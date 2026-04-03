@@ -1,0 +1,24 @@
+{
+  "name": "bpc-protocol",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BPC — Bound Pair Credentials: hardware-bound, pair-verified, replay-proof API authentication protocol",
+  "workspaces": [
+    "packages/core",
+    "packages/server",
+    "packages/client-sdk"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces",
+    "test:core": "npm run test --workspace=packages/core",
+    "test:server": "npm run test --workspace=packages/server",
+    "test:client": "npm run test --workspace=packages/client-sdk"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}
