@@ -1,12 +1,10 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { PairRegistry, AnomalyEngine, ServerNonceStore, verifyBPCRequest } from '../../packages/server/src/index.ts';
-import type { BPCRequestData, PairRegistration } from '../../packages/server/src/index.ts';
+import { createBPCServer, verifyBPCRequest, BPC_ERRORS, handleRotation } from '../../packages/server/src/index.ts';
+import type { BPCRequestData, PairRegistration, RotationRequest } from '../../packages/server/src/index.ts';
 
 const PORT = 3100;
 
-const registry = new PairRegistry();
-const nonceStore = new ServerNonceStore();
-const anomaly = new AnomalyEngine();
+const { registry, nonceStore, anomaly, store } = createBPCServer();
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -27,7 +25,9 @@ function log(method: string, path: string, result: string): void {
   console.log(`[${ts}] ${method} ${path} => ${result}`);
 }
 
-const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+// Raise maxHeaderSize to 8 MB so oversized headers reach our middleware,
+// which then rejects them with a proper JSON 400 (not a silent Node 431).
+const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: IncomingMessage, res: ServerResponse) => {
   const method = (req.method ?? 'GET').toUpperCase();
   const path = req.url ?? '/';
 
@@ -38,9 +38,35 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       const registration: PairRegistration = JSON.parse(body);
 
       // Dev mode: auto-approve
-      const pairId = registry.registerDirect(registration);
+      const pairId = await registry.registerDirect(registration);
       log(method, path, `REGISTERED pair=${pairId}`);
       json(res, 200, { pairId, status: 'approved' });
+      return;
+    }
+
+    // --- Revocation endpoint ---
+    if (method === 'POST' && path === '/bpc/revoke') {
+      const body = await readBody(req);
+      const { pairId: targetPairId } = JSON.parse(body) as { pairId: string };
+      if (!targetPairId) { json(res, 400, { error: 'missing_pair_id' }); return; }
+      await registry.revoke(targetPairId);
+      log(method, path, `REVOKED pair=${targetPairId}`);
+      json(res, 200, { revoked: true, pairId: targetPairId });
+      return;
+    }
+
+    // --- Rotation endpoint ---
+    if (method === 'POST' && path === '/bpc/rotate') {
+      const body = await readBody(req);
+      const rotReq = JSON.parse(body) as RotationRequest;
+      const result = await handleRotation(rotReq, store);
+      if (!result.ok) {
+        log(method, path, `ROTATION DENIED (${result.error})`);
+        json(res, 401, { error: result.error });
+        return;
+      }
+      log(method, path, `ROTATED old=${rotReq.oldPairId} new=${result.newPairId}`);
+      json(res, 200, { newPairId: result.newPairId });
       return;
     }
 
@@ -50,15 +76,20 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
         pairId: (req.headers['x-bpc-pair-id'] as string) ?? null,
         signedData: (req.headers['x-bpc-signed-data'] as string) ?? null,
         signature: (req.headers['x-bpc-signature'] as string) ?? null,
+        version: (req.headers['x-bpc-version'] as string) ?? null,
+        bodyHash: null,   // body hash enforcement optional for this example
         method,
         path,
+        ip: req.socket.remoteAddress,
       };
 
       const result = await verifyBPCRequest(reqData, registry, nonceStore, anomaly);
 
       if (!result.ok) {
-        log(method, path, `DENIED (${result.error})`);
-        json(res, 401, { error: result.error });
+        const errCode = result.error ?? 'unknown_error';
+        const httpStatus = BPC_ERRORS[errCode]?.httpStatus ?? 401;
+        log(method, path, `DENIED (${errCode}) ${httpStatus}`);
+        json(res, httpStatus, { error: errCode });
         return;
       }
 
@@ -66,12 +97,23 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 
       // Route to handlers
       if (path === '/api/status') {
-        json(res, 200, { status: 'ok', pair: result.pairId, timestamp: Date.now() });
+        json(res, 200, { status: 'ok', pair: result.pairId, scope: result.pair?.scope, timestamp: Date.now() });
         return;
       }
 
       if (path === '/api/users') {
         json(res, 200, { users: ['alice', 'bob', 'charlie'] });
+        return;
+      }
+
+      // Admin-only endpoint: only 'admin' scoped pairs can DELETE
+      if (path === '/api/admin' && method === 'DELETE') {
+        if (result.pair?.scope !== 'admin') {
+          log(method, path, `SCOPE VIOLATION pair=${result.pairId} scope=${result.pair?.scope}`);
+          json(res, 403, { error: 'scope_violation' });
+          return;
+        }
+        json(res, 200, { deleted: true, by: result.pairId });
         return;
       }
 
@@ -91,8 +133,11 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 server.listen(PORT, () => {
   console.log(`BPC Full-Stack Example Server running on http://localhost:${PORT}`);
   console.log('Endpoints:');
-  console.log('  POST /bpc/register  — Register a new pair (dev mode: auto-approve)');
-  console.log('  GET  /api/status    — Protected: returns server status');
-  console.log('  GET  /api/users     — Protected: returns user list');
+  console.log('  POST /bpc/register    -- Register a new pair (dev mode: auto-approve)');
+  console.log('  POST /bpc/revoke      -- Revoke a pair');
+  console.log('  POST /bpc/rotate      -- Pair rotation (old key signs new pubJwk)');
+  console.log('  GET  /api/status      -- Protected: returns server status + scope');
+  console.log('  GET  /api/users       -- Protected: returns user list');
+  console.log('  DEL  /api/admin       -- Protected: admin-only delete');
   console.log('');
 });

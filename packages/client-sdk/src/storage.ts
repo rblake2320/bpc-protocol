@@ -1,51 +1,39 @@
-const DB_NAME = 'bpc-keys';
-const STORE = 'keypairs';
+/**
+ * Storage factory -- returns browser (IndexedDB) or Node.js (encrypted file) backend
+ * based on the current runtime environment.
+ */
 
-async function openDB(): Promise<IDBDatabase> {
-  return new Promise((res, rej) => {
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onerror = () => rej(req.error);
-    req.onsuccess = () => res(req.result);
-    req.onupgradeneeded = e => (e.target as IDBOpenDBRequest).result.createObjectStore(STORE, { keyPath: 'id' });
-  });
+// Re-export IDB functions for direct use
+export { saveKeypair, loadKeypair, loadAll, deleteKeypair } from './idb-storage.js';
+
+export interface KeyStorage {
+  save(id: string, data: Record<string, unknown>): Promise<void>;
+  load(id: string): Promise<Record<string, unknown> | null>;
+  loadAll(): Promise<Record<string, unknown>[]>;
+  delete(id: string): Promise<void>;
 }
 
-export async function saveKeypair(id: string, data: Record<string, unknown>): Promise<void> {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const tx = db.transaction(STORE, 'readwrite');
-    tx.objectStore(STORE).put({ id, ...data });
-    tx.oncomplete = () => res();
-    tx.onerror = () => rej(tx.error);
-  });
-}
+/**
+ * Create a key storage instance appropriate for the current runtime.
+ * In a browser: uses IndexedDB.
+ * In Node.js: uses AES-256-GCM encrypted files at ~/.bpc/keys/
+ */
+export function createStorage(): KeyStorage {
+  const isBrowser = typeof window !== 'undefined' && typeof indexedDB !== 'undefined';
 
-export async function loadKeypair(id: string): Promise<Record<string, unknown> | null> {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const tx = db.transaction(STORE, 'readonly');
-    const req = tx.objectStore(STORE).get(id);
-    req.onsuccess = () => res(req.result ?? null);
-    req.onerror = () => rej(req.error);
-  });
-}
-
-export async function loadAll(): Promise<Record<string, unknown>[]> {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const tx = db.transaction(STORE, 'readonly');
-    const req = tx.objectStore(STORE).getAll();
-    req.onsuccess = () => res(req.result);
-    req.onerror = () => rej(req.error);
-  });
-}
-
-export async function deleteKeypair(id: string): Promise<void> {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const tx = db.transaction(STORE, 'readwrite');
-    tx.objectStore(STORE).delete(id);
-    tx.oncomplete = () => res();
-    tx.onerror = () => rej(tx.error);
-  });
+  if (isBrowser) {
+    return {
+      async save(id, data) { const m = await import('./idb-storage.js'); return m.saveKeypair(id, data); },
+      async load(id) { const m = await import('./idb-storage.js'); return m.loadKeypair(id); },
+      async loadAll() { const m = await import('./idb-storage.js'); return m.loadAll(); },
+      async delete(id) { const m = await import('./idb-storage.js'); return m.deleteKeypair(id); },
+    };
+  } else {
+    return {
+      async save(id, data) { const m = await import('./node-storage.js'); return m.saveKeypairToFile(id, data); },
+      async load(id) { const m = await import('./node-storage.js'); return m.loadKeypairFromFile(id); },
+      async loadAll() { const m = await import('./node-storage.js'); return m.loadAllFromFile(); },
+      async delete(id) { const m = await import('./node-storage.js'); return m.deleteKeypairFromFile(id); },
+    };
+  }
 }

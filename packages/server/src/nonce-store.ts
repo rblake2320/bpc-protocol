@@ -1,16 +1,12 @@
-import { NonceStore } from '@bpc/core';
+import type { NonceStoreBackend } from './store.js';
 
 export class ServerNonceStore {
-  private store: NonceStore;
+  constructor(
+    private backend: NonceStoreBackend,
+    private windowMs = 120_000,
+  ) {}
 
-  constructor(windowMs = 120_000) {
-    this.store = new NonceStore(windowMs);
-  }
-
-  /** Returns true if nonce was already seen (replay). */
-  checkAndConsume(nonce: string): boolean {
-    if (this.store.has(nonce)) return true; // replay detected
-    this.store.add(nonce);
-    return false;
+  async checkAndConsume(nonce: string): Promise<boolean> {
+    return this.backend.checkAndConsume(nonce, this.windowMs);
   }
 }

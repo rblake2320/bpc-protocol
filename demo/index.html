@@ -590,7 +590,7 @@ textarea { min-height: 80px; resize: vertical; }
       <div class="feature-card fade-in">
         <div class="feature-icon"><i data-lucide="lock-keyhole" style="width:20px;height:20px"></i></div>
         <div class="feature-title">User-Chosen Secret</div>
-        <p class="feature-desc">A 4–12 character code chosen by the client, mixed into every cryptographic signature. Never stored in plain form, never logged, never sent in clear text.</p>
+        <p class="feature-desc">An 8–64 character code chosen by the client, mixed into every cryptographic signature. Never stored in plain form, never logged, never sent in clear text. Stored server-side as Argon2id hash.</p>
       </div>
       <div class="feature-card fade-in">
         <div class="feature-icon"><i data-lucide="shield-check" style="width:20px;height:20px"></i></div>
@@ -617,6 +617,7 @@ textarea { min-height: 80px; resize: vertical; }
     <div class="section-label">Interactive Demo</div>
     <h2 class="section-title">BPC in action</h2>
     <p class="section-subtitle">Register a device, pair a client, make requests — and watch what happens when an attacker tries to use a stolen key.</p>
+    <p style="font-size:var(--text-xs);color:var(--color-text-faint);font-family:var(--font-mono);margin-top:var(--space-2)">Runs entirely in your browser — no server required. See <code>packages/server/</code> for the real Node.js implementation.</p>
 
     <!-- TABS -->
     <div class="tabs">
@@ -647,13 +648,13 @@ textarea { min-height: 80px; resize: vertical; }
             </select>
           </div>
           <button class="btn btn-primary" style="width:100%" onclick="registerDevice(this)">
-            <i data-lucide="key-round" style="width:14px;height:14px"></i> Generate Hardware Keypair
+            <i data-lucide="key-round" style="width:14px;height:14px"></i> Generate Device Keypair
           </button>
           <div id="device-result" style="display:none; margin-top:var(--space-4)">
             <div class="status-box success">
               <div class="status-box-icon"><i data-lucide="check-circle" style="width:16px;height:16px"></i></div>
               <div class="status-box-body">
-                <strong>Device registered — ECDSA P-256 key in hardware</strong>
+                <strong>Device registered — ECDSA P-256 key (non-extractable)</strong>
                 <div id="device-summary" style="font-family:var(--font-mono);font-size:var(--text-xs);margin-top:var(--space-2);line-height:2"></div>
               </div>
             </div>
@@ -671,9 +672,9 @@ textarea { min-height: 80px; resize: vertical; }
             <input type="text" id="pair-name" placeholder="e.g. Payment Service" value="Payment Service">
           </div>
           <div class="form-group">
-            <label>User Secret <span class="label-hint">(4–12 chars: letters, digits, symbols)</span></label>
+            <label>User Secret <span class="label-hint">(8–64 chars: letters, digits, symbols)</span></label>
             <div class="input-group">
-              <input type="password" id="pair-secret" placeholder="e.g. Ax9!kR" maxlength="12">
+              <input type="password" id="pair-secret" placeholder="e.g. Ax9!kR@2m" maxlength="64" minlength="8">
               <span class="input-suffix" id="secret-strength"></span>
             </div>
           </div>
@@ -912,7 +913,7 @@ textarea { min-height: 80px; resize: vertical; }
         <div class="flow">
           <div class="flow-step"><div class="flow-step-num">1</div><div><div class="flow-step-title">Client builds payload</div><div class="flow-step-desc">Canonical JSON: { method, path, body_hash, timestamp, nonce, pair_id }. Timestamp must be within ±60s. Nonce is a crypto random UUID.</div></div></div>
           <div class="flow-step"><div class="flow-step-num">2</div><div><div class="flow-step-title">Secret mixing</div><div class="flow-step-desc">HMAC(user_secret, nonce + timestamp) is derived and injected into the canonical payload before signing. Server recomputes from stored secret hash.</div></div></div>
-          <div class="flow-step"><div class="flow-step-num">3</div><div><div class="flow-step-title">ECDSA signature</div><div class="flow-step-desc">Client signs the entire canonical payload with its hardware-bound private key using ECDSA-SHA256 via Web Crypto API.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num">3</div><div><div class="flow-step-title">ECDSA signature</div><div class="flow-step-desc">Client signs the canonical payload with its non-extractable private key using ECDSA-SHA256 via Web Crypto API.</div></div></div>
           <div class="flow-step"><div class="flow-step-num">4</div><div><div class="flow-step-title">Server validates all layers</div><div class="flow-step-desc">Box checks: pair_id exists, scope allows endpoint, timestamp fresh, nonce not seen before, ECDSA signature valid, secret derivation matches. All must pass.</div></div></div>
         </div>
       </div>
@@ -968,8 +969,8 @@ textarea { min-height: 80px; resize: vertical; }
         <div class="card-title" style="margin-bottom:var(--space-4)"><i data-lucide="layers" style="width:16px;height:16px;color:var(--color-primary)"></i> &nbsp;What an attacker needs to succeed</div>
         <div class="flow">
           <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">1</div><div><div class="flow-step-title">The pair ID</div><div class="flow-step-desc">128-bit random, unguessable. Only the registered client knows it.</div></div></div>
-          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">2</div><div><div class="flow-step-title">The private key</div><div class="flow-step-desc">Hardware-bound, non-extractable. Physical access to the device is required.</div></div></div>
-          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">3</div><div><div class="flow-step-title">The user secret</div><div class="flow-step-desc">4–12 characters chosen by the human operator. Never stored in plain form anywhere.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">2</div><div><div class="flow-step-title">The private key</div><div class="flow-step-desc">Non-extractable via Web Crypto API. Physical access to the device is required for key use.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">3</div><div><div class="flow-step-title">The user secret</div><div class="flow-step-desc">8–64 characters chosen by the human operator. Never stored in plain form anywhere. Hashed with Argon2id server-side.</div></div></div>
           <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">4</div><div><div class="flow-step-title">A fresh nonce window</div><div class="flow-step-desc">The request must be made within ±60 seconds. Replays are mathematically impossible.</div></div></div>
         </div>
         <div class="status-box info" style="margin-top:var(--space-4);margin-bottom:0">
@@ -999,7 +1000,7 @@ textarea { min-height: 80px; resize: vertical; }
         </thead>
         <tbody>
           <tr><td>GitHub-safe credential</td><td class="cross">❌</td><td class="cross">❌</td><td><span style="color:var(--color-warning)">~</span></td><td class="check">✓</td></tr>
-          <tr><td>Hardware-bound key</td><td class="cross">❌</td><td class="cross">❌</td><td class="check">✓</td><td class="check">✓</td></tr>
+          <tr><td>Non-extractable key</td><td class="cross">❌</td><td class="cross">❌</td><td class="check">✓</td><td class="check">✓</td></tr>
           <tr><td>Replay protection</td><td class="cross">❌</td><td><span style="color:var(--color-warning)">~</span></td><td><span style="color:var(--color-warning)">~</span></td><td class="check">✓</td></tr>
           <tr><td>Human-chosen secret factor</td><td class="cross">❌</td><td class="cross">❌</td><td class="cross">❌</td><td class="check">✓</td></tr>
           <tr><td>Explicit pair registry</td><td class="cross">❌</td><td class="cross">❌</td><td class="cross">❌</td><td class="check">✓</td></tr>
@@ -1016,7 +1017,7 @@ textarea { min-height: 80px; resize: vertical; }
 
 <!-- ===== FOOTER ===== -->
 <footer style="border-top:1px solid var(--color-border);padding:var(--space-8) var(--space-6);text-align:center;color:var(--color-text-faint);font-size:var(--text-xs);font-family:var(--font-mono)">
-  BPC — Bound Pair Credentials · Conceived by R. Blake · Built as a protocol reference implementation · Not yet an open standard — but it should be.
+  BPC — Bound Pair Credentials · Conceived by R. Blake · Built as a protocol reference implementation · Not yet an open standard.
 </footer>
 
 <!-- ===== APPROVAL MODAL ===== -->
@@ -1237,14 +1238,14 @@ async function registerDevice(btn) {
     document.getElementById('device-status-badge').textContent = 'Registered';
     document.getElementById('device-status-badge').className = 'badge badge-success';
     
-    log('success', `Device "${name}" registered — ECDSA P-256 keypair in hardware crypto store`);
+    log('success', `Device "${name}" registered — ECDSA P-256 keypair in browser crypto store (non-extractable)`);
     toast('success', 'Device Registered', `${name} is ready in ${mode} mode`);
     await saveStateToIDB();
   } catch(e) {
     log('error', 'Device registration failed: ' + e.message);
   }
 
-  btn.disabled = false; btn.innerHTML = '<i data-lucide="key-round" style="width:14px;height:14px"></i> Generate Hardware Keypair';
+  btn.disabled = false; btn.innerHTML = '<i data-lucide="key-round" style="width:14px;height:14px"></i> Generate Device Keypair';
   lucide.createIcons();
 }
 
@@ -1256,7 +1257,7 @@ async function registerPair() {
   const secret = document.getElementById('pair-secret').value;
   const scope = document.getElementById('pair-scope').value;
   
-  if (!secret || secret.length < 4) {
+  if (!secret || secret.length < 8) {
     return showResult('pair-result', 'error', 'Secret must be at least 4 characters');
   }
   if (state.pairs.length >= state.config.maxPairs) {
@@ -1516,13 +1517,13 @@ function updatePairRegistry() {
   }
   tbody.innerHTML = state.pairs.map(p => `
     <tr>
-      <td style="color:var(--color-primary)">${p.id.substring(0,18)}…</td>
-      <td>${p.name}</td>
-      <td><span class="badge badge-neutral">${p.scope}</span></td>
-      <td><span class="badge ${p.mode==='production'?'badge-primary':'badge-warning'}">${p.mode}</span></td>
-      <td><span class="badge ${p.status==='active'?'badge-success':'badge-error'}">${p.status}</span></td>
+      <td style="color:var(--color-primary)">${esc(p.id.substring(0,18))}…</td>
+      <td>${esc(p.name)}</td>
+      <td><span class="badge badge-neutral">${esc(p.scope)}</span></td>
+      <td><span class="badge ${p.mode==='production'?'badge-primary':'badge-warning'}">${esc(p.mode)}</span></td>
+      <td><span class="badge ${p.status==='active'?'badge-success':'badge-error'}">${esc(p.status)}</span></td>
       <td style="color:var(--color-text-muted)">${p.lastActive ? new Date(p.lastActive).toLocaleTimeString() : '—'}</td>
-      <td><button class="btn btn-danger btn-sm" onclick="revokePair('${p.id}')">Revoke</button></td>
+      <td><button class="btn btn-danger btn-sm" onclick="revokePair('${esc(p.id)}')">Revoke</button></td>
     </tr>
   `).join('');
 }
@@ -1544,7 +1545,7 @@ function updateSelects() {
     const sel = document.getElementById(id);
     const prev = sel.value;
     sel.innerHTML = '<option value="">— Select a pair —</option>' +
-      state.pairs.map(p => `<option value="${p.id}">${p.name} (${p.scope})</option>`).join('');
+      state.pairs.map(p => `<option value="${esc(p.id)}">${esc(p.name)} (${esc(p.scope)})</option>`).join('');
     if (prev) sel.value = prev;
   });
 }
@@ -1612,6 +1613,8 @@ function syntaxHighlight(obj) {
 function clearLog() {
   document.getElementById('activity-log').innerHTML = '<div class="log-empty">Log cleared</div>';
 }
+
+function esc(str) { const d = document.createElement('div'); d.textContent = String(str); return d.innerHTML; }
 
 function log(type, text) {
   const container = document.getElementById('activity-log');

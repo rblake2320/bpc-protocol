@@ -1,3 +1,5 @@
+export const BPC_PROTOCOL_VERSION = '1.0';
+
 export interface BPCKeypair {
   privateKey: CryptoKey;
   publicKey: CryptoKey;
@@ -8,13 +10,13 @@ export interface BPCKeypair {
 export interface BPCPair {
   id: string;
   name: string;
-  scope: 'read' | 'read-write' | 'full';
+  scope: 'read' | 'read-write' | 'admin';
   mode: 'development' | 'production';
   secretHash: string;       // SHA-256(bpc: + secret), base64url
   privateKey: CryptoKey;
   publicKey: CryptoKey;
   fingerprint: string;
-  status: 'active' | 'revoked';
+  status: 'active' | 'locked' | 'expired' | 'rotated' | 'revoked';
   created: number;          // Unix ms
   lastActive: number | null;
   requests: number;
@@ -29,6 +31,7 @@ export interface BPCCanonicalPayload {
   path: string;
   secret_hmac: string;
   timestamp: number;
+  version: string;
 }
 
 export interface BPCSignedRequest {

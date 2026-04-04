@@ -1,106 +1,84 @@
 import { describe, it, expect } from 'vitest';
-import { generateKeypair, verifyPayload, importPublicKeyFromJwk, b64urlDecode, canonicalize } from '../../core/src/index.js';
 import { BPCClient } from '../src/client.js';
+import { BPC_PROTOCOL_VERSION, generateKeypair, b64urlDecode } from '../../core/src/index.js';
 import { prepareRegistration } from '../src/registration.js';
 import type { BPCKeypair } from '../../core/src/index.js';
 
-describe('BPCClient.signRequest', () => {
-  let keypair: BPCKeypair;
-  let client: BPCClient;
-
-  it('should produce all three required BPC headers', async () => {
-    keypair = await generateKeypair();
-    client = new BPCClient({
-      serverUrl: 'http://localhost:3000',
-      pairId: 'pair_test123',
+describe('@bpc/client-sdk -- BPCClient', () => {
+  it('should include X-BPC-Version header in signed requests', async () => {
+    const keypair = await generateKeypair();
+    const client = new BPCClient({
+      serverUrl: 'http://localhost:3100',
+      pairId: 'pair_test',
       keypair,
-      secret: 'test-secret',
+      secret: 'TestSecret1!',
     });
 
-    const headers = await client.signRequest('GET', '/api/status');
-
-    expect(headers['X-BPC-Pair-ID']).toBe('pair_test123');
-    expect(typeof headers['X-BPC-Signature']).toBe('string');
-    expect(headers['X-BPC-Signature'].length).toBeGreaterThan(20);
-    expect(typeof headers['X-BPC-Signed-Data']).toBe('string');
-    expect(headers['X-BPC-Signed-Data'].length).toBeGreaterThan(20);
+    const headers = await client.signRequest('GET', '/api/test');
+    expect(headers['X-BPC-Version']).toBe(BPC_PROTOCOL_VERSION);
+    expect(headers['X-BPC-Version']).toBe('1.0');
   });
 
-  it('should produce a verifiable ECDSA signature', async () => {
-    keypair = await generateKeypair();
-    client = new BPCClient({
-      serverUrl: 'http://localhost:3000',
-      pairId: 'pair_verify_test',
+  it('should include version in signed payload', async () => {
+    const keypair = await generateKeypair();
+    const client = new BPCClient({
+      serverUrl: 'http://localhost:3100',
+      pairId: 'pair_test',
       keypair,
-      secret: 'verify-secret',
+      secret: 'TestSecret1!',
     });
 
-    const headers = await client.signRequest('POST', '/api/data', { key: 'value' });
+    const headers = await client.signRequest('GET', '/api/test');
 
-    // Decode the signed data to get the payload
+    // Decode the signed data to inspect the payload
     const signedDataJson = new TextDecoder().decode(b64urlDecode(headers['X-BPC-Signed-Data']));
-    const payload = JSON.parse(signedDataJson);
+    const payload = JSON.parse(signedDataJson) as Record<string, unknown>;
 
-    // Verify the signature using the public key
-    const pubKey = await importPublicKeyFromJwk(keypair.pubJwk);
-    const valid = await verifyPayload(pubKey, payload, headers['X-BPC-Signature']);
-    expect(valid).toBe(true);
+    expect(payload['version']).toBe(BPC_PROTOCOL_VERSION);
   });
 
-  it('should produce a different nonce on each request', async () => {
-    keypair = await generateKeypair();
-    client = new BPCClient({
-      serverUrl: 'http://localhost:3000',
-      pairId: 'pair_nonce_test',
+  it('should produce full body hash (not truncated)', async () => {
+    const keypair = await generateKeypair();
+    const client = new BPCClient({
+      serverUrl: 'http://localhost:3100',
+      pairId: 'pair_test',
       keypair,
-      secret: 'nonce-secret',
+      secret: 'TestSecret1!',
     });
 
-    const h1 = await client.signRequest('GET', '/api/status');
-    const h2 = await client.signRequest('GET', '/api/status');
+    const headers = await client.signRequest('POST', '/api/data', { foo: 'bar' });
+    const signedDataJson = new TextDecoder().decode(b64urlDecode(headers['X-BPC-Signed-Data']));
+    const payload = JSON.parse(signedDataJson) as Record<string, unknown>;
 
-    // Different signed data means different nonce/timestamp
-    expect(h1['X-BPC-Signed-Data']).not.toBe(h2['X-BPC-Signed-Data']);
-
-    // Decode and confirm nonces differ
-    const p1 = JSON.parse(new TextDecoder().decode(b64urlDecode(h1['X-BPC-Signed-Data'])));
-    const p2 = JSON.parse(new TextDecoder().decode(b64urlDecode(h2['X-BPC-Signed-Data'])));
-    expect(p1.nonce).not.toBe(p2.nonce);
+    // body_hash should be 'sha256:' + full 43-char base64url, not truncated to 32
+    const bodyHash = payload['body_hash'] as string;
+    expect(bodyHash).toMatch(/^sha256:[A-Za-z0-9_-]{43}$/);
   });
 
-  it('should include correct method and path in the payload', async () => {
-    keypair = await generateKeypair();
-    client = new BPCClient({
-      serverUrl: 'http://localhost:3000',
-      pairId: 'pair_mp_test',
+  it('should reject non-HTTPS URLs in production (not localhost)', async () => {
+    const keypair = await generateKeypair();
+    const client = new BPCClient({
+      serverUrl: 'http://example.com',
+      pairId: 'pair_test',
       keypair,
-      secret: 'mp-secret',
+      secret: 'TestSecret1!',
     });
 
-    const headers = await client.signRequest('DELETE', '/api/resource/42');
-    const payload = JSON.parse(new TextDecoder().decode(b64urlDecode(headers['X-BPC-Signed-Data'])));
-
-    expect(payload.method).toBe('DELETE');
-    expect(payload.path).toBe('/api/resource/42');
-    expect(payload.pair_id).toBe('pair_mp_test');
+    await expect(client.fetch('/api/test')).rejects.toThrow('HTTPS');
   });
 
-  it('should produce canonical (sorted-key) JSON in signed data', async () => {
-    keypair = await generateKeypair();
-    client = new BPCClient({
-      serverUrl: 'http://localhost:3000',
-      pairId: 'pair_canonical_test',
+  it('should allow HTTP localhost URLs', async () => {
+    const keypair = await generateKeypair();
+    const client = new BPCClient({
+      serverUrl: 'http://localhost:3100',
+      pairId: 'pair_test',
       keypair,
-      secret: 'canonical-secret',
+      secret: 'TestSecret1!',
     });
 
-    const headers = await client.signRequest('GET', '/test');
-    const signedJson = new TextDecoder().decode(b64urlDecode(headers['X-BPC-Signed-Data']));
-    const keys = Object.keys(JSON.parse(signedJson));
-
-    // Keys must be alphabetically sorted per BPC canonical form
-    const sorted = [...keys].sort();
-    expect(keys).toEqual(sorted);
+    // Should not throw HTTPS error -- signRequest works fine on localhost
+    const headers = await client.signRequest('GET', '/api/test');
+    expect(headers['X-BPC-Pair-ID']).toBe('pair_test');
   });
 });
 

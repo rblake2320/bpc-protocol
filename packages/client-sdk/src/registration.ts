@@ -8,7 +8,7 @@ export interface RegistrationResult {
 
 export interface RegistrationRequest {
   name: string;
-  scope: 'read' | 'read-write' | 'full';
+  scope: 'read' | 'read-write' | 'admin';
   mode: 'development' | 'production';
   secretHash: string;
   pubJwk: JsonWebKey;
@@ -18,7 +18,7 @@ export interface RegistrationRequest {
 export async function prepareRegistration(
   name: string,
   secret: string,
-  scope: 'read' | 'read-write' | 'full' = 'read-write',
+  scope: 'read' | 'read-write' | 'admin' = 'read-write',
   mode: 'development' | 'production' = 'development'
 ): Promise<{ keypair: BPCKeypair; request: RegistrationRequest }> {
   const keypair = await generateKeypair();

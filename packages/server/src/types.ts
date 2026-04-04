@@ -1,26 +1,20 @@
 /**
- * @bpc/server — Server-side types for BPC Protocol v0.1.0
- *
- * HMAC verification note (v0.1.0):
- * The server stores secretHash (SHA-256 of "bpc:" + secret, base64url) at pairing time.
- * The secret_hmac field in the canonical payload is covered by the ECDSA signature —
- * if the signature is valid, the secret_hmac was computed by the legitimate pair holder.
- * Independent server-side HMAC recomputation requires HKDF-derived key storage,
- * deferred to v0.2.0. See spec/bpc-spec-v1.md section 6.
+ * @bpc/server — Server-side types for BPC Protocol v1.0
  */
 
 export interface StoredPair {
   id: string;
   name: string;
-  scope: 'read' | 'read-write' | 'full';
+  scope: 'read' | 'read-write' | 'admin';
   mode: 'development' | 'production';
   secretHash: string;       // SHA-256(bpc:+secret) base64url — stored at pairing
   pubJwk: JsonWebKey;       // Registered public key
-  status: 'active' | 'revoked';
+  status: 'active' | 'locked' | 'expired' | 'rotated' | 'revoked';
   created: number;
   lastActive: number | null;
   requests: number;
   failedSigs: number;
+  expiresAt?: number;
 }
 
 export interface PairRegistration {
@@ -29,6 +23,7 @@ export interface PairRegistration {
   mode: StoredPair['mode'];
   secretHash: string;
   pubJwk: JsonWebKey;
+  expiresAt?: number;
 }
 
 export interface BPCVerifyResult {
@@ -36,6 +31,7 @@ export interface BPCVerifyResult {
   pairId?: string;
   pair?: StoredPair;
   error?: string;
+  rateLimitRemaining?: number;
 }
 
 export interface AnomalyCounters {

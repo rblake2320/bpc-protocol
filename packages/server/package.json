@@ -18,6 +18,14 @@
   "dependencies": {
     "@bpc/core": "^0.1.0"
   },
+  "peerDependencies": {
+    "pg": ">=8.0.0",
+    "ioredis": ">=5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": { "optional": true },
+    "ioredis": { "optional": true }
+  },
   "devDependencies": {
     "typescript": "^5.4.0",
     "vitest": "^1.6.0",

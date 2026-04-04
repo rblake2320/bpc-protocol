@@ -1,64 +1,124 @@
 /**
- * Core BPC request verification — framework-agnostic.
- *
- * Takes parsed request data, returns a verification result. No HTTP framework coupling.
- *
- * HMAC verification (v0.1.0 design constraint):
- * The secret_hmac field is included in the canonical payload and covered by the
- * ECDSA signature. If the signature verifies, the secret_hmac was produced by the
- * holder of the private key associated with the registered pair. Independent
- * server-side HMAC recomputation (requiring HKDF-derived key storage) is deferred
- * to v0.2.0. See spec/bpc-spec-v1.md section 6.
+ * BPC request verification — 12-step pipeline.
+ * Steps: rate-limit → headers → version → pair-exists → pair-status →
+ *        decode-payload → timestamp → nonce → method/path → scope → body-hash → signature
  */
 
-import { verifyPayload, importPublicKeyFromJwk, canonicalize } from '@bpc/core';
+import { verifyPayload, importPublicKeyFromJwk, BPC_PROTOCOL_VERSION } from '@bpc/core';
 import type { BPCVerifyResult } from './types.js';
 import type { PairRegistry } from './registry.js';
 import type { ServerNonceStore } from './nonce-store.js';
 import type { AnomalyEngine } from './anomaly.js';
+import type { RateLimiter } from './rate-limiter.js';
+import type { AuditLog } from './audit.js';
 
 export interface BPCRequestData {
   pairId: string | null;
-  signedData: string | null;   // base64url-encoded canonical payload JSON
+  signedData: string | null;      // base64url-encoded canonical payload JSON
   signature: string | null;
   method: string;
   path: string;
+  version: string | null;         // X-BPC-Version header
+  bodyHash: string | null;        // SHA-256 of actual request body, base64url, client-provided
+  ip?: string;                    // for rate limiting
 }
+
+// Maximum header field lengths — prevents Node.js 431 and large-payload DoS.
+// ECDSA P-256 DER sig = 64–72 bytes → ~100 base64url chars. 256 is generous.
+// Canonical payload with all fields ≈ 400 bytes → ~550 base64url chars. 4096 is generous.
+const MAX_SIGNED_DATA_LEN = 4096;
+const MAX_SIGNATURE_LEN = 256;
+const MAX_PAIR_ID_LEN = 64;
 
 export interface BPCServerConfig {
   sigWindowMs: number;
+  lockoutCount?: number;          // failed sig threshold before pair is locked (default: 10)
+  rateLimiter?: RateLimiter;      // optional — if omitted, rate limiting is skipped
+  auditLog?: AuditLog;            // optional — if omitted, no audit logging
 }
 
 const DEFAULT_SERVER_CONFIG: BPCServerConfig = { sigWindowMs: 60_000 };
+
+const SCOPE_ALLOWED_METHODS: Record<string, Set<string>> = {
+  'read':       new Set(['GET', 'HEAD', 'OPTIONS']),
+  'read-write': new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH']),
+  'admin':      new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE']),
+};
 
 export async function verifyBPCRequest(
   req: BPCRequestData,
   registry: PairRegistry,
   nonceStore: ServerNonceStore,
   anomaly: AnomalyEngine,
-  config: BPCServerConfig = DEFAULT_SERVER_CONFIG
+  config: BPCServerConfig = DEFAULT_SERVER_CONFIG,
 ): Promise<BPCVerifyResult> {
-  anomaly.recordRequest();
+  const pairId = req.pairId ?? undefined;
+  await anomaly.recordRequest(pairId);
 
-  // 1. Headers present
+  async function deny(error: string, doSigFail = false): Promise<BPCVerifyResult> {
+    await anomaly.recordDenied(pairId);
+    if (doSigFail) await anomaly.recordSigFailure(pairId);
+    await config.auditLog?.write({ action: 'verify_fail', pairId, error, ip: req.ip, method: req.method, path: req.path });
+    if (pairId && doSigFail) await registry.recordActivity(pairId, false);
+    return { ok: false, error };
+  }
+
+  // Step 1: Rate limit check
+  if (config.rateLimiter && req.ip) {
+    const rl = await config.rateLimiter.check(`ip:${req.ip}`);
+    if (!rl.allowed) return deny('rate_limit_exceeded');
+  }
+  if (config.rateLimiter && req.pairId) {
+    const rl = await config.rateLimiter.check(`pair:${req.pairId}`);
+    if (!rl.allowed) return deny('rate_limit_exceeded');
+  }
+
+  // Step 2: Headers present + size guards (prevents Node.js 431 / large-payload DoS)
   if (!req.pairId || !req.signedData || !req.signature) {
-    anomaly.recordDenied();
-    return { ok: false, error: 'missing_headers' };
+    return deny('missing_headers');
+  }
+  if (req.pairId.length > MAX_PAIR_ID_LEN ||
+      req.signedData.length > MAX_SIGNED_DATA_LEN ||
+      req.signature.length > MAX_SIGNATURE_LEN) {
+    return deny('invalid_signed_data');
   }
 
-  // 2. Pair exists and is active
-  const pair = registry.get(req.pairId);
+  // Step 3: Protocol version check
+  const clientVersion = req.version ?? '1.0';
+  if (clientVersion !== BPC_PROTOCOL_VERSION) {
+    return deny('version_mismatch');
+  }
+
+  // Step 4: Pair exists
+  const pair = await registry.get(req.pairId);
   if (!pair) {
-    anomaly.recordUnknownPair();
-    anomaly.recordDenied();
-    return { ok: false, error: 'unknown_pair' };
-  }
-  if (pair.status !== 'active') {
-    anomaly.recordDenied();
-    return { ok: false, error: 'pair_revoked' };
+    await anomaly.recordUnknownPair();
+    return deny('unknown_pair');
   }
 
-  // 3. Decode and parse canonical payload
+  // Step 5: Pair status checks
+  if (pair.status === 'revoked') return deny('pair_revoked');
+  if (pair.status === 'locked')  return deny('pair_locked');
+  if (pair.status === 'rotated') return deny('pair_rotated');
+  if (pair.status === 'expired') return deny('pair_expired');
+  // Belt-and-suspenders lockout: check failedSigs directly to close the parallel-request
+  // race window where multiple concurrent forged-sig requests all pass the status check
+  // before any single one has committed the locked status back to the store.
+  const lockoutCount = config.lockoutCount ?? 10;
+  if (pair.failedSigs >= lockoutCount) {
+    registry.recordActivity(req.pairId, false).catch(() => {}); // flush status update
+    return deny('pair_locked');
+  }
+  // Check expiresAt field too
+  if (pair.expiresAt && Date.now() > pair.expiresAt) {
+    pair.status = 'expired';
+    // fire-and-forget status update
+    registry.get(req.pairId).then(p => { if (p) { p.status = 'expired'; } }).catch(() => {});
+    return deny('pair_expired');
+  }
+  if (pair.status !== 'active') return deny('pair_revoked');
+
+  // Step 6: Decode and parse canonical payload
   let payload: Record<string, unknown>;
   try {
     const padded = req.signedData.replace(/-/g, '+').replace(/_/g, '/');
@@ -66,38 +126,42 @@ export async function verifyBPCRequest(
     const json = atob(padded + '='.repeat(padLen));
     payload = JSON.parse(json);
   } catch {
-    anomaly.recordSigFailure();
-    anomaly.recordDenied();
-    return { ok: false, error: 'invalid_signed_data' };
+    return deny('invalid_signed_data', true);
   }
 
-  // 4. Timestamp within window
+  // Step 7: Timestamp within window
   const ts = payload['timestamp'] as number;
   const now = Date.now();
   if (typeof ts !== 'number' || Math.abs(now - ts) > config.sigWindowMs) {
-    anomaly.recordExpiredTimestamp();
-    anomaly.recordDenied();
-    registry.recordActivity(req.pairId, false);
-    return { ok: false, error: 'timestamp_expired' };
+    await anomaly.recordExpiredTimestamp(req.pairId);
+    return deny('timestamp_expired', true);
   }
 
-  // 5. Nonce not seen before
+  // Step 8: Nonce not seen before
   const nonce = payload['nonce'] as string;
-  if (!nonce || nonceStore.checkAndConsume(nonce)) {
-    anomaly.recordReplay();
-    anomaly.recordDenied();
-    return { ok: false, error: 'replay_detected' };
+  if (!nonce || await nonceStore.checkAndConsume(nonce)) {
+    await anomaly.recordReplay(req.pairId);
+    return deny('replay_detected');
   }
 
-  // 6. Method and path match
+  // Step 9: Method and path match
   if (payload['method'] !== req.method || payload['path'] !== req.path) {
-    anomaly.recordSigFailure();
-    anomaly.recordDenied();
-    registry.recordActivity(req.pairId, false);
-    return { ok: false, error: 'method_path_mismatch' };
+    return deny('method_path_mismatch', true);
   }
 
-  // 7. Verify ECDSA signature over canonical payload
+  // Step 10: Scope enforcement
+  const allowedMethods = SCOPE_ALLOWED_METHODS[pair.scope] ?? SCOPE_ALLOWED_METHODS['read'];
+  if (!allowedMethods.has(req.method)) {
+    return deny('scope_violation');
+  }
+
+  // Step 11: Body hash verification (if client provided hash in payload)
+  const payloadBodyHash = payload['body_hash'] as string | undefined;
+  if (payloadBodyHash && req.bodyHash && payloadBodyHash !== req.bodyHash) {
+    return deny('invalid_body_hash', true);
+  }
+
+  // Step 12: Verify ECDSA signature over canonical payload
   let valid = false;
   try {
     const publicKey = await importPublicKeyFromJwk(pair.pubJwk);
@@ -107,13 +171,12 @@ export async function verifyBPCRequest(
   }
 
   if (!valid) {
-    anomaly.recordSigFailure();
-    anomaly.recordDenied();
-    registry.recordActivity(req.pairId, false);
-    return { ok: false, error: 'invalid_signature' };
+    return deny('invalid_signature', true);
   }
 
-  // 8. All checks passed
-  registry.recordActivity(req.pairId, true);
+  // All checks passed
+  await registry.recordActivity(req.pairId, true);
+  await config.auditLog?.write({ action: 'verify_pass', pairId: req.pairId, method: req.method, path: req.path, ip: req.ip });
+
   return { ok: true, pairId: req.pairId, pair };
 }
