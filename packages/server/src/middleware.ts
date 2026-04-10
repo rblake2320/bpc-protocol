@@ -4,7 +4,7 @@
  *        decode-payload → timestamp → nonce → method/path → scope → body-hash → signature
  */
 
-import { verifyPayload, importPublicKeyFromJwk, BPC_PROTOCOL_VERSION } from '@bpc/core';
+import { verifyPayload, importPublicKeyFromJwk, BPC_PROTOCOL_VERSION, verifySecretHmac } from '@bpc/core';
 import type { BPCVerifyResult } from './types.js';
 import type { PairRegistry } from './registry.js';
 import type { ServerNonceStore } from './nonce-store.js';
@@ -129,6 +129,21 @@ export async function verifyBPCRequest(
     return deny('invalid_signed_data', true);
   }
 
+  // Step 6.5: Verify user-secret HMAC (Layer 3 enforcement)
+  const secretHmac = payload['secret_hmac'] as string | undefined;
+  if (!secretHmac) {
+    return deny('missing_secret_hmac', true);
+  }
+  const secretValid = await verifySecretHmac(
+    pair.secretHash ?? '',
+    payload['nonce'] as string,
+    payload['timestamp'] as number,
+    secretHmac,
+  );
+  if (!secretValid) {
+    return deny('invalid_secret_hmac', true);
+  }
+
   // Step 7: Timestamp within window
   const ts = payload['timestamp'] as number;
   const now = Date.now();
@@ -157,8 +172,9 @@ export async function verifyBPCRequest(
 
   // Step 11: Body hash verification (if client provided hash in payload)
   const payloadBodyHash = payload['body_hash'] as string | undefined;
-  if (payloadBodyHash && req.bodyHash && payloadBodyHash !== req.bodyHash) {
-    return deny('invalid_body_hash', true);
+  if (payloadBodyHash) {
+    if (!req.bodyHash) return deny('missing_body_hash', true);
+    if (payloadBodyHash !== req.bodyHash) return deny('invalid_body_hash', true);
   }
 
   // Step 12: Verify ECDSA signature over canonical payload

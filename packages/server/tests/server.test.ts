@@ -34,7 +34,7 @@ async function buildSignedRequest(
   method: string,
   path: string,
   secretHash: string,
-): Promise<{ payload: BPCCanonicalPayload; signedData: string; signature: string }> {
+): Promise<{ payload: BPCCanonicalPayload; signedData: string; signature: string; bodyHash: string }> {
   const nonce = generateNonce();
   const timestamp = Date.now();
   const bodyHash = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('')));
@@ -54,7 +54,7 @@ async function buildSignedRequest(
   const signature = await signPayload(privateKey, payload as unknown as Record<string, unknown>);
   const signedData = encodePayload(payload as unknown as Record<string, unknown>);
 
-  return { payload, signedData, signature };
+  return { payload, signedData, signature, bodyHash };
 }
 
 function makeReqData(overrides: Partial<BPCRequestData> & { pairId: string | null; signedData: string | null; signature: string | null; method: string; path: string }): BPCRequestData {
@@ -97,7 +97,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
   });
 
   it('should verify a correctly signed request', async () => {
-    const { signedData, signature } = await buildSignedRequest(
+    const { signedData, signature, bodyHash } = await buildSignedRequest(
       keypair.privateKey, pairId, 'GET', '/api/data', secretHash,
     );
 
@@ -107,6 +107,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
       signature,
       method: 'GET',
       path: '/api/data',
+      bodyHash,
     });
 
     const result = await verifyBPCRequest(req, registry, nonceStore, anomaly);
@@ -116,7 +117,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
   });
 
   it('should reject a replayed request (same nonce)', async () => {
-    const { signedData, signature } = await buildSignedRequest(
+    const { signedData, signature, bodyHash } = await buildSignedRequest(
       keypair.privateKey, pairId, 'GET', '/api/data', secretHash,
     );
 
@@ -126,6 +127,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
       signature,
       method: 'GET',
       path: '/api/data',
+      bodyHash,
     });
 
     // First request succeeds
@@ -212,7 +214,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
     // Generate a different keypair — attacker's key
     const attackerKeypair = await generateKeypair();
 
-    const { signedData, signature } = await buildSignedRequest(
+    const { signedData, signature, bodyHash } = await buildSignedRequest(
       attackerKeypair.privateKey, pairId, 'GET', '/api/data', secretHash,
     );
 
@@ -222,6 +224,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
       signature, // signed with attacker's key, server has legitimate pair's pubkey
       method: 'GET',
       path: '/api/data',
+      bodyHash, // provide the body hash so we reach the signature check
     });
 
     const result = await verifyBPCRequest(req, registry, nonceStore, anomaly);
@@ -315,7 +318,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
     const attackerKeypair = await generateKeypair();
 
     for (let i = 0; i < 10; i++) {
-      const { signedData, signature } = await buildSignedRequest(
+      const { signedData, signature, bodyHash } = await buildSignedRequest(
         attackerKeypair.privateKey, pairId, 'GET', '/api/data', secretHash,
       );
       const req = makeReqData({
@@ -324,6 +327,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
         signature,
         method: 'GET',
         path: '/api/data',
+        bodyHash, // provide body hash so we reach the signature check
       });
       const result = await verifyBPCRequest(req, registry, nonceStore, anomaly);
       expect(result.ok).toBe(false);
@@ -335,7 +339,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
     expect(pair?.status).toBe('locked');
 
     // Next request should get pair_locked
-    const { signedData, signature } = await buildSignedRequest(
+    const { signedData, signature, bodyHash } = await buildSignedRequest(
       keypair.privateKey, pairId, 'GET', '/api/data', secretHash,
     );
     const req = makeReqData({
@@ -344,6 +348,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
       signature,
       method: 'GET',
       path: '/api/data',
+      bodyHash,
     });
     const result = await verifyBPCRequest(req, registry, nonceStore, anomaly);
     expect(result.ok).toBe(false);
@@ -354,7 +359,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
     // Rate limiter: 1 request per 60s window
     const rateLimiter = new MemoryRateLimiter(1, 60_000);
 
-    const { signedData: sd1, signature: sig1 } = await buildSignedRequest(
+    const { signedData: sd1, signature: sig1, bodyHash: bh1 } = await buildSignedRequest(
       keypair.privateKey, pairId, 'GET', '/api/data', secretHash,
     );
     const req1 = makeReqData({
@@ -364,6 +369,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
       method: 'GET',
       path: '/api/data',
       ip: '127.0.0.1',
+      bodyHash: bh1,
     });
 
     // First request passes
@@ -374,7 +380,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
     expect(r1.ok).toBe(true);
 
     // Second request from same IP gets rate limited
-    const { signedData: sd2, signature: sig2 } = await buildSignedRequest(
+    const { signedData: sd2, signature: sig2, bodyHash: bh2 } = await buildSignedRequest(
       keypair.privateKey, pairId, 'GET', '/api/data', secretHash,
     );
     const req2 = makeReqData({
@@ -384,6 +390,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
       method: 'GET',
       path: '/api/data',
       ip: '127.0.0.1',
+      bodyHash: bh2,
     });
     const r2 = await verifyBPCRequest(req2, registry, nonceStore, anomaly, {
       sigWindowMs: 60_000,
