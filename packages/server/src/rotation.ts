@@ -53,7 +53,15 @@ export async function handleRotation(
 
   if (!valid) return { ok: false, error: 'invalid_signature' };
 
-  // 4. Create new pair with same metadata, new public key
+  // 4. Bind rotation payload to request parameters
+  if ((payload as Record<string,unknown>)['purpose'] !== 'rotation') return { ok: false, error: 'payload_field_mismatch' };
+  if ((payload as Record<string,unknown>)['old_pair_id'] !== req.oldPairId) return { ok: false, error: 'payload_field_mismatch' };
+  if ((payload as Record<string,unknown>)['timestamp'] !== req.timestamp) return { ok: false, error: 'payload_field_mismatch' };
+  if (JSON.stringify((payload as Record<string,unknown>)['new_pub_jwk']) !== JSON.stringify(req.newPubJwk)) {
+    return { ok: false, error: 'payload_field_mismatch' };
+  }
+
+  // 5. (renumbered) Create new pair with same metadata, new public key
   const newPairId = generateId('pair');
   const newPair: StoredPair = {
     id: newPairId,

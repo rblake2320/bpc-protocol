@@ -39,7 +39,13 @@ export async function verifySecretHmac(
   // If a stored HMAC key is available, perform full verification
   if (storedHmacKey && storedHmacKey.length > 0) {
     const expected = await hmacDerive(storedHmacKey, nonce + timestamp);
-    return expected === providedHmac;
+    // Use timing-safe comparison to prevent timing attacks on HMAC verification
+    if (expected.length !== providedHmac.length) return false;
+    const a = new TextEncoder().encode(expected);
+    const b = new TextEncoder().encode(providedHmac);
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+    return diff === 0;
   }
 
   // Without stored key: structural validation only (v0.1.0 fallback)
