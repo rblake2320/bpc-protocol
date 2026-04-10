@@ -93,19 +93,39 @@ packages/
 - **`@bpc/server`** -- the verification pipeline (`verifyBPCRequest`), pair registry, server-side nonce store, and behavioral anomaly engine. Framework-agnostic -- bring your own HTTP framework.
 - **`@bpc/client-sdk`** -- `BPCClient` class that handles request signing and header construction. Provides a `fetch()` wrapper that automatically attaches BPC headers.
 
+## Security Properties
+
+The following properties are enforced by the protocol and verified by the test suite. Claims are scoped to **correctly implemented, correctly deployed, correctly operated** systems.
+
+| Property | Claim | How it holds |
+|----------|-------|--------------|
+| Credential isolation | A stolen API key cannot be used from a different device | ECDSA private key generated with `extractable: false` — cannot be exported by JavaScript or extracted by a compromised application layer |
+| Secret binding | A stolen device cannot be used without the user secret | Every request carries an HMAC derived from `hashSecret(secret)` mixed into the signed payload. The server verifies this independently of the ECDSA signature. |
+| Replay resistance | A captured valid request cannot be replayed | Per-request cryptographic nonce (consumed on first use) + 60-second timestamp window. Both must be valid simultaneously. |
+| Body integrity | A valid signature cannot be transplanted onto a different request body | `body_hash` (SHA-256 of the raw request body) is included in the signed canonical payload. Servers compute the hash of the received body and compare. |
+| Rotation authenticity | A key rotation cannot be initiated by an attacker who holds only the pair ID | The rotation payload (`old_pair_id`, `new_pub_jwk`, `timestamp`, `purpose`) is signed by the existing device private key. Server validates the signature and all bound fields before accepting the new key. |
+| Behavioral detection | Repeated probing, failed signatures, and replay attempts are tracked | Anomaly engine records per-pair threat scores. Operators can gate on score thresholds. |
+
+**What BPC does not claim:**
+
+- Protection against a fully compromised host (OS-level key extraction or secret theft are outside protocol scope)
+- Hardware attestation — the `extractable: false` flag prevents JS-layer extraction; TPM/Secure Enclave binding requires WebAuthn attestation (planned v0.2.0)
+- Quantum resistance — ECDSA P-256 is vulnerable to Shor's algorithm once cryptographically relevant quantum computers exist. NIST deprecates P-256 by 2030. Migration path to ML-DSA (CRYSTALS-Dilithium, FIPS 204) is planned before that deadline.
+
 ## Status
 
-v0.1.0 -- Working reference implementation. Patent pending. Not yet production-hardened.
+v1.0.0 — Production-hardened reference implementation. Patent pending.
+
+Three independent adversarial test passes were run against the codebase, finding and resolving: secret HMAC enforcement gap, rotation payload field binding, body hash enforcement in the example server, HMAC comparison timing, and Math.random() in the Redis rate limiter. All 57 tests (core, server, client-sdk) pass.
 
 The `non-extractable` flag on device keys prevents JavaScript-level key extraction. For hardware-level binding (TPM/Secure Enclave), platform attestation via WebAuthn is required and is planned for v0.2.0. See `spec/bpc-spec-v1.md` for the full protocol specification.
 
-## Open Items (v0.2.0)
+## Roadmap (v0.2.0)
 
-- HKDF-based server-side HMAC verification (independent secret validation without storing plaintext)
 - Persistent pair registry (database-backed, survives restarts)
 - Multi-instance nonce store (Redis-backed for load-balanced deployments)
 - Hardware attestation via WebAuthn (TPM/Secure Enclave key binding)
-- Scope enforcement at verification time (read / read-write / full)
+- ML-DSA migration path (post-quantum, pre-2030 NIST deadline)
 
 ## Attribution
 
