@@ -72,12 +72,22 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
 
     // --- Protected endpoints: require valid BPC ---
     if (path.startsWith('/api/')) {
+      // Read and hash the raw request body — required for body_hash verification.
+      // BPC client always includes body_hash in its signed payload (SHA-256 of the
+      // request body, or SHA-256 of empty string for GET/no-body requests).
+      // The server must compute the same hash from the actual received bytes and
+      // pass it here so the middleware can verify the client's claim.
+      const rawBody = await readBody(req);
+      const bodyBytes = new TextEncoder().encode(rawBody);
+      const digest = await crypto.subtle.digest('SHA-256', bodyBytes);
+      const bodyHashValue = 'sha256:' + Buffer.from(digest).toString('base64url');
+
       const reqData: BPCRequestData = {
         pairId: (req.headers['x-bpc-pair-id'] as string) ?? null,
         signedData: (req.headers['x-bpc-signed-data'] as string) ?? null,
         signature: (req.headers['x-bpc-signature'] as string) ?? null,
         version: (req.headers['x-bpc-version'] as string) ?? null,
-        bodyHash: null,   // body hash enforcement optional for this example
+        bodyHash: bodyHashValue,  // real hash of received body — verifies body wasn't swapped
         method,
         path,
         ip: req.socket.remoteAddress,

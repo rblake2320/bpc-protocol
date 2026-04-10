@@ -39,12 +39,14 @@ export async function verifySecretHmac(
   // If a stored HMAC key is available, perform full verification
   if (storedHmacKey && storedHmacKey.length > 0) {
     const expected = await hmacDerive(storedHmacKey, nonce + timestamp);
-    // Use timing-safe comparison to prevent timing attacks on HMAC verification
-    if (expected.length !== providedHmac.length) return false;
-    const a = new TextEncoder().encode(expected);
-    const b = new TextEncoder().encode(providedHmac);
-    let diff = 0;
-    for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+    // Constant-time comparison — no early return on length mismatch.
+    // Iterate over expected length, XOR actual bytes; accumulate a "lengths differ" flag
+    // into diff so that a wrong-length input is always rejected without leaking timing.
+    const enc = new TextEncoder();
+    const aBytes = enc.encode(expected);
+    const bBytes = enc.encode(providedHmac);
+    let diff = aBytes.length !== bBytes.length ? 1 : 0;
+    for (let i = 0; i < aBytes.length; i++) diff |= aBytes[i] ^ (bBytes[i] ?? 0);
     return diff === 0;
   }
 
