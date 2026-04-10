@@ -1,5 +1,5 @@
 import {
-  signPayload, hmacDerive,
+  signPayload, hmacDerive, hashSecret,
   generateNonce, b64url, canonicalize,
   BPC_PROTOCOL_VERSION,
 } from '@bpc/core';
@@ -39,7 +39,10 @@ export class BPCClient {
       bodyHash = EMPTY_BODY_HASH;
     }
 
-    const secretHmac = await hmacDerive(this.config.secret, nonce + timestamp);
+    // Derive secretHash the same way the server does at pairing time:
+    // server stores hashSecret(secret) = SHA256('bpc:' + secret) — HMAC key must match
+    const secretHash = await hashSecret(this.config.secret);
+    const secretHmac = await hmacDerive(secretHash, nonce + timestamp);
 
     const payload = {
       body_hash: bodyHash,
@@ -94,6 +97,7 @@ export class BPCClient {
     const rotationPayload = {
       old_pair_id: this.config.pairId,
       new_pub_jwk: newPubJwk,
+      purpose: 'rotation' as const,
       timestamp,
     };
 
