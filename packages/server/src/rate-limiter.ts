@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 export interface RateLimitResult {
   allowed: boolean;
   remaining: number;
@@ -69,7 +71,7 @@ export class RedisRateLimiter implements RateLimiter {
     }
 
     // Add current request
-    await this.redis.zadd(fullKey, now, `${now}-${Math.random()}`);
+    await this.redis.zadd(fullKey, now, `${now}-${randomUUID()}`);
     await this.redis.expire(fullKey, Math.ceil(this.windowMs / 1000) + 1);
 
     return {
@@ -79,3 +81,4 @@ export class RedisRateLimiter implements RateLimiter {
     };
   }
 }
+

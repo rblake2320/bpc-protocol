@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { BPCClient } from '../src/client.js';
-import { BPC_PROTOCOL_VERSION, generateKeypair, b64urlDecode } from '../../core/src/index.js';
+import { BPC_PROTOCOL_VERSION, generateKeypair, b64urlDecode, hashSecret, hmacDerive } from '../../core/src/index.js';
 import { prepareRegistration } from '../src/registration.js';
 import type { BPCKeypair } from '../../core/src/index.js';
 
@@ -55,6 +55,24 @@ describe('@bpc/client-sdk -- BPCClient', () => {
     expect(bodyHash).toMatch(/^sha256:[A-Za-z0-9_-]{43}$/);
   });
 
+  it('should derive secret_hmac from hashSecret(secret)', async () => {
+    const keypair = await generateKeypair();
+    const client = new BPCClient({
+      serverUrl: 'http://localhost:3100',
+      pairId: 'pair_test',
+      keypair,
+      secret: 'TestSecret1!',
+    });
+
+    const headers = await client.signRequest('GET', '/api/test');
+    const signedDataJson = new TextDecoder().decode(b64urlDecode(headers['X-BPC-Signed-Data']));
+    const payload = JSON.parse(signedDataJson) as Record<string, string>;
+
+    const secretHash = await hashSecret('TestSecret1!');
+    const expectedSecretHmac = await hmacDerive(secretHash, payload['nonce'] + payload['timestamp']);
+    expect(payload['secret_hmac']).toBe(expectedSecretHmac);
+  });
+
   it('should reject non-HTTPS URLs in production (not localhost)', async () => {
     const keypair = await generateKeypair();
     const client = new BPCClient({
@@ -80,6 +98,40 @@ describe('@bpc/client-sdk -- BPCClient', () => {
     const headers = await client.signRequest('GET', '/api/test');
     expect(headers['X-BPC-Pair-ID']).toBe('pair_test');
   });
+  it('should include purpose=rotation in the signed rotation payload', async () => {
+    const keypair = await generateKeypair();
+    const client = new BPCClient({
+      serverUrl: 'http://localhost:3100',
+      pairId: 'pair_test',
+      keypair,
+      secret: 'TestSecret1!',
+    });
+
+    const nextKeypair = await generateKeypair();
+    let capturedBody: string | undefined;
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      capturedBody = init?.body as string | undefined;
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      await client.rotate(nextKeypair);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(capturedBody).toBeDefined();
+    const rotationRequest = JSON.parse(capturedBody ?? '{}') as { signedData: string };
+    const signedDataJson = new TextDecoder().decode(b64urlDecode(rotationRequest.signedData));
+    const payload = JSON.parse(signedDataJson) as Record<string, unknown>;
+
+    expect(payload['purpose']).toBe('rotation');
+  });
 });
 
 describe('prepareRegistration', () => {
@@ -100,3 +152,5 @@ describe('prepareRegistration', () => {
     expect(request.pubJwk).toEqual(keypair.pubJwk);
   });
 });
+
+
