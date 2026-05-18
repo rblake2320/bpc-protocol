@@ -18,7 +18,7 @@
  * NIST SP 800-53 Rev 5 controls: IA-3, IA-5, SC-8, SC-13, SI-10, AU-2.
  */
 
-import { verifyPayload, importPublicKeyFromJwk, BPC_PROTOCOL_VERSION, verifySecretHmac } from '@bpc/core';
+import { verifyPayload, importPublicKeyFromJwk, BPC_PROTOCOL_VERSION, verifySecretHmac, assertNoForbiddenKeys } from '@bpc/core';
 import type { BPCVerifyResult } from './types.js';
 import type { PairRegistry } from './registry.js';
 import type { ServerNonceStore } from './nonce-store.js';
@@ -148,11 +148,14 @@ export async function verifyBPCRequest(
   if (pair.status !== 'active') return deny('pair_revoked');
 
   // Step 6: Decode and parse canonical payload
+  // BPC-07 FIX: Scan raw JSON for forbidden keys BEFORE JSON.parse() runs.
+  // Prevents constructor/prototype injection at the string level.
   let payload: Record<string, unknown>;
   try {
     const padded = req.signedData.replace(/-/g, '+').replace(/_/g, '/');
     const padLen = (4 - padded.length % 4) % 4;
     const json = atob(padded + '='.repeat(padLen));
+    assertNoForbiddenKeys(json); // throws TypeError on any forbidden key
     payload = JSON.parse(json);
   } catch {
     return deny('invalid_signed_data', true);
@@ -209,8 +212,15 @@ export async function verifyBPCRequest(
   }
 
   // Step 10: Scope enforcement
+  // BPC-08 FIX: Normalize method to uppercase before scope check to prevent
+  // case-sensitivity bypass. Also verify the method in the SIGNED PAYLOAD
+  // is within scope — not just the wire method — closing the scope-violation breach.
+  const normalizedWireMethod = req.method.toUpperCase();
+  const payloadMethod = typeof payload['method'] === 'string'
+    ? payload['method'].toUpperCase()
+    : '';
   const allowedMethods = SCOPE_ALLOWED_METHODS[pair.scope] ?? SCOPE_ALLOWED_METHODS['read'];
-  if (!allowedMethods.has(req.method)) {
+  if (!allowedMethods.has(normalizedWireMethod) || !allowedMethods.has(payloadMethod)) {
     return deny('scope_violation');
   }
 

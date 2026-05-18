@@ -49,6 +49,16 @@ export class PairRegistry {
   private maxPairs: number;
   private lockoutCount: number;
 
+  /**
+   * BPC-09 FIX — Attacker-Induced Lockout DoS:
+   * Track unauthenticated failures per IP address. A pair is only locked
+   * when the SAME IP accumulates >= lockoutCount failures within the window.
+   * An attacker from a different IP cannot lock a victim's pair.
+   * Key: `${pairId}:${ip}`, Value: { count, windowStart }.
+   */
+  private ipFailureTracker = new Map<string, { count: number; windowStart: number }>();
+  private readonly IP_FAILURE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
   constructor(store: PairStore, maxPairs = 2000, lockoutCount = 10) {
     this.store = store;
     this.maxPairs = maxPairs;
@@ -159,14 +169,46 @@ export class PairRegistry {
     return this.store.listPending();
   }
 
-  async recordActivity(pairId: string, success: boolean): Promise<void> {
+  /**
+   * Record authentication activity for a pair.
+   *
+   * BPC-09 FIX: The optional `ip` parameter enables IP-aware failure tracking.
+   * A pair is only locked when the SAME IP accumulates >= lockoutCount failures
+   * within IP_FAILURE_WINDOW_MS. This prevents an attacker from locking a
+   * victim's pair by sending forged failures from a different IP address.
+   *
+   * On success: resets global failedSigs and clears all IP failure entries.
+   * Without IP: falls back to global counter behavior (backward compat).
+   */
+  async recordActivity(pairId: string, success: boolean, ip?: string): Promise<void> {
     const pair = await this.store.get(pairId);
     if (!pair) return;
     pair.requests++;
     pair.lastActive = Date.now();
-    if (!success) {
+    if (success) {
+      // Reset on success — clear both global counter and all IP entries for this pair
+      pair.failedSigs = 0;
+      for (const key of this.ipFailureTracker.keys()) {
+        if (key.startsWith(`${pairId}:`)) this.ipFailureTracker.delete(key);
+      }
+    } else if (ip) {
+      // IP-aware: only lock when the SAME IP accumulates enough failures
+      const ipKey = `${pairId}:${ip}`;
+      const now = Date.now();
+      const tracker = this.ipFailureTracker.get(ipKey);
+      if (!tracker || now - tracker.windowStart > this.IP_FAILURE_WINDOW_MS) {
+        this.ipFailureTracker.set(ipKey, { count: 1, windowStart: now });
+      } else {
+        tracker.count++;
+      }
+      const ipFailures = this.ipFailureTracker.get(ipKey)!.count;
+      pair.failedSigs = ipFailures;
+      if (ipFailures >= this.lockoutCount && pair.status === 'active') {
+        pair.status = 'locked';
+      }
+    } else {
+      // No IP provided — fallback to original global counter (backward compat)
       pair.failedSigs++;
-      // Auto-lockout after threshold
       if (pair.failedSigs >= this.lockoutCount && pair.status === 'active') {
         pair.status = 'locked';
       }
