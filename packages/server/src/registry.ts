@@ -118,9 +118,82 @@ export class PairRegistry {
       lastActive: null,
       requests: 0,
       failedSigs: 0,
+      // Layer 8: Preserve kind and canaryClass from registration
+      kind:        pending.registration.kind ?? 'legitimate',
+      canaryClass: pending.registration.canaryClass,
     };
     await this.store.set(pair);
     return pairId;
+  }
+
+  /**
+   * Layer 8: Register a Ghost Pair (canary token).
+   *
+   * A Ghost Pair is a fully functional BPC pair whose credentials are
+   * intentionally planted in high-risk locations to catch different attacker classes.
+   * Three canaryClass values correspond to three distinct leak surfaces:
+   *
+   *   'env_file':       Plant in .env.example or sample config files.
+   *                     Catches developers who copy sample configs without rotating,
+   *                     and supply-chain attackers who scrape public repositories.
+   *
+   *   'docs':           Use as a fake example pairId in SDK documentation.
+   *                     Catches attackers who read your docs and try example credentials.
+   *
+   *   'registry_exfil': Provision as a real pair but never use in production traffic.
+   *                     Catches attackers who exfiltrated the database or obtained
+   *                     the registry via the BPC-04 enumeration vector.
+   *
+   * When triggered, the middleware:
+   *   1. Returns ok:true with ghostAlert:true and shadow:true (deceptive success)
+   *   2. Logs a CRITICAL severity audit event with full forensic detail
+   *   3. Auto-routes the attacker's source IP to Shadow Mode
+   *   4. The attacker believes they succeeded — the SOC is immediately alerted
+   *
+   * @param registration Standard PairRegistration (kind is forced to 'ghost')
+   * @param canaryClass  Which leak surface this canary covers
+   * @returns The ghost pair ID — plant this in your bait environment
+   */
+  async registerGhostPair(
+    registration: Omit<PairRegistration, 'kind' | 'canaryClass'>,
+    canaryClass: import('./types.js').CanaryClass = 'registry_exfil',
+  ): Promise<string> {
+    return this.registerDirect({ ...registration, kind: 'ghost', canaryClass });
+  }
+
+  /**
+   * Layer 8: Register all three Ghost Pair leak surfaces at once.
+   * Returns an object with the three pair IDs keyed by canaryClass.
+   * Plant each ID in its corresponding bait environment.
+   */
+  async registerAllGhostPairs(
+    baseRegistration: Omit<PairRegistration, 'kind' | 'canaryClass' | 'name'>,
+    pubJwkByClass: {
+      env_file:       JsonWebKey;
+      docs:           JsonWebKey;
+      registry_exfil: JsonWebKey;
+    },
+    secretHashByClass: {
+      env_file:       string;
+      docs:           string;
+      registry_exfil: string;
+    },
+  ): Promise<{ env_file: string; docs: string; registry_exfil: string }> {
+    const [envId, docsId, regId] = await Promise.all([
+      this.registerGhostPair(
+        { ...baseRegistration, name: 'ghost-env-file', pubJwk: pubJwkByClass.env_file, secretHash: secretHashByClass.env_file },
+        'env_file',
+      ),
+      this.registerGhostPair(
+        { ...baseRegistration, name: 'ghost-docs', pubJwk: pubJwkByClass.docs, secretHash: secretHashByClass.docs },
+        'docs',
+      ),
+      this.registerGhostPair(
+        { ...baseRegistration, name: 'ghost-registry-exfil', pubJwk: pubJwkByClass.registry_exfil, secretHash: secretHashByClass.registry_exfil },
+        'registry_exfil',
+      ),
+    ]);
+    return { env_file: envId, docs: docsId, registry_exfil: regId };
   }
 
   async registerDirect(registration: PairRegistration): Promise<string> {
