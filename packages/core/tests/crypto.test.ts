@@ -83,9 +83,10 @@ describe('verifySecretHmac', () => {
     expect(await verifySecretHmac('', 'nonce', 123, badHmac)).toBe(false);
   });
 
-  it('accepts structurally valid HMAC without stored key (v0.1.0 fallback)', async () => {
+  it('rejects HMAC when stored key is empty (BPC-01 fix — no fallback)', async () => {
+    // v0.1.0 fallback has been removed: empty stored key MUST always fail.
     const validHmac = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno';
-    expect(await verifySecretHmac('', 'nonce', 123, validHmac)).toBe(true);
+    expect(await verifySecretHmac('', 'nonce', 123, validHmac)).toBe(false);
   });
 
   it('performs full verification when stored key is provided', async () => {
@@ -102,44 +103,48 @@ describe('verifySecretHmac', () => {
 });
 
 describe('validateSecret', () => {
-  it('accepts a valid secret', () => {
-    const result = validateSecret('MyP@ss1!');
+  // IL4-7 policy: min 16 chars, max 128 chars, 2+ special chars.
+
+  it('accepts a valid IL4-7 compliant secret', () => {
+    const result = validateSecret('ValidSecret1!@#$');
     expect(result.valid).toBe(true);
     expect(result.reason).toBeUndefined();
   });
 
-  it('rejects too-short secret', () => {
-    const result = validateSecret('Ab1!');
+  it('rejects too-short secret (< 16 chars)', () => {
+    const result = validateSecret('Ab1!@');
     expect(result.valid).toBe(false);
     expect(result.reason).toContain('at least');
   });
 
   it('rejects secret missing uppercase', () => {
-    const result = validateSecret('myp@ss1!abc');
+    const result = validateSecret('myp@ss1!abc1234!!');
     expect(result.valid).toBe(false);
     expect(result.reason).toContain('uppercase');
   });
 
   it('rejects secret missing lowercase', () => {
-    const result = validateSecret('MYP@SS1!ABC');
+    const result = validateSecret('MYP@SS1!ABC1234!!');
     expect(result.valid).toBe(false);
     expect(result.reason).toContain('lowercase');
   });
 
   it('rejects secret missing digit', () => {
-    const result = validateSecret('MyP@ssss!');
+    const result = validateSecret('MyP@ssssABCDEF!!');
     expect(result.valid).toBe(false);
     expect(result.reason).toContain('digit');
   });
 
-  it('rejects secret missing special character', () => {
-    const result = validateSecret('MyPasss1abc');
+  it('rejects secret with only one special character', () => {
+    // 16+ chars, has upper/lower/digit, but only ONE special char
+    const result = validateSecret('MyPasss1abcDEF1!');
     expect(result.valid).toBe(false);
-    expect(result.reason).toContain('special');
+    expect(result.reason).toContain('two special');
   });
 
-  it('rejects secret exceeding max length', () => {
-    const result = validateSecret('A'.repeat(65) + 'b1!');
+  it('rejects secret exceeding max length (> 128 chars)', () => {
+    // 130 chars total: 120 'A' + 'b' + '1' + '!@' + 7 more 'A' = 130
+    const result = validateSecret('A'.repeat(126) + 'b1!@');
     expect(result.valid).toBe(false);
     expect(result.reason).toContain('at most');
   });

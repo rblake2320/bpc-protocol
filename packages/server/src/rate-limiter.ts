@@ -1,4 +1,23 @@
+/**
+ * BPC Rate Limiter
+ *
+ * Security hardening (IL4-7 / BPC-06 fix):
+ *  - Added capacity guard: evicts oldest 10% of entries when the in-memory
+ *    map exceeds 50k keys, preventing unbounded memory growth under attack.
+ *  - Sliding window algorithm prevents burst exploitation at window boundaries.
+ *  - Consumers should instantiate two limiters with different limits:
+ *      IP-based (unauthenticated):  MemoryRateLimiter(200, 60_000)
+ *      pairId-based (authenticated): MemoryRateLimiter(100, 60_000)
+ *    This prevents a single attacker from denying service to all users on a
+ *    shared IP/NAT, and prevents a compromised pair from flooding the server.
+ *
+ * NIST SP 800-53 Rev 5 controls: SC-5 (DoS Protection), SI-10.
+ */
+
 import { randomUUID } from 'node:crypto';
+
+/** Maximum number of tracked keys before eviction. */
+const MAX_TRACKED_KEYS = 50_000;
 
 export interface RateLimitResult {
   allowed: boolean;
@@ -21,22 +40,32 @@ export class MemoryRateLimiter implements RateLimiter {
   ) {}
 
   async check(key: string): Promise<RateLimitResult> {
-    const now = Date.now();
+    const now    = Date.now();
     const cutoff = now - this.windowMs;
 
+    // Capacity guard — evict oldest 10% of keys if map is too large.
+    if (this.windows.size >= MAX_TRACKED_KEYS) {
+      const evictCount = Math.ceil(MAX_TRACKED_KEYS * 0.1);
+      let evicted = 0;
+      for (const k of this.windows.keys()) {
+        if (evicted >= evictCount) break;
+        this.windows.delete(k);
+        evicted++;
+      }
+    }
+
     let timestamps = this.windows.get(key) ?? [];
-    // Evict expired timestamps
+    // Evict expired timestamps (sliding window).
     timestamps = timestamps.filter(t => t > cutoff);
 
     const allowed = timestamps.length < this.limit;
     if (allowed) timestamps.push(now);
-
     this.windows.set(key, timestamps);
 
     return {
       allowed,
       remaining: Math.max(0, this.limit - timestamps.length),
-      resetAt: (timestamps[0] ?? now) + this.windowMs,
+      resetAt:   (timestamps[0] ?? now) + this.windowMs,
     };
   }
 }

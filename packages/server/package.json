@@ -1,6 +1,6 @@
 {
   "name": "@bpc/server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "BPC Protocol server-side verification middleware",
   "type": "module",
   "main": "./dist/index.js",
@@ -23,8 +23,12 @@
     "ioredis": ">=5.0.0"
   },
   "peerDependenciesMeta": {
-    "pg": { "optional": true },
-    "ioredis": { "optional": true }
+    "pg": {
+      "optional": true
+    },
+    "ioredis": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "typescript": "^5.4.0",

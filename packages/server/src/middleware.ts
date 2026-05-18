@@ -1,7 +1,21 @@
 /**
- * BPC request verification — 12-step pipeline.
- * Steps: rate-limit → headers → version → pair-exists → pair-status →
- *        decode-payload → timestamp → nonce → method/path → scope → body-hash → signature
+ * BPC Request Verification Middleware — 12-step pipeline
+ *
+ * IL4-7 hardening applied:
+ *  - Step 6.5: secretHash fallback removed (BPC-01 fix) — empty secretHash
+ *    is now a hard failure at the middleware level (defense in depth alongside
+ *    the verifySecretHmac fix and the registry registration validation).
+ *  - Step 6: payload parsing validates nonce format (UUID) and timestamp type
+ *    before HMAC verification to prevent type-confusion attacks.
+ *  - Step 2: pairId format validated against expected pattern.
+ *  - Global: method and path validated against allowlists before processing.
+ *
+ * Pipeline steps:
+ *   rate-limit → headers → version → pair-exists → pair-status →
+ *   decode-payload → hmac → timestamp → nonce → method/path → scope →
+ *   body-hash → signature
+ *
+ * NIST SP 800-53 Rev 5 controls: IA-3, IA-5, SC-8, SC-13, SI-10, AU-2.
  */
 
 import { verifyPayload, importPublicKeyFromJwk, BPC_PROTOCOL_VERSION, verifySecretHmac } from '@bpc/core';
@@ -24,11 +38,17 @@ export interface BPCRequestData {
 }
 
 // Maximum header field lengths — prevents Node.js 431 and large-payload DoS.
-// ECDSA P-256 DER sig = 64–72 bytes → ~100 base64url chars. 256 is generous.
-// Canonical payload with all fields ≈ 400 bytes → ~550 base64url chars. 4096 is generous.
+// ECDSA P-256 DER sig = 64-72 bytes -> ~100 base64url chars. 256 is generous.
+// Canonical payload with all fields ~400 bytes -> ~550 base64url chars. 4096 is generous.
 const MAX_SIGNED_DATA_LEN = 4096;
-const MAX_SIGNATURE_LEN = 256;
-const MAX_PAIR_ID_LEN = 64;
+const MAX_SIGNATURE_LEN   = 256;
+const MAX_PAIR_ID_LEN     = 64;
+
+/** Allowed HTTP methods — reject anything outside this set before processing. */
+const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE']);
+
+/** UUID v4 regex for nonce format validation. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export interface BPCServerConfig {
   sigWindowMs: number;
@@ -73,6 +93,11 @@ export async function verifyBPCRequest(
     if (!rl.allowed) return deny('rate_limit_exceeded');
   }
 
+  // Step 1b: Method allowlist — reject unknown HTTP methods immediately.
+  if (!ALLOWED_METHODS.has(req.method)) {
+    return deny('invalid_method');
+  }
+
   // Step 2: Headers present + size guards (prevents Node.js 431 / large-payload DoS)
   if (!req.pairId || !req.signedData || !req.signature) {
     return deny('missing_headers');
@@ -80,6 +105,10 @@ export async function verifyBPCRequest(
   if (req.pairId.length > MAX_PAIR_ID_LEN ||
       req.signedData.length > MAX_SIGNED_DATA_LEN ||
       req.signature.length > MAX_SIGNATURE_LEN) {
+    return deny('invalid_signed_data');
+  }
+  // pairId format: must be alphanumeric + underscore/hyphen only.
+  if (!/^[A-Za-z0-9_-]+$/.test(req.pairId)) {
     return deny('invalid_signed_data');
   }
 
@@ -129,32 +158,47 @@ export async function verifyBPCRequest(
     return deny('invalid_signed_data', true);
   }
 
-  // Step 6.5: Verify user-secret HMAC (Layer 3 enforcement)
+  // Step 6.5: Validate payload field types before HMAC verification.
+  // Prevents type-confusion attacks where timestamp or nonce is a non-scalar.
+  const rawNonce     = payload['nonce'];
+  const rawTimestamp = payload['timestamp'];
+  if (typeof rawNonce !== 'string' || !UUID_RE.test(rawNonce)) {
+    return deny('invalid_signed_data', true);
+  }
+  if (typeof rawTimestamp !== 'number' || !Number.isFinite(rawTimestamp)) {
+    return deny('invalid_signed_data', true);
+  }
+
+  // Step 6.6: Verify user-secret HMAC (Layer 3 enforcement)
+  // IL4-7 / BPC-01 defense-in-depth: explicitly reject empty secretHash here
+  // in addition to the fix in verifySecretHmac() and registry validation.
   const secretHmac = payload['secret_hmac'] as string | undefined;
   if (!secretHmac) {
     return deny('missing_secret_hmac', true);
   }
+  if (!pair.secretHash || pair.secretHash.length === 0) {
+    // Pair was registered without a valid secretHash — hard reject.
+    return deny('invalid_secret_hmac', true);
+  }
   const secretValid = await verifySecretHmac(
-    pair.secretHash ?? '',
-    payload['nonce'] as string,
-    payload['timestamp'] as number,
+    pair.secretHash,
+    rawNonce,
+    rawTimestamp,
     secretHmac,
   );
   if (!secretValid) {
     return deny('invalid_secret_hmac', true);
   }
 
-  // Step 7: Timestamp within window
-  const ts = payload['timestamp'] as number;
+  // Step 7: Timestamp within window (rawTimestamp already type-validated above).
   const now = Date.now();
-  if (typeof ts !== 'number' || Math.abs(now - ts) > config.sigWindowMs) {
+  if (Math.abs(now - rawTimestamp) > config.sigWindowMs) {
     await anomaly.recordExpiredTimestamp(req.pairId);
     return deny('timestamp_expired', true);
   }
 
-  // Step 8: Nonce not seen before
-  const nonce = payload['nonce'] as string;
-  if (!nonce || await nonceStore.checkAndConsume(nonce)) {
+  // Step 8: Nonce not seen before (rawNonce already UUID-validated above).
+  if (await nonceStore.checkAndConsume(rawNonce)) {
     await anomaly.recordReplay(req.pairId);
     return deny('replay_detected');
   }

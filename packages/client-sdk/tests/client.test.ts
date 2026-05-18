@@ -120,7 +120,7 @@ describe('@bpc/client-sdk -- BPCClient', () => {
     }) as typeof fetch;
 
     try {
-      await client.rotate(nextKeypair);
+      await client.rotate(nextKeypair.pubJwk);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -131,6 +131,10 @@ describe('@bpc/client-sdk -- BPCClient', () => {
     const payload = JSON.parse(signedDataJson) as Record<string, unknown>;
 
     expect(payload['purpose']).toBe('rotation');
+    // IL4-7 / BPC-05: new_pub_jwk is now serialized as a JSON string field.
+    expect(typeof payload['new_pub_jwk_json']).toBe('string');
+    const parsedJwk = JSON.parse(payload['new_pub_jwk_json'] as string) as JsonWebKey;
+    expect(parsedJwk.kty).toBe('EC');
   });
 });
 

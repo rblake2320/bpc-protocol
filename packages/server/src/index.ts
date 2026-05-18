@@ -7,7 +7,7 @@ export type {
 } from './types.js';
 export type { BPCRequestData, BPCServerConfig } from './middleware.js';
 export type { PairStore, NonceStoreBackend, AnomalyStore } from './store.js';
-export type { AuditLog, AuditEntry, AuditAction } from './audit.js';
+export type { AuditLog, AuditEntry, AuditAction, AuditSeverity } from './audit.js';
 export type { RateLimiter, RateLimitResult } from './rate-limiter.js';
 export type { RotationRequest, RotationResult } from './rotation.js';
 export type { PgPool } from './pg-store.js';
@@ -17,6 +17,7 @@ export type { RedisZSetClient } from './rate-limiter.js';
 
 // Implementations
 export { PairRegistry } from './registry.js';
+export type { RedactedPair } from './registry.js';
 export { AnomalyEngine } from './anomaly.js';
 export { ServerNonceStore } from './nonce-store.js';
 export { verifyBPCRequest } from './middleware.js';

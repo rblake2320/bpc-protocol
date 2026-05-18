@@ -94,10 +94,12 @@ export class BPCClient {
    */
   async rotate(newPubJwk: JsonWebKey, rotationEndpoint = '/bpc/rotate'): Promise<{ newPairId: string }> {
     const timestamp = Date.now();
+    // IL4-7 / BPC-05: canonicalize() only accepts flat (scalar) payloads.
+    // Serialize new_pub_jwk as a JSON string so it is a scalar field.
     const rotationPayload = {
-      old_pair_id: this.config.pairId,
-      new_pub_jwk: newPubJwk,
-      purpose: 'rotation' as const,
+      new_pub_jwk_json: JSON.stringify(newPubJwk),
+      old_pair_id:      this.config.pairId,
+      purpose:          'rotation' as const,
       timestamp,
     };
 

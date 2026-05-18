@@ -1,8 +1,8 @@
 {
   "name": "bpc-protocol",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "BPC — Bound Pair Credentials: hardware-bound, pair-verified, replay-proof API authentication protocol",
+  "description": "BPC \u2014 Bound Pair Credentials: hardware-bound, pair-verified, replay-proof API authentication protocol",
   "workspaces": [
     "packages/core",
     "packages/server",
