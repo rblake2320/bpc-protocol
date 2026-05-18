@@ -1307,7 +1307,11 @@ if (results.findings.length > 0) {
 }
 
 import { writeFileSync } from 'node:fs';
-writeFileSync('/home/ubuntu/master-attack/nuclear-results.json', JSON.stringify({
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const outPath = join(__dirname, 'nuclear-results.json');
+writeFileSync(outPath, JSON.stringify({
   totalAttacks: results.total,
   blocked: results.blocked,
   breached: results.breached,
@@ -1315,4 +1319,4 @@ writeFileSync('/home/ubuntu/master-attack/nuclear-results.json', JSON.stringify(
   findings: results.findings,
   timestamp: new Date().toISOString()
 }, null, 2));
-console.log('\nResults written to /home/ubuntu/master-attack/nuclear-results.json');
+console.log(`\nResults written to ${outPath}`);

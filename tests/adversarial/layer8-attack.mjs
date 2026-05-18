@@ -781,9 +781,13 @@ if (breaches.length > 0) {
 }
 
 import { writeFileSync } from 'node:fs';
-writeFileSync('/home/ubuntu/master-attack/layer8-results.json', JSON.stringify({
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const outPath = join(__dirname, 'layer8-results.json');
+writeFileSync(outPath, JSON.stringify({
   timestamp: new Date().toISOString(),
   summary: { total, passed, failed, breaches: breaches.length },
   results,
 }, null, 2));
-console.log('\nResults written to layer8-results.json');
+console.log(`\nResults written to ${outPath}`);
