@@ -172,13 +172,17 @@ export class PairRegistry {
   /**
    * Record authentication activity for a pair.
    *
-   * BPC-09 FIX: The optional `ip` parameter enables IP-aware failure tracking.
-   * A pair is only locked when the SAME IP accumulates >= lockoutCount failures
-   * within IP_FAILURE_WINDOW_MS. This prevents an attacker from locking a
-   * victim's pair by sending forged failures from a different IP address.
+   * BPC-09 FIX: IP-aware failure tracking. A pair is only locked when the
+   * SAME IP accumulates >= lockoutCount failures within IP_FAILURE_WINDOW_MS.
    *
-   * On success: resets global failedSigs and clears all IP failure entries.
-   * Without IP: falls back to global counter behavior (backward compat).
+   * BPC-10 FIX: Cumulative failure decay (slow-drip evasion protection).
+   * Failures are tracked with a half-life decay: each window, the cumulative
+   * score is halved before new failures are added. This means an attacker
+   * who sends 9 failures/window will accumulate: 9 → 13.5 → 15.75 → ...
+   * eventually crossing the lockout threshold. They cannot probe indefinitely
+   * by staying just below the per-window limit.
+   *
+   * On success: resets all failure counters and clears all IP failure entries.
    */
   async recordActivity(pairId: string, success: boolean, ip?: string): Promise<void> {
     const pair = await this.store.get(pairId);
@@ -186,8 +190,10 @@ export class PairRegistry {
     pair.requests++;
     pair.lastActive = Date.now();
     if (success) {
-      // Reset on success — clear both global counter and all IP entries for this pair
+      // Full reset on success
       pair.failedSigs = 0;
+      pair.cumulativeFailures = 0;
+      pair.firstFailureAt = null;
       for (const key of this.ipFailureTracker.keys()) {
         if (key.startsWith(`${pairId}:`)) this.ipFailureTracker.delete(key);
       }
@@ -203,17 +209,50 @@ export class PairRegistry {
       }
       const ipFailures = this.ipFailureTracker.get(ipKey)!.count;
       pair.failedSigs = ipFailures;
+      // BPC-10: Apply cumulative decay for slow-drip detection
+      this._applyCumulativeDecay(pair);
       if (ipFailures >= this.lockoutCount && pair.status === 'active') {
         pair.status = 'locked';
       }
+      // Also check cumulative threshold (catches slow-drip across windows)
+      if ((pair.cumulativeFailures ?? 0) >= this.lockoutCount * 2 && pair.status === 'active') {
+        pair.status = 'locked';
+      }
     } else {
-      // No IP provided — fallback to original global counter (backward compat)
+      // No IP provided — fallback to global counter with cumulative decay
       pair.failedSigs++;
+      // BPC-10: Apply cumulative decay for slow-drip detection
+      this._applyCumulativeDecay(pair);
       if (pair.failedSigs >= this.lockoutCount && pair.status === 'active') {
+        pair.status = 'locked';
+      }
+      // Also check cumulative threshold
+      if ((pair.cumulativeFailures ?? 0) >= this.lockoutCount * 2 && pair.status === 'active') {
         pair.status = 'locked';
       }
     }
     await this.store.set(pair);
+  }
+
+  /**
+   * BPC-10: Apply half-life decay to cumulative failure score.
+   * Called on every failure. Decays the cumulative score by half for each
+   * full window that has elapsed since the first failure, then increments by 1.
+   */
+  private _applyCumulativeDecay(pair: import('./types.js').StoredPair): void {
+    const now = Date.now();
+    const firstFailure = pair.firstFailureAt ?? now;
+    const windowsElapsed = Math.floor((now - firstFailure) / this.IP_FAILURE_WINDOW_MS);
+    let cumulative = pair.cumulativeFailures ?? 0;
+    // Decay: halve for each elapsed window (minimum 0)
+    if (windowsElapsed > 0) {
+      cumulative = cumulative / Math.pow(2, windowsElapsed);
+    }
+    // Add this failure
+    cumulative += 1;
+    pair.cumulativeFailures = cumulative;
+    // Update firstFailureAt: reset to now if we decayed (new cycle), else keep original
+    pair.firstFailureAt = windowsElapsed > 0 ? now : firstFailure;
   }
 
   async unlock(pairId: string): Promise<void> {

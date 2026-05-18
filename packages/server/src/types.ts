@@ -14,6 +14,16 @@ export interface StoredPair {
   lastActive: number | null;
   requests: number;
   failedSigs: number;
+  /**
+   * BPC-10 FIX — Slow-drip evasion protection.
+   * Cumulative failure score with half-life decay per IP_FAILURE_WINDOW_MS.
+   * Failures never reset to zero on window expiry — they decay by half.
+   * An attacker sending 9 failures/window accumulates: 9 → 13.5 → 15.75...
+   * eventually crossing the lockout threshold, closing the slow-drip gap.
+   */
+  cumulativeFailures?: number;
+  /** Timestamp of the first failure in the current decay cycle. */
+  firstFailureAt?: number | null;
   expiresAt?: number;
 }
 
