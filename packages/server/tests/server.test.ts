@@ -338,7 +338,8 @@ describe('@bpc/server — verifyBPCRequest', () => {
     const pair = await registry.get(pairId);
     expect(pair?.status).toBe('locked');
 
-    // Next request should get pair_locked
+    // Next request: Shadow Mode is enabled by default, so a locked pair returns
+    // ok:true with shadow:true instead of pair_locked — attacker is deceived.
     const { signedData, signature, bodyHash } = await buildSignedRequest(
       keypair.privateKey, pairId, 'GET', '/api/data', secretHash,
     );
@@ -351,8 +352,16 @@ describe('@bpc/server — verifyBPCRequest', () => {
       bodyHash,
     });
     const result = await verifyBPCRequest(req, registry, nonceStore, anomaly);
-    expect(result.ok).toBe(false);
-    expect(result.error).toBe('pair_locked');
+    expect(result.ok).toBe(true);
+    expect(result.shadow).toBe(true);
+
+    // With Shadow Mode explicitly disabled, the raw pair_locked error is returned.
+    const result2 = await verifyBPCRequest(req, registry, nonceStore, anomaly, {
+      sigWindowMs: 60_000,
+      enableShadowMode: false,
+    });
+    expect(result2.ok).toBe(false);
+    expect(result2.error).toBe('pair_locked');
   });
 
   it('should reject requests when rate limited', async () => {
@@ -477,21 +486,41 @@ describe('@bpc/server — verifyBPCRequest', () => {
   });
 
   it('should lock via failedSigs check even if status field lags (parallel-race guard)', async () => {
+    // ── Assertion 1: Shadow Mode OFF → raw pair_locked error ──────────────────
+    // Use a fresh isolated pair so state is clean.
+    const store1 = new MemoryPairStore();
+    const registry1 = new PairRegistry(store1);
+    const nonceStore1 = new ServerNonceStore(new MemoryNonceBackend(), 60_000);
+    const anomaly1 = new AnomalyEngine(new MemoryAnomalyStore());
+    const kp1 = await generateKeypair();
+    const sh1 = await hashSecret('race-guard-secret-1');
+    const raceId1 = await registry1.registerDirect({ name: 'race-1', scope: 'read', mode: 'development', secretHash: sh1, pubJwk: kp1.pubJwk });
     // Manually set failedSigs to lockoutCount without changing status
-    // (simulates the state mid-race where status hasn't been written back yet)
-    const pair = await registry.get(pairId);
-    if (pair) {
-      pair.failedSigs = 10;
-      // Don't set status=locked — simulate mid-race state
-    }
-
-    const { signedData, signature } = await buildSignedRequest(
-      keypair.privateKey, pairId, 'GET', '/api/data', secretHash,
-    );
-    const req = makeReqData({ pairId, signedData, signature, method: 'GET', path: '/api/data' });
-    const result = await verifyBPCRequest(req, registry, nonceStore, anomaly, { sigWindowMs: 60_000, lockoutCount: 10 });
+    const pair1 = await registry1.get(raceId1);
+    if (pair1) { pair1.failedSigs = 10; }
+    const { signedData: sd1, signature: sig1 } = await buildSignedRequest(kp1.privateKey, raceId1, 'GET', '/api/data', sh1);
+    const req1 = makeReqData({ pairId: raceId1, signedData: sd1, signature: sig1, method: 'GET', path: '/api/data' });
+    const result = await verifyBPCRequest(req1, registry1, nonceStore1, anomaly1, { sigWindowMs: 60_000, lockoutCount: 10, enableShadowMode: false });
     expect(result.ok).toBe(false);
     expect(result.error).toBe('pair_locked');
+
+    // ── Assertion 2: Shadow Mode ON → deceptive ok:true + shadow:true ─────────
+    // Use a completely separate fresh pair so the first call's side-effects
+    // (recordActivity overwriting failedSigs) do not contaminate this assertion.
+    const store2 = new MemoryPairStore();
+    const registry2 = new PairRegistry(store2);
+    const nonceStore2 = new ServerNonceStore(new MemoryNonceBackend(), 60_000);
+    const anomaly2 = new AnomalyEngine(new MemoryAnomalyStore());
+    const kp2 = await generateKeypair();
+    const sh2 = await hashSecret('race-guard-secret-2');
+    const raceId2 = await registry2.registerDirect({ name: 'race-2', scope: 'read', mode: 'development', secretHash: sh2, pubJwk: kp2.pubJwk });
+    const pair2 = await registry2.get(raceId2);
+    if (pair2) { pair2.failedSigs = 10; }
+    const { signedData: sd2, signature: sig2 } = await buildSignedRequest(kp2.privateKey, raceId2, 'GET', '/api/data', sh2);
+    const req2 = makeReqData({ pairId: raceId2, signedData: sd2, signature: sig2, method: 'GET', path: '/api/data' });
+    const result2 = await verifyBPCRequest(req2, registry2, nonceStore2, anomaly2, { sigWindowMs: 60_000, lockoutCount: 10, enableShadowMode: true });
+    expect(result2.ok).toBe(true);
+    expect(result2.shadow).toBe(true);
   });
 });
 

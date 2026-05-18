@@ -128,7 +128,7 @@ export async function verifyBPCRequest(
       if (pairId) await anomaly.recordSigFailureForIp(pairId, sourceIp);
     }
     await config.auditLog?.write({ action: 'verify_fail', pairId, error, ip: req.ip, method: req.method, path: req.path });
-    if (pairId && doSigFail) await registry.recordActivity(pairId, false);
+    if (pairId && doSigFail) await registry.recordActivity(pairId, false, sourceIp);
     return { ok: false, error };
   }
 
@@ -226,7 +226,7 @@ export async function verifyBPCRequest(
   // Belt-and-suspenders lockout: check failedSigs directly
   const lockoutCount = config.lockoutCount ?? 10;
   if (pair.failedSigs >= lockoutCount) {
-    registry.recordActivity(req.pairId, false).catch(() => {});
+    registry.recordActivity(req.pairId, false, sourceIp).catch(() => {});
     if (shadowEnabled) {
       await anomaly.enterShadowState(req.pairId, sourceIp, 'failedSigs_threshold');
       const delayMs = tarpitEnabled ? await anomaly.applyTarpit(sourceIp, 'shadow') : 0;
