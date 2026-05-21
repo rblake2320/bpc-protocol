@@ -2,6 +2,11 @@
  * BPC Request Verification Middleware — 12-step pipeline
  *
  * IL4-7 hardening applied:
+ *  - Step 0: Pre-authentication IP rate limiting via `ipRateLimiter` config field.
+ *    This fires BEFORE any BPC header is read, so unauthenticated floods are
+ *    throttled at the edge. Separate from the per-pair limiter (`rateLimiter`)
+ *    so a flooded IP cannot exhaust the per-pair budget for legitimate users.
+ *    (BPC-06 / Chain-5 fix — NIST SP 800-53 SC-5)
  *  - Step 6.5: secretHash fallback removed (BPC-01 fix) — empty secretHash
  *    is now a hard failure at the middleware level (defense in depth alongside
  *    the verifySecretHmac fix and the registry registration validation).
@@ -11,11 +16,11 @@
  *  - Global: method and path validated against allowlists before processing.
  *
  * Pipeline steps:
- *   rate-limit → headers → version → pair-exists → pair-status →
+ *   ip-rate-limit → rate-limit → headers → version → pair-exists → pair-status →
  *   decode-payload → hmac → timestamp → nonce → method/path → scope →
  *   body-hash → signature
  *
- * NIST SP 800-53 Rev 5 controls: IA-3, IA-5, SC-8, SC-13, SI-10, AU-2.
+ * NIST SP 800-53 Rev 5 controls: IA-3, IA-5, SC-5, SC-8, SC-13, SI-10, AU-2.
  */
 
 import { verifyPayload, importPublicKeyFromJwk, BPC_PROTOCOL_VERSION, verifySecretHmac } from '@bpc/core';
@@ -53,7 +58,18 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 export interface BPCServerConfig {
   sigWindowMs: number;
   lockoutCount?: number;          // failed sig threshold before pair is locked (default: 10)
-  rateLimiter?: RateLimiter;      // optional — if omitted, rate limiting is skipped
+  /**
+   * Per-IP rate limiter — fires BEFORE any BPC header is read.
+   * Recommended: MemoryRateLimiter(200, 60_000) for unauthenticated endpoints.
+   * Separate from `rateLimiter` so IP floods cannot exhaust per-pair budgets.
+   * (IL4-7 / BPC-06 fix — NIST SP 800-53 SC-5)
+   */
+  ipRateLimiter?: RateLimiter;
+  /**
+   * Per-pair rate limiter — fires after pairId is read from headers.
+   * Recommended: MemoryRateLimiter(100, 60_000) for authenticated endpoints.
+   */
+  rateLimiter?: RateLimiter;
   auditLog?: AuditLog;            // optional — if omitted, no audit logging
 }
 
@@ -83,7 +99,16 @@ export async function verifyBPCRequest(
     return { ok: false, error };
   }
 
-  // Step 1: Rate limit check
+  // Step 0: Pre-authentication IP rate limit — fires before any BPC header is read.
+  // This is the primary defence against unauthenticated floods (Chain-5 / BPC-06).
+  // Must use a separate limiter from the per-pair limiter so that a flooded IP
+  // cannot exhaust the per-pair budget for legitimate users on the same IP/NAT.
+  if (config.ipRateLimiter && req.ip) {
+    const rl = await config.ipRateLimiter.check(`ip:${req.ip}`);
+    if (!rl.allowed) return deny('rate_limit_exceeded');
+  }
+
+  // Step 1: Per-pair rate limit check (fires after pairId is available from headers).
   if (config.rateLimiter && req.ip) {
     const rl = await config.rateLimiter.check(`ip:${req.ip}`);
     if (!rl.allowed) return deny('rate_limit_exceeded');

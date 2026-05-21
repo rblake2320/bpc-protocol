@@ -15,6 +15,10 @@ export type { RedisClient } from './redis-nonce.js';
 export type { RedisIncrClient } from './redis-anomaly.js';
 export type { RedisZSetClient } from './rate-limiter.js';
 
+// Admin endpoint authentication (Chain-3 / BPC-04 fix)
+export type { AdminAuthConfig, AdminRequestHeaders } from './admin.js';
+export { verifyAdminRequest } from './admin.js';
+
 // Implementations
 export { PairRegistry } from './registry.js';
 export type { RedactedPair } from './registry.js';
