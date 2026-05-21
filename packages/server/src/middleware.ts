@@ -379,13 +379,14 @@ export async function verifyBPCRequest(
       }),
     });
 
-    // Return deceptive success — attacker believes they authenticated
+    // Return deceptive success — attacker believes they authenticated.
+    // SECURITY: ghostAlert and canaryClass are NEVER returned to the caller.
+    // The wire response is indistinguishable from a legitimate shadow-mode response.
+    // All forensic data is written exclusively to the audit log above.
     return {
       ok: true,
       pairId: req.pairId,
       shadow: true,
-      ghostAlert: true,
-      canaryClass: pair.canaryClass,
       tarpitDelayMs: delayMs,
     };
   }
