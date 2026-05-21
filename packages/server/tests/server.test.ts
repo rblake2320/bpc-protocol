@@ -603,8 +603,9 @@ describe('@bpc/server — AnomalyEngine', () => {
       await engine.recordUnknownPair();
     }
     const score = await engine.threatScore();
-    // unknownRate=1 (30pts) + sigRate=1 (30pts) + replay=0 + expired=0 = 60 * 100 = 6000
-    expect(score).toBe(6000);
+    // unknownRate=1 (30pts) + sigRate=1 (30pts) + replay=0 + expired=0 = 60
+    // Weights sum to 100. No extra *100 multiplier. Score range is 0-100.
+    expect(score).toBe(60);
   });
 
   it('should track counters accurately', async () => {

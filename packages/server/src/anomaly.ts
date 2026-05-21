@@ -241,7 +241,9 @@ export class AnomalyEngine {
     const sigRate = Math.min(sigFail / total, 1);
     const replayRate = Math.min(replay / total, 1);
     const expiredRate = Math.min(expiredTs / total, 1);
-    return Math.round((unknownRate * 30 + sigRate * 30 + replayRate * 20 + expiredRate * 20) * 100);
+    // Weights sum to 100 (30+30+20+20). Result is already in 0-100 range.
+    // DO NOT multiply by 100 — the weights produce a 0-100 score directly.
+    return Math.round(unknownRate * 30 + sigRate * 30 + replayRate * 20 + expiredRate * 20);
   }
 
   async counters(): Promise<AnomalyCounters> {

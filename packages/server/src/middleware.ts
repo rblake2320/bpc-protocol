@@ -176,10 +176,10 @@ export async function verifyBPCRequest(
   }
 
   // Step 1: Per-pair rate limit check (fires after pairId is available from headers).
-  if (config.rateLimiter && req.ip) {
-    const rl = await config.rateLimiter.check(`ip:${req.ip}`);
-    if (!rl.allowed) return deny('rate_limit_exceeded');
-  }
+  // IMPORTANT: This limiter checks ONLY the pair: key, never the ip: key.
+  // IP-level throttling is handled exclusively by ipRateLimiter (Step 0).
+  // Checking ip: here would cause all clients behind the same NAT to share a
+  // single per-pair budget, enabling targeted lockout DoS.
   if (config.rateLimiter && req.pairId) {
     const rl = await config.rateLimiter.check(`pair:${req.pairId}`);
     if (!rl.allowed) return deny('rate_limit_exceeded');
