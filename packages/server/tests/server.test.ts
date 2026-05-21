@@ -604,7 +604,9 @@ describe('@bpc/server — AnomalyEngine', () => {
     }
     const score = await engine.threatScore();
     // unknownRate=1 (30pts) + sigRate=1 (30pts) + replay=0 + expired=0 = 60
-    // Weights sum to 100. No extra *100 multiplier. Score range is 0-100.
+    // BPC-07 FIX: The old formula multiplied by 100 (producing 6000), causing any
+    // server with 2+ unknown-pair probes to hit the 70-point attack threshold and
+    // permanently 429-lock all clients. The correct score is 0-100, not 0-10000.
     expect(score).toBe(60);
   });
 
