@@ -1,7 +1,7 @@
 {
   "name": "@bpc/client-sdk",
   "version": "0.2.0",
-  "description": "BPC Protocol client SDK \u2014 drop-in signed request support",
+  "description": "BPC Protocol client SDK — drop-in signed request support",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -16,7 +16,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@bpc/core": "^0.1.0"
+    "@bpc/core": "^0.2.0"
   },
   "devDependencies": {
     "typescript": "^5.4.0",

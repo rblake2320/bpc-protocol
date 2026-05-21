@@ -11,8 +11,19 @@
  * NIST SP 800-53 Rev 5 controls: AU-2, AU-3, AU-9, AU-12.
  */
 
-export type AuditAction = 'verify_pass' | 'verify_fail' | 'register' | 'revoke' | 'rotate' | 'lockout';
-export type AuditSeverity = 'info' | 'warn' | 'critical';
+export type AuditAction =
+  | 'verify_pass'
+  | 'verify_fail'
+  | 'register'
+  | 'revoke'
+  | 'rotate'
+  | 'lockout'
+  // Layer 8 Active Defense actions
+  | 'shadow_mode_hit'
+  | 'shadow_mode_enter'
+  | 'ghost_pair_triggered';
+
+export type AuditSeverity = 'info' | 'warn' | 'critical' | 'HIGH' | 'CRITICAL';
 
 export interface AuditEntry {
   id: string;
@@ -26,6 +37,8 @@ export interface AuditEntry {
   path?: string;
   userAgent?: string;
   requestId?: string;
+  /** Layer 8: Additional forensic detail (JSON string for ghost/shadow events). */
+  detail?: string;
 }
 
 export interface AuditLog {
