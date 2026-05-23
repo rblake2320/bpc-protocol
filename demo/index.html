@@ -992,6 +992,100 @@ textarea { min-height: 80px; resize: vertical; }
           </div>
         </div>
 
+        <!-- Bond architecture -->
+        <div class="card" style="margin-bottom:var(--space-4);border:1px solid var(--color-warning)">
+          <div style="display:flex;align-items:center;gap:var(--space-3);padding:var(--space-4);border-bottom:1px solid var(--color-border)">
+            <span style="font-size:1.2rem">🔗</span>
+            <div>
+              <div class="card-title">Bond Architecture — how IDs are stored and linked</div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">Every key is a 3-component bond. All three must match on every request. A missing or wrong component blocks access at that layer.</div>
+            </div>
+          </div>
+
+          <div style="padding:var(--space-4);display:grid;grid-template-columns:1fr 1fr;gap:var(--space-4)">
+            <!-- BPC bond -->
+            <div>
+              <div style="font-size:var(--text-xs);font-weight:700;color:var(--color-primary);margin-bottom:var(--space-3)">BPC BOND — 3 components</div>
+              <div style="display:flex;flex-direction:column;gap:var(--space-2)">
+                <div style="padding:var(--space-2) var(--space-3);border-radius:6px;background:var(--color-surface-offset);border:1px solid var(--color-border)">
+                  <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-primary)">1 · pairId</div>
+                  <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">128-bit random ID. Stored on both sides. Sent in every request as <code>X-BPC-Pair-Id</code>. Server registry lookup is the first gate.</div>
+                  <div style="font-size:10px;color:var(--color-text-faint);margin-top:4px;font-family:var(--font-mono)">SERVER: pairs.json → StoredPair.id &nbsp;|&nbsp; CLIENT: localStorage / file / env</div>
+                </div>
+                <div style="padding:var(--space-2) var(--space-3);border-radius:6px;background:var(--color-surface-offset);border:1px solid var(--color-border)">
+                  <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-primary)">2 · ECDSA P-256 private key</div>
+                  <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">Held only by the device. Non-extractable in WebCrypto; DPAPI/NCrypt in enterprise terminals. Server stores the public key JWK only. Every request signed; server verifies.</div>
+                  <div style="font-size:10px;color:var(--color-text-faint);margin-top:4px;font-family:var(--font-mono)">SERVER: StoredPair.pubJwk (public only) &nbsp;|&nbsp; CLIENT: IndexedDB / DPAPI / NCrypt</div>
+                </div>
+                <div style="padding:var(--space-2) var(--space-3);border-radius:6px;background:var(--color-surface-offset);border:1px solid var(--color-border)">
+                  <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-primary)">3 · User secret (HMAC factor)</div>
+                  <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">Never transmitted. Client derives <code>HMAC(secret, nonce+timestamp)</code> per request. Server stores <code>HKDF-SHA256(secret)</code> hash only and recomputes to verify.</div>
+                  <div style="font-size:10px;color:var(--color-text-faint);margin-top:4px;font-family:var(--font-mono)">SERVER: StoredPair.secretHash (HKDF hash, 256-bit) &nbsp;|&nbsp; CLIENT: user memory / vault</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- TSK bond -->
+            <div>
+              <div style="font-size:var(--text-xs);font-weight:700;color:var(--color-warning);margin-bottom:var(--space-3)">TSK BOND — positional map + shared secret</div>
+              <div style="display:flex;flex-direction:column;gap:var(--space-2)">
+                <div style="padding:var(--space-2) var(--space-3);border-radius:6px;background:var(--color-surface-offset);border:1px solid var(--color-border)">
+                  <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-warning)">clientId</div>
+                  <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">Issued at provisioning. Sent in every request as <code>X-TSK-Client-ID</code>. Maps to TumblerMap in the store.</div>
+                  <div style="font-size:10px;color:var(--color-text-faint);margin-top:4px;font-family:var(--font-mono)">SERVER: tsk-maps.json → TumblerMap &nbsp;|&nbsp; CLIENT: stored in provision payload</div>
+                </div>
+                <div style="padding:var(--space-2) var(--space-3);border-radius:6px;background:var(--color-surface-offset);border:1px solid var(--color-border)">
+                  <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-warning)">sharedSecret + segment positions</div>
+                  <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">Shared secret: both sides have it. Positions: SERVER ONLY — never transmitted after provisioning. Client assembles segments; server extracts by position. Neither side can reconstruct what the other holds.</div>
+                  <div style="font-size:10px;color:var(--color-text-faint);margin-top:4px;font-family:var(--font-mono)">SERVER: TumblerMap.segments[].position &nbsp;|&nbsp; CLIENT: sharedSecret + types/windows only</div>
+                </div>
+                <div style="padding:var(--space-2) var(--space-3);border-radius:6px;background:var(--color-surface-offset);border:1px solid var(--color-border)">
+                  <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-warning)">HOTP counter (atomic CAS)</div>
+                  <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">Advances atomically per successful auth via compare-and-swap. Concurrent replay of the same key is blocked at the store layer. Client counter must stay synchronized.</div>
+                  <div style="font-size:10px;color:var(--color-text-faint);margin-top:4px;font-family:var(--font-mono)">SERVER: TumblerMap.segments[counter].counter &nbsp;|&nbsp; CLIENT: tracks locally, reset on re-provision</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Rotation + universality -->
+          <div style="padding:var(--space-3) var(--space-4);border-top:1px solid var(--color-border);display:grid;grid-template-columns:1fr 1fr;gap:var(--space-4)">
+            <div>
+              <div style="font-size:var(--text-xs);font-weight:700;margin-bottom:var(--space-2)">Rotation preserves the bond chain</div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6">BPC rotation: old private key signs the rotation payload containing the new public key. Server verifies, creates new pair inheriting scope + secretHash + expiresAt, marks old pair <code>rotated</code> (not deleted — audit trail preserved). The user secret and scope never change.</div>
+            </div>
+            <div>
+              <div style="font-size:var(--text-xs);font-weight:700;margin-bottom:var(--space-2)">These keys work for anything</div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6"><code>verifyBPCRequest()</code> and <code>verifyTSKRequest()</code> are pure middleware — they don't care what your endpoint does. After verification: <code>result.pairId</code> (provable identity), <code>result.pair.scope</code> (permission level). Works for REST, WebSocket upgrades, payment APIs, EHR integrations, AI agent terminals, webhook receivers, database proxies, or any HTTP-based system.</div>
+            </div>
+          </div>
+
+          <!-- What breaks the bond -->
+          <div style="padding:var(--space-3) var(--space-4);border-top:1px solid var(--color-border);background:color-mix(in srgb, var(--color-warning) 5%, transparent)">
+            <div style="font-size:var(--text-xs);font-weight:700;color:var(--color-warning);margin-bottom:var(--space-2)">What breaks the bond — and what doesn't</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-4);font-size:var(--text-xs);color:var(--color-text-muted)">
+              <div>
+                <div style="color:var(--color-danger);font-weight:600;margin-bottom:4px">Breaks the bond</div>
+                <ul style="margin:0;padding-left:14px;line-height:1.8">
+                  <li>Client loses private key (browser IndexedDB cleared without export)</li>
+                  <li>Server store deleted with no backup (use <code>BPC_DATA_DIR</code> to persist)</li>
+                  <li>Explicit revocation: <code>POST /bpc/revoke</code></li>
+                  <li>Pair expiry if <code>expiresAt</code> was set at registration</li>
+                </ul>
+              </div>
+              <div>
+                <div style="color:var(--color-success);font-weight:600;margin-bottom:4px">Does NOT break the bond</div>
+                <ul style="margin:0;padding-left:14px;line-height:1.8">
+                  <li>Server restart (with file store — pairs.json persists)</li>
+                  <li>Key rotation — bond migrates to new keypair, scope preserved</li>
+                  <li>Changing what endpoint the key is used against (scope permitting)</li>
+                  <li>Temporary pair lockout — unlock via <code>/bpc/unlock</code></li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- Security layer grid -->
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:var(--space-3);margin-bottom:var(--space-4)">
           <div class="card" style="text-align:center;padding:var(--space-4)">

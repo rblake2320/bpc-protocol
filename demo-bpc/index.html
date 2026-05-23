@@ -1009,9 +1009,62 @@ textarea { min-height: 80px; resize: vertical; }
           </div>
         </div>
 
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-6);margin-bottom:var(--space-6)">
-          <div class="card">
-            <div class="card-header"><div class="card-title">What it is</div></div>
+        <div class="card" style="margin-bottom:var(--space-6);border:1px solid var(--color-warning)">
+          <div class="card-header"><div class="card-title">🔗 Bond Architecture — how the ID is stored and linked</div></div>
+          <div style="padding:var(--space-4)">
+            <p style="font-size:var(--text-xs);color:var(--color-text-muted);margin-bottom:var(--space-4);line-height:1.6">A BPC bond is three components that must ALL match on every request. A missing or wrong component blocks access at the matching layer — no partial credit.</p>
+
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:var(--space-3);margin-bottom:var(--space-4)">
+              <div style="padding:var(--space-3);border-radius:8px;background:var(--color-surface-offset);border:1px solid var(--color-border)">
+                <div style="font-size:var(--text-xs);font-weight:700;color:var(--color-primary);margin-bottom:var(--space-2)">Component 1 · pairId</div>
+                <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6;margin-bottom:var(--space-2)">128-bit random ID issued at registration. Sent in every request as <code>X-BPC-Pair-Id</code>. First thing the server checks — unknown pair_id returns an instant reject with no crypto work done.</p>
+                <div style="font-size:10px;font-family:var(--font-mono);color:var(--color-text-faint)">SERVER: StoredPair.id in pairs.json<br>CLIENT: stored wherever the integration runs (env, file, vault)</div>
+              </div>
+              <div style="padding:var(--space-3);border-radius:8px;background:var(--color-surface-offset);border:1px solid var(--color-border)">
+                <div style="font-size:var(--text-xs);font-weight:700;color:var(--color-primary);margin-bottom:var(--space-2)">Component 2 · ECDSA P-256 private key</div>
+                <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6;margin-bottom:var(--space-2)">Device-bound. Non-extractable in WebCrypto; Windows DPAPI/NCrypt in enterprise terminals. Server stores only the public key JWK. Every request body is signed; the server verifies with the stored public key.</p>
+                <div style="font-size:10px;font-family:var(--font-mono);color:var(--color-text-faint)">SERVER: StoredPair.pubJwk (public only)<br>CLIENT: IndexedDB (browser) / DPAPI / NCrypt (enterprise)</div>
+              </div>
+              <div style="padding:var(--space-3);border-radius:8px;background:var(--color-surface-offset);border:1px solid var(--color-border)">
+                <div style="font-size:var(--text-xs);font-weight:700;color:var(--color-primary);margin-bottom:var(--space-2)">Component 3 · User secret (HMAC factor)</div>
+                <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6;margin-bottom:var(--space-2)">Never transmitted. Client derives <code>HMAC(secret, nonce+timestamp)</code> per request and injects it into the signed payload. Server stores only <code>HKDF-SHA256(secret)</code> and recomputes to verify. Device theft without the secret cannot forge requests.</p>
+                <div style="font-size:10px;font-family:var(--font-mono);color:var(--color-text-faint)">SERVER: StoredPair.secretHash (256-bit HKDF)<br>CLIENT: user memory / credential vault / KMS</div>
+              </div>
+            </div>
+
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:var(--space-3)">
+              <div style="padding:var(--space-3);border-radius:8px;background:var(--color-surface-offset);border:1px solid var(--color-border)">
+                <div style="font-size:var(--text-xs);font-weight:600;margin-bottom:var(--space-2)">Rotation preserves continuity</div>
+                <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.5">Old private key signs the rotation payload containing the new public key. Server verifies, creates a new pair with the same scope + secretHash + expiresAt, marks old pair <code style="font-size:10px">rotated</code> (preserved in audit). Bond migrates; user secret never changes.</p>
+              </div>
+              <div style="padding:var(--space-3);border-radius:8px;background:color-mix(in srgb, var(--color-success) 8%, transparent);border:1px solid color-mix(in srgb, var(--color-success) 25%, transparent)">
+                <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-success);margin-bottom:var(--space-2)">Does NOT break the bond</div>
+                <ul style="font-size:var(--text-xs);color:var(--color-text-muted);margin:0;padding-left:14px;line-height:1.8">
+                  <li>Server restart (with file store)</li>
+                  <li>Key rotation (scope preserved)</li>
+                  <li>Changing endpoint targets</li>
+                  <li>Temporary lockout (unlock via API)</li>
+                </ul>
+              </div>
+              <div style="padding:var(--space-3);border-radius:8px;background:color-mix(in srgb, var(--color-danger) 8%, transparent);border:1px solid color-mix(in srgb, var(--color-danger) 25%, transparent)">
+                <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-danger);margin-bottom:var(--space-2)">Breaks the bond</div>
+                <ul style="font-size:var(--text-xs);color:var(--color-text-muted);margin:0;padding-left:14px;line-height:1.8">
+                  <li>Client private key lost (no export)</li>
+                  <li>Server store deleted (no backup)</li>
+                  <li>Explicit revocation</li>
+                  <li>Pair expiry (if expiresAt set)</li>
+                </ul>
+              </div>
+            </div>
+
+            <div style="margin-top:var(--space-3);padding:var(--space-3);border-radius:8px;background:var(--color-surface);border:1px solid var(--color-border);font-size:var(--text-xs);color:var(--color-text-muted)">
+              <strong style="color:var(--color-text)">Universal scope:</strong> <code>verifyBPCRequest()</code> is pure middleware — it doesn't care what your endpoint does. After verification passes: <code>result.pairId</code> gives you a cryptographically provable identity, <code>result.pair.scope</code> gives you permission level. Works for REST APIs, WebSocket upgrades, payment APIs, EHR integrations, AI agent terminal authentication, webhook receivers, database access proxies, microservice-to-microservice auth — any HTTP-based system.
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:var(--space-6)">
+          <div class="card-header"><div class="card-title">Five security layers</div></div>
             <div style="padding:var(--space-4);font-size:var(--text-sm);color:var(--color-text-muted);line-height:1.65">
               BPC binds API credentials to a specific device using non-extractable ECDSA P-256 keys generated by the Web Crypto API. The private key never leaves the device. Every request carries a hardware signature — not just a token.
               <br><br>
