@@ -573,7 +573,7 @@ textarea { min-height: 80px; resize: vertical; }
   <div class="container">
     <div style="text-align:center; margin-bottom: var(--space-12);">
       <div class="section-label">Why BPC</div>
-      <h2 class="section-title">Five interlocking security layers</h2>
+      <h2 class="section-title">Seven interlocking security layers</h2>
       <p class="section-subtitle" style="margin-inline:auto">Each layer is independent. Together they create a credential that cannot be meaningfully compromised by stealing any single piece.</p>
     </div>
     <div class="features-grid">
@@ -590,7 +590,7 @@ textarea { min-height: 80px; resize: vertical; }
       <div class="feature-card fade-in">
         <div class="feature-icon"><i data-lucide="lock-keyhole" style="width:20px;height:20px"></i></div>
         <div class="feature-title">User-Chosen Secret</div>
-        <p class="feature-desc">An 8–64 character code chosen by the client, mixed into every cryptographic signature. Never stored in plain form, never logged, never sent in clear text. Stored server-side as Argon2id hash.</p>
+        <p class="feature-desc">A 16–128 character code chosen by the client (2+ special characters required), mixed into every cryptographic signature. Never stored in plain form, never logged, never sent in clear text. Stored server-side as Argon2id hash.</p>
       </div>
       <div class="feature-card fade-in">
         <div class="feature-icon"><i data-lucide="shield-check" style="width:20px;height:20px"></i></div>
@@ -672,9 +672,9 @@ textarea { min-height: 80px; resize: vertical; }
             <input type="text" id="pair-name" placeholder="e.g. Payment Service" value="Payment Service">
           </div>
           <div class="form-group">
-            <label>User Secret <span class="label-hint">(8–64 chars: letters, digits, symbols)</span></label>
+            <label>User Secret <span class="label-hint">(16–128 chars, 2+ special characters)</span></label>
             <div class="input-group">
-              <input type="password" id="pair-secret" placeholder="e.g. Ax9!kR@2m" maxlength="64" minlength="8">
+              <input type="password" id="pair-secret" placeholder="e.g. Ax9!kR@2m#Qz" maxlength="128" minlength="16">
               <span class="input-suffix" id="secret-strength"></span>
             </div>
           </div>
@@ -781,6 +781,8 @@ textarea { min-height: 80px; resize: vertical; }
               <option value="replay">Replay a captured request</option>
               <option value="unknown-pair">Fake pair ID (brute force)</option>
               <option value="expired-ts">Expired timestamp (replay variant)</option>
+              <option value="tsk-segment">TSK: TOTP segment stolen (Layer 6)</option>
+              <option value="structural-secrecy">TSK: Wrong segment order guess (Layer 7)</option>
             </select>
           </div>
           <div class="form-group">
@@ -970,7 +972,7 @@ textarea { min-height: 80px; resize: vertical; }
         <div class="flow">
           <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">1</div><div><div class="flow-step-title">The pair ID</div><div class="flow-step-desc">128-bit random, unguessable. Only the registered client knows it.</div></div></div>
           <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">2</div><div><div class="flow-step-title">The private key</div><div class="flow-step-desc">Non-extractable via Web Crypto API. Physical access to the device is required for key use.</div></div></div>
-          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">3</div><div><div class="flow-step-title">The user secret</div><div class="flow-step-desc">8–64 characters chosen by the human operator. Never stored in plain form anywhere. Hashed with Argon2id server-side.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">3</div><div><div class="flow-step-title">The user secret</div><div class="flow-step-desc">16–128 characters chosen by the human operator (2+ special characters required). Never stored in plain form anywhere. Hashed with Argon2id server-side.</div></div></div>
           <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">4</div><div><div class="flow-step-title">A fresh nonce window</div><div class="flow-step-desc">The request must be made within ±60 seconds. Replays are mathematically impossible.</div></div></div>
         </div>
         <div class="status-box info" style="margin-top:var(--space-4);margin-bottom:0">
@@ -1257,8 +1259,12 @@ async function registerPair() {
   const secret = document.getElementById('pair-secret').value;
   const scope = document.getElementById('pair-scope').value;
   
-  if (!secret || secret.length < 8) {
-    return showResult('pair-result', 'error', 'Secret must be at least 4 characters');
+  const specialCount = (secret.match(/[^A-Za-z0-9]/g) || []).length;
+  if (!secret || secret.length < 16) {
+    return showResult('pair-result', 'error', 'Secret must be at least 16 characters');
+  }
+  if (specialCount < 2) {
+    return showResult('pair-result', 'error', 'Secret must contain at least 2 special characters');
   }
   if (state.pairs.length >= state.config.maxPairs) {
     return showResult('pair-result', 'error', `Pair capacity reached (${state.config.maxPairs} max)`);
@@ -1429,6 +1435,20 @@ async function runAttack() {
     resultMsg = '❌ DENIED: Expired timestamp<br><span style="font-size:11px">Timestamp ' + new Date(oldTs).toISOString() + ' is outside the ±60s window. Request rejected as stale.</span>';
     logMsg = `🚨 Expired timestamp rejected — request from 90s ago blocked`;
     toast('warning', 'Timestamp Expired', 'Request outside valid window');
+  } else if (type === 'tsk-segment') {
+    threatType = 'sig';
+    state.threats.sig = Math.min(100, state.threats.sig + 30);
+    resultMsg = '❌ DENIED: TSK segment insufficient (Layer 6)<br><span style="font-size:11px">Attacker obtained the TOTP segment alone. Server requires all three segments — static (monthly), TOTP (30s), and HOTP (event-counter) — cryptographically combined. A single segment grants zero access.</span>';
+    logMsg = `🚨 TSK Layer 6 attack blocked — TOTP-only segment cannot authenticate`;
+    toast('error', '🚨 TSK Attack Blocked', 'Single-segment key attempt denied by Layer 6');
+  } else if (type === 'structural-secrecy') {
+    threatType = 'sig';
+    state.threats.sig = Math.min(100, state.threats.sig + 35);
+    const guesses = ['static→TOTP→HOTP', 'HOTP→TOTP→static', 'TOTP→static→HOTP'];
+    const guess = guesses[Math.floor(Math.random() * guesses.length)];
+    resultMsg = '❌ DENIED: Structural secrecy violation (Layer 7)<br><span style="font-size:11px">Attacker guessed segment order "' + guess + '". The true positional map is a server-only secret that changes per-session. There are 6 possible orderings — all produce a valid-looking but non-matching key. Server detected the mismatch immediately.</span>';
+    logMsg = `🚨 TSK Layer 7 attack blocked — segment order guess "${guess}" rejected by structural secrecy`;
+    toast('error', '🚨 Structural Secrecy', 'Segment order attack blocked by Layer 7');
   }
   
   updateAllStats();
@@ -1658,10 +1678,11 @@ function dismissToast(el) {
 document.getElementById('pair-secret').addEventListener('input', function() {
   const v = this.value;
   let strength = '', color = '';
+  const specials = (v.match(/[^A-Za-z0-9]/g) || []).length;
   if (!v) { strength = ''; }
-  else if (v.length < 4) { strength = 'too short'; color = 'var(--color-error)'; }
-  else if (v.length < 6) { strength = 'weak'; color = 'var(--color-warning)'; }
-  else if (/[A-Z]/.test(v) && /[0-9]/.test(v) && /[^A-Za-z0-9]/.test(v)) { strength = 'strong'; color = 'var(--color-success)'; }
+  else if (v.length < 16) { strength = 'too short'; color = 'var(--color-error)'; }
+  else if (specials < 2) { strength = 'needs 2+ specials'; color = 'var(--color-warning)'; }
+  else if (v.length >= 16 && specials >= 2 && /[A-Z]/.test(v) && /[0-9]/.test(v)) { strength = 'strong'; color = 'var(--color-success)'; }
   else { strength = 'ok'; color = 'var(--color-primary)'; }
   document.getElementById('secret-strength').textContent = strength;
   document.getElementById('secret-strength').style.color = color;
