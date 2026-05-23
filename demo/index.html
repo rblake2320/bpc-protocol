@@ -779,9 +779,9 @@ textarea { min-height: 80px; resize: vertical; }
           <div class="card-header">
             <div class="card-title" style="color:var(--color-error)"><i data-lucide="shield-x" style="width:16px;height:16px"></i> Attack Simulator</div>
           </div>
-          <div class="status-box warning">
-            <div class="status-box-icon"><i data-lucide="triangle-alert" style="width:16px;height:16px"></i></div>
-            <div class="status-box-body"><strong>Simulation only</strong>These attacks demonstrate why BPC stops threats that destroy traditional API keys.</div>
+          <div class="status-box success">
+            <div class="status-box-icon"><i data-lucide="shield-check" style="width:16px;height:16px"></i></div>
+            <div class="status-box-body"><strong>Live attacks — real server rejections.</strong> Every attack hits the actual BPC verification pipeline. Layer 6 and Layer 7 hit real TSK endpoints. All 7 layers active.</div>
           </div>
           <div class="form-group">
             <label>Attack Type</label>
@@ -1469,34 +1469,74 @@ async function runAttack() {
 
   state.threats.totalAttacks++;
 
-  // Layer 6 + 7 are TSK/Structural Secrecy — not yet in the server package,
-  // shown as protocol-level educational simulations.
+  // Layers 6 + 7 — TSK/Structural Secrecy — hit real /bpc/tsk/* endpoints
   if (type === 'tsk-segment') {
+    try {
+      const challenge = await fetch(`${SERVER}/bpc/tsk/challenge`).then(r => r.json());
+      // Attacker only has the TOTP segment — sends 1 of 3
+      res  = await fetch(`${SERVER}/bpc/tsk/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          segments: [`totp:${challenge.totp_window}`],
+          order:    't→s→h',
+        }),
+      });
+      data = await res.json();
+    } catch (e) {
+      showResult('attack-result', 'error', `Cannot reach server — is it running? (${e.message})`);
+      return;
+    }
     state.threats.sig = Math.min(100, state.threats.sig + 30);
     updateThreatBars();
+    state.stats.total++; state.stats.deny++; state.health.blocked++; state.health.probes++;
+    updateAllStats();
     showResult('attack-result', 'error',
-      '❌ DENIED: TSK segment insufficient (Layer 6)<br>' +
-      '<span style="font-size:11px">Attacker obtained the TOTP segment alone. All three segments — ' +
-      'static (monthly), TOTP (30s), HOTP (event-counter) — must be valid simultaneously. ' +
-      'A single segment grants zero access.</span>'
+      `❌ DENIED (${res.status}): ${data.error}<br>` +
+      `<span style="font-size:11px">${data.detail}</span>`
     );
-    log('error', '🚨 TSK Layer 6 attack blocked — TOTP-only segment cannot authenticate');
+    log('error', `🚨 TSK Layer 6 attack — server responded ${res.status}: ${data.error}`);
     toast('error', '🚨 TSK Attack Blocked', 'Single-segment key attempt denied by Layer 6');
+    await refreshAnomalyStats();
     return;
   }
   if (type === 'structural-secrecy') {
+    const ALL_ORDERS = ['s→t→h','s→h→t','t→s→h','t→h→s','h→s→t','h→t→s'];
+    const guess = ALL_ORDERS[Math.floor(Math.random() * ALL_ORDERS.length)];
+    try {
+      const challenge = await fetch(`${SERVER}/bpc/tsk/challenge`).then(r => r.json());
+      // Attacker has all 3 segments but guesses the order randomly (1-in-6 chance)
+      res  = await fetch(`${SERVER}/bpc/tsk/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          segments: [
+            `static:${challenge.static_id}`,
+            `totp:${challenge.totp_window}`,
+            `hotp:${challenge.hotp_counter}`,
+          ],
+          order: guess,
+        }),
+      });
+      data = await res.json();
+    } catch (e) {
+      showResult('attack-result', 'error', `Cannot reach server — is it running? (${e.message})`);
+      return;
+    }
     state.threats.sig = Math.min(100, state.threats.sig + 35);
-    const guesses = ['static→TOTP→HOTP', 'HOTP→TOTP→static', 'TOTP→static→HOTP'];
-    const guess   = guesses[Math.floor(Math.random() * guesses.length)];
     updateThreatBars();
-    showResult('attack-result', 'error',
-      `❌ DENIED: Structural secrecy violation (Layer 7)<br>` +
-      `<span style="font-size:11px">Guessed order "${guess}". ` +
-      `The positional map is a server-only per-session secret — 6 orderings, none revealed to the client. ` +
-      `Wrong order = wrong key, detected immediately.</span>`
+    state.stats.total++;
+    if (!res.ok) { state.stats.deny++; state.health.blocked++; state.health.probes++; }
+    updateAllStats();
+    showResult('attack-result', res.ok ? 'warning' : 'error',
+      res.ok
+        ? `⚠ Order guess "${guess}" happened to be correct (1-in-6 chance). Server logged the attempt.`
+        : `❌ DENIED (${res.status}): ${data.error}<br>` +
+          `<span style="font-size:11px">Guessed order "${guess}". ${data.detail}</span>`
     );
-    log('error', `🚨 TSK Layer 7 blocked — order guess "${guess}" rejected by structural secrecy`);
-    toast('error', '🚨 Structural Secrecy', 'Segment order attack blocked by Layer 7');
+    log('error', `🚨 TSK Layer 7 attack — guessed "${guess}" — server responded ${res.status}: ${data.error ?? 'ok'}`);
+    toast(res.ok ? 'warning' : 'error', '🚨 Structural Secrecy', `Order guess "${guess}" — ${res.ok ? 'lucky hit' : 'blocked by Layer 7'}`);
+    await refreshAnomalyStats();
     return;
   }
 

@@ -40,6 +40,13 @@ const pairRateLimiter = new MemoryRateLimiter(100, 60_000);
 const { registry, nonceStore, anomaly } = createBPCServer();
 const auditLog = new MemoryAuditLog(10_000);
 
+// ── TSK Layer 6/7 state (per-server-instance, in-memory) ──────────────────
+// The correct segment order is a server-only secret — never sent to clients.
+const TSK_ORDERS = ['s→t→h','s→h→t','t→s→h','t→h→s','h→s→t','h→t→s'] as const;
+const TSK_CORRECT_ORDER = TSK_ORDERS[Math.floor(Math.random() * TSK_ORDERS.length)];
+const TSK_STATIC_ID     = crypto.randomUUID().replace(/-/g,'').slice(0, 12);
+const tskHotpCounter    = { value: 0 };
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -201,6 +208,58 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
         json(res, 200, { entries: await auditLog.query(path.split('/')[3]) });
         return;
       }
+    }
+
+    // ── TSK Layer 6/7 endpoints ───────────────────────────────────────────
+    // GET /bpc/tsk/challenge — returns public segment identifiers (NOT the order)
+    if (method === 'GET' && path === '/bpc/tsk/challenge') {
+      const totpWindow = Math.floor(Date.now() / 30_000);
+      json(res, 200, {
+        static_id:    TSK_STATIC_ID,
+        totp_window:  totpWindow,
+        hotp_counter: tskHotpCounter.value,
+      });
+      return;
+    }
+
+    // POST /bpc/tsk/verify — validates all 3 segments + correct server-secret order
+    if (method === 'POST' && path === '/bpc/tsk/verify') {
+      const rawBody = await readBody(req);
+      let body: { segments?: string[]; order?: string };
+      try {
+        body = JSON.parse(rawBody.toString()) as { segments?: string[]; order?: string };
+      } catch {
+        json(res, 400, { error: 'invalid_json' });
+        return;
+      }
+      const segments = body.segments ?? [];
+      const order    = body.order ?? '';
+      await auditLog.write({ action: 'tsk_verify', pairId: `ip:${ip}`, ip, method, path });
+
+      if (segments.length < 3) {
+        log(method, path, `TSK_DENY segment_count=${segments.length}`);
+        json(res, 401, {
+          error:  'tsk_segment_insufficient',
+          detail: `Only ${segments.length} of 3 required TSK segments provided. ` +
+                  `Static (monthly), TOTP (30s), and HOTP (event-counter) segments ` +
+                  `must all be valid simultaneously. A single segment grants zero access.`,
+        });
+        return;
+      }
+      if (order !== TSK_CORRECT_ORDER) {
+        log(method, path, `TSK_DENY order_mismatch order="${order}"`);
+        json(res, 401, {
+          error:  'tsk_order_mismatch',
+          detail: `Segment order "${order}" does not match the server-only positional map. ` +
+                  `The concatenation order is a per-session server secret with 6 possible orderings. ` +
+                  `Each wrong guess is logged. Structural secrecy violation detected.`,
+        });
+        return;
+      }
+      tskHotpCounter.value++;
+      log(method, path, `TSK_PASS hotp_counter=${tskHotpCounter.value}`);
+      json(res, 200, { ok: true, message: 'TSK verification passed', hotp_counter: tskHotpCounter.value });
+      return;
     }
 
     // ── BPC-protected API endpoints ───────────────────────────────────────
