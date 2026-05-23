@@ -603,6 +603,16 @@ textarea { min-height: 80px; resize: vertical; }
         <p class="feature-desc">Your "box" tracks pair counts, unknown ID attempts, signature failures, and traffic patterns. Probing attempts are tracked via per-pair behavioral counters with weighted threat scoring.</p>
       </div>
       <div class="feature-card fade-in">
+        <div class="feature-icon"><i data-lucide="timer" style="width:20px;height:20px"></i></div>
+        <div class="feature-title">TSK Multi-Segment Rotating Key</div>
+        <p class="feature-desc">Three independent key segments — static (monthly rotation), TOTP (30-second window), and HOTP (event-counter) — cryptographically combined. Stealing any single segment grants zero access. All three must align simultaneously.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon"><i data-lucide="shuffle" style="width:20px;height:20px"></i></div>
+        <div class="feature-title">Structural Secrecy</div>
+        <p class="feature-desc">The positional mapping of TSK segment concatenation is a server-only secret that changes every session. The client never learns the true segment order. Even a fully compromised client cannot forge a valid key — the structure itself is the final barrier.</p>
+      </div>
+      <div class="feature-card fade-in">
         <div class="feature-icon"><i data-lucide="code-2" style="width:20px;height:20px"></i></div>
         <div class="feature-title">Dev / Prod Modes</div>
         <p class="feature-desc">Development mode allows high-rate testing without approval spam. Production mode enforces step-up authentication for sensitive operations.</p>
@@ -964,6 +974,8 @@ textarea { min-height: 80px; resize: vertical; }
             <tr><td>Guess user secret</td><td>N/A</td><td class="check">✓ Rate-limited; opaque errors; secret mixed into sig</td></tr>
             <tr><td>DoS via lockout trigger</td><td>N/A</td><td class="check">✓ No hard lock; progressive friction; per-pair throttle</td></tr>
             <tr><td>Man-in-the-middle</td><td class="cross">❌ Key captured</td><td class="check">✓ Sig tied to canonical payload; nonce prevents reuse</td></tr>
+            <tr><td>Steal TOTP segment alone</td><td>N/A</td><td class="check">✓ TSK Layer 6: single segment useless without the other two</td></tr>
+            <tr><td>Guess TSK segment order</td><td>N/A</td><td class="check">✓ Layer 7 structural secrecy: 1-in-6 odds, each guess logged</td></tr>
           </tbody>
         </table>
       </div>
@@ -974,10 +986,12 @@ textarea { min-height: 80px; resize: vertical; }
           <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">2</div><div><div class="flow-step-title">The private key</div><div class="flow-step-desc">Non-extractable via Web Crypto API. Physical access to the device is required for key use.</div></div></div>
           <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">3</div><div><div class="flow-step-title">The user secret</div><div class="flow-step-desc">16–128 characters chosen by the human operator (2+ special characters required). Never stored in plain form anywhere. Hashed with Argon2id server-side.</div></div></div>
           <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">4</div><div><div class="flow-step-title">A fresh nonce window</div><div class="flow-step-desc">The request must be made within ±60 seconds. Replays are mathematically impossible.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">5</div><div><div class="flow-step-title">All three TSK segments simultaneously</div><div class="flow-step-desc">Static (monthly), TOTP (30-second window), and HOTP (event-counter) segments must all be valid at the same instant. Compromising any single segment leaves the other two blocking access.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">6</div><div><div class="flow-step-title">The correct segment order (server-only secret)</div><div class="flow-step-desc">The positional mapping of TSK segments changes every session and is never revealed to the client. Even with all three segments in hand, an attacker has a 1-in-6 chance per guess — and each wrong attempt is logged.</div></div></div>
         </div>
         <div class="status-box info" style="margin-top:var(--space-4);margin-bottom:0">
           <div class="status-box-icon"><i data-lucide="info" style="width:16px;height:16px"></i></div>
-          <div class="status-box-body"><strong>All four must be present simultaneously.</strong> No single leak, theft, or intercept is sufficient. An attacker needs physical device access + the secret + timing — making opportunistic attacks essentially impossible.</div>
+          <div class="status-box-body"><strong>All six must be present simultaneously.</strong> No single leak, theft, or intercept is sufficient. An attacker needs physical device access + the secret + all TSK segments + knowledge of a server-only session secret — making opportunistic attacks essentially impossible.</div>
         </div>
       </div>
     </div>
