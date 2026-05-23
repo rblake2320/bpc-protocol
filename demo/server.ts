@@ -20,6 +20,9 @@ import {
   handleRotation,
   MemoryRateLimiter,
   MemoryAuditLog,
+  PairRegistry,
+  AnomalyEngine,
+  ServerNonceStore,
 } from '../packages/server/src/index.ts';
 import type {
   BPCRequestData,
@@ -27,6 +30,13 @@ import type {
   RotationRequest,
   AdminAuthConfig,
 } from '../packages/server/src/index.ts';
+// File stores imported DIRECTLY — not re-exported via index.ts.
+// This keeps the enterprise package interface frozen: ultra_server sees no change.
+import {
+  FilePairStore,
+  FileNonceBackend,
+  FileAnomalyStore,
+} from '../packages/server/src/file-store.ts';
 
 const PORT        = 3100;
 const DEMO_DIR    = dirname(fileURLToPath(import.meta.url));
@@ -41,8 +51,27 @@ const ADMIN_AUTH: AdminAuthConfig = { bearerToken: ADMIN_TOKEN };
 const ipRateLimiter   = new MemoryRateLimiter(200, 60_000);
 const pairRateLimiter = new MemoryRateLimiter(100, 60_000);
 
-const { registry, nonceStore, anomaly } = createBPCServer();
-const auditLog = new MemoryAuditLog(10_000);
+// ── Persistent storage when BPC_DATA_DIR is set — demo data stays isolated ──
+// NEVER point BPC_DATA_DIR at enterprise directories (%APPDATA%\SelfConnect\).
+// Demo state and enterprise state must never share a path.
+const DATA_DIR = process.env['BPC_DATA_DIR'];
+let registry: PairRegistry;
+let nonceStore: ServerNonceStore;
+let anomaly: AnomalyEngine;
+let auditLog: MemoryAuditLog;
+
+if (DATA_DIR) {
+  console.log(`[BPC] Persistent store: ${DATA_DIR}`);
+  const pairStore    = new FilePairStore(join(DATA_DIR, 'pairs.json'));
+  const nonceBackend = new FileNonceBackend(join(DATA_DIR, 'nonces.json'));
+  const anomalyStore = new FileAnomalyStore(join(DATA_DIR, 'anomaly.json'));
+  registry  = new PairRegistry(pairStore, 2000, 10);
+  nonceStore = new ServerNonceStore(nonceBackend, 130_000);
+  anomaly   = new AnomalyEngine(anomalyStore);
+  auditLog  = new MemoryAuditLog(10_000);
+} else {
+  ({ registry, nonceStore, anomaly, auditLog } = createBPCServer());
+}
 
 // ── TSK Layer 6/7 state (per-server-instance, in-memory) ──────────────────
 // The correct segment order is a server-only secret — never sent to clients.
