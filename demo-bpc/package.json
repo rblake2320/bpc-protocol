@@ -1,0 +1,6 @@
+{
+  "name": "bpc-demo-bpc-only",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "npx tsx server.ts" }
+}

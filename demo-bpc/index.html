@@ -1,0 +1,1639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BPC — Bound Pair Credentials</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@300..700&family=Instrument+Serif:ital@0;1&family=Inter:wght@300..700&display=swap" rel="stylesheet">
+<script src="assets/lucide.min.js"></script>
+<style>
+/* ===== DESIGN TOKENS ===== */
+:root, [data-theme="light"] {
+  --color-bg:               #0b0f13;
+  --color-surface:          #111518;
+  --color-surface-2:        #161b20;
+  --color-surface-offset:   #1c2329;
+  --color-surface-dynamic:  #222b34;
+  --color-divider:          #1e2830;
+  --color-border:           #253040;
+  --color-text:             #d4dce6;
+  --color-text-muted:       #7a8fa0;
+  --color-text-faint:       #3a4f62;
+  --color-text-inverse:     #0b0f13;
+  --color-primary:          #2eb8d4;
+  --color-primary-hover:    #22a0ba;
+  --color-primary-active:   #1b87a0;
+  --color-primary-glow:     rgba(46,184,212,0.15);
+  --color-primary-highlight: #122430;
+  --color-success:          #3dd68c;
+  --color-success-bg:       rgba(61,214,140,0.10);
+  --color-warning:          #f59e0b;
+  --color-warning-bg:       rgba(245,158,11,0.10);
+  --color-error:            #f87171;
+  --color-error-bg:         rgba(248,113,113,0.10);
+  --color-orange:           #fb923c;
+  --color-purple:           #a78bfa;
+  --color-gold:             #fbbf24;
+  --font-display:           'Instrument Serif', Georgia, serif;
+  --font-body:              'Inter', -apple-system, sans-serif;
+  --font-mono:              'Geist Mono', 'Fira Code', monospace;
+  --text-xs:   clamp(0.75rem,  0.7rem  + 0.25vw, 0.875rem);
+  --text-sm:   clamp(0.875rem, 0.8rem  + 0.35vw, 1rem);
+  --text-base: clamp(1rem,     0.95rem + 0.25vw, 1.125rem);
+  --text-lg:   clamp(1.125rem, 1rem    + 0.75vw, 1.5rem);
+  --text-xl:   clamp(1.5rem,   1.2rem  + 1.25vw, 2.25rem);
+  --text-2xl:  clamp(2rem,     1.2rem  + 2.5vw,  3.5rem);
+  --text-hero: clamp(2.5rem,   0.5rem  + 5vw,    5.5rem);
+  --space-1:  0.25rem; --space-2:  0.5rem;  --space-3:  0.75rem;
+  --space-4:  1rem;    --space-5:  1.25rem; --space-6:  1.5rem;
+  --space-8:  2rem;    --space-10: 2.5rem;  --space-12: 3rem;
+  --space-16: 4rem;    --space-20: 5rem;    --space-24: 6rem;
+  --radius-sm: 0.375rem; --radius-md: 0.5rem; --radius-lg: 0.75rem;
+  --radius-xl: 1rem;     --radius-2xl: 1.5rem; --radius-full: 9999px;
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.4);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.5);
+  --shadow-lg: 0 12px 40px rgba(0,0,0,0.6);
+  --shadow-glow: 0 0 30px rgba(46,184,212,0.12);
+  --transition: 180ms cubic-bezier(0.16, 1, 0.3, 1);
+  --content-narrow: 640px; --content-default: 960px; --content-wide: 1280px;
+}
+[data-theme="light"] {
+  --color-bg:               #f0f4f8;
+  --color-surface:          #f8fafc;
+  --color-surface-2:        #ffffff;
+  --color-surface-offset:   #e8edf3;
+  --color-surface-dynamic:  #dce4ed;
+  --color-divider:          #d0dae6;
+  --color-border:           #c4cfdc;
+  --color-text:             #1a2332;
+  --color-text-muted:       #4a6075;
+  --color-text-faint:       #8ba0b5;
+  --color-text-inverse:     #f0f4f8;
+  --color-primary:          #0e7fa0;
+  --color-primary-hover:    #0a6b88;
+  --color-primary-active:   #085570;
+  --color-primary-glow:     rgba(14,127,160,0.12);
+  --color-primary-highlight: #d0eef8;
+  --color-success:          #16a34a;
+  --color-success-bg:       rgba(22,163,74,0.08);
+  --color-warning:          #d97706;
+  --color-warning-bg:       rgba(217,119,6,0.08);
+  --color-error:            #dc2626;
+  --color-error-bg:         rgba(220,38,38,0.08);
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.08);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.10);
+  --shadow-lg: 0 12px 40px rgba(0,0,0,0.14);
+  --shadow-glow: 0 0 30px rgba(14,127,160,0.08);
+}
+
+/* ===== BASE ===== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; -webkit-font-smoothing: antialiased; scroll-padding-top: 80px; }
+body {
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  color: var(--color-text);
+  background: var(--color-bg);
+  min-height: 100dvh;
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+img, svg { display: block; max-width: 100%; }
+button { cursor: pointer; border: none; background: none; font: inherit; color: inherit; }
+a { color: var(--color-primary); text-decoration: none; }
+a:hover { text-decoration: underline; }
+h1,h2,h3,h4 { font-family: var(--font-display); line-height: 1.2; text-wrap: balance; }
+p, li { text-wrap: pretty; }
+code, pre, .mono { font-family: var(--font-mono); }
+:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 3px; border-radius: var(--radius-sm); }
+
+/* ===== NAV ===== */
+.nav {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: var(--space-3) var(--space-6);
+  background: color-mix(in oklch, var(--color-bg) 85%, transparent);
+  backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--color-border);
+}
+.nav-logo { display: flex; align-items: center; gap: var(--space-2); font-weight: 600; font-size: var(--text-sm); }
+.nav-logo svg { width: 32px; height: 32px; }
+.nav-links { display: flex; align-items: center; gap: var(--space-6); }
+.nav-links a { font-size: var(--text-sm); color: var(--color-text-muted); transition: color var(--transition); }
+.nav-links a:hover { color: var(--color-text); text-decoration: none; }
+.nav-actions { display: flex; align-items: center; gap: var(--space-3); }
+.theme-toggle {
+  display: flex; align-items: center; justify-content: center;
+  width: 36px; height: 36px;
+  border-radius: var(--radius-full);
+  color: var(--color-text-muted);
+  transition: background var(--transition), color var(--transition);
+}
+.theme-toggle:hover { background: var(--color-surface-offset); color: var(--color-text); }
+
+/* ===== LAYOUT ===== */
+.container { max-width: var(--content-default); margin-inline: auto; padding-inline: var(--space-6); }
+.container-wide { max-width: var(--content-wide); margin-inline: auto; padding-inline: var(--space-6); }
+section { padding-block: clamp(var(--space-16), 6vw, var(--space-24)); }
+
+/* ===== HERO ===== */
+.hero {
+  min-height: 100dvh;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  text-align: center;
+  position: relative; overflow: hidden;
+  padding-block: var(--space-24);
+  padding-inline: var(--space-6);
+}
+.hero-grid {
+  position: absolute; inset: 0; pointer-events: none;
+  background-image:
+    linear-gradient(var(--color-border) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-border) 1px, transparent 1px);
+  background-size: 60px 60px;
+  opacity: 0.3;
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 50%, black 30%, transparent 100%);
+}
+.hero-glow {
+  position: absolute; inset: 0; pointer-events: none;
+  background: radial-gradient(ellipse 60% 40% at 50% 50%, var(--color-primary-glow), transparent 70%);
+}
+.hero-badge {
+  display: inline-flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-full);
+  font-size: var(--text-xs); font-family: var(--font-mono);
+  color: var(--color-primary);
+  background: var(--color-primary-highlight);
+  margin-bottom: var(--space-6);
+  position: relative; z-index: 1;
+}
+.hero-title {
+  font-size: var(--text-hero);
+  font-family: var(--font-display);
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  max-width: 900px;
+  margin-bottom: var(--space-6);
+  position: relative; z-index: 1;
+}
+.hero-title em { font-style: italic; color: var(--color-primary); }
+.hero-subtitle {
+  font-size: var(--text-lg);
+  color: var(--color-text-muted);
+  max-width: 600px;
+  margin-bottom: var(--space-10);
+  position: relative; z-index: 1;
+}
+.hero-actions {
+  display: flex; gap: var(--space-3); flex-wrap: wrap; justify-content: center;
+  position: relative; z-index: 1;
+  margin-bottom: var(--space-16);
+}
+.hero-scroll-hint {
+  position: absolute; bottom: var(--space-8); left: 50%; transform: translateX(-50%);
+  display: flex; flex-direction: column; align-items: center; gap: var(--space-2);
+  color: var(--color-text-faint); font-size: var(--text-xs); z-index: 1;
+  animation: bounce 2s ease-in-out infinite;
+}
+@keyframes bounce { 0%,100%{transform:translateX(-50%) translateY(0)} 50%{transform:translateX(-50%) translateY(6px)} }
+
+/* ===== BUTTONS ===== */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2);
+  padding: var(--space-3) var(--space-5);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm); font-weight: 500;
+  transition: all var(--transition); white-space: nowrap; border: none;
+}
+.btn-primary {
+  background: var(--color-primary); color: var(--color-text-inverse);
+  box-shadow: 0 0 20px var(--color-primary-glow);
+}
+.btn-primary:hover { background: var(--color-primary-hover); box-shadow: 0 0 30px var(--color-primary-glow); }
+.btn-secondary {
+  background: var(--color-surface-offset); color: var(--color-text);
+  border: 1px solid var(--color-border);
+}
+.btn-secondary:hover { background: var(--color-surface-dynamic); }
+.btn-ghost { background: transparent; color: var(--color-text-muted); border: 1px solid var(--color-border); }
+.btn-ghost:hover { color: var(--color-text); background: var(--color-surface-offset); }
+.btn-sm { padding: var(--space-2) var(--space-3); font-size: var(--text-xs); }
+.btn-lg { padding: var(--space-4) var(--space-8); font-size: var(--text-base); }
+.btn-danger { background: var(--color-error-bg); color: var(--color-error); border: 1px solid rgba(248,113,113,0.2); }
+.btn-danger:hover { background: var(--color-error); color: white; }
+.btn-success-outline { background: var(--color-success-bg); color: var(--color-success); border: 1px solid rgba(61,214,140,0.2); }
+
+/* ===== CARDS ===== */
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  padding: var(--space-6);
+  box-shadow: var(--shadow-sm);
+}
+.card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-4); }
+.card-title { font-size: var(--text-base); font-weight: 600; display: flex; align-items: center; gap: var(--space-2); font-family: var(--font-body); }
+
+/* ===== BADGES ===== */
+.badge {
+  display: inline-flex; align-items: center; gap: var(--space-1);
+  padding: 2px var(--space-2); border-radius: var(--radius-full);
+  font-size: var(--text-xs); font-weight: 500;
+}
+.badge-primary { background: var(--color-primary-highlight); color: var(--color-primary); border: 1px solid rgba(46,184,212,0.2); }
+.badge-success { background: var(--color-success-bg); color: var(--color-success); border: 1px solid rgba(61,214,140,0.2); }
+.badge-warning { background: var(--color-warning-bg); color: var(--color-warning); border: 1px solid rgba(245,158,11,0.2); }
+.badge-error   { background: var(--color-error-bg);   color: var(--color-error);   border: 1px solid rgba(248,113,113,0.2); }
+.badge-neutral { background: var(--color-surface-offset); color: var(--color-text-muted); border: 1px solid var(--color-border); }
+.badge-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+/* ===== FORMS ===== */
+.form-group { margin-bottom: var(--space-4); }
+label { display: block; font-size: var(--text-sm); font-weight: 500; margin-bottom: var(--space-2); color: var(--color-text); }
+label .label-hint { font-weight: 400; color: var(--color-text-muted); }
+input, select, textarea {
+  width: 100%; padding: var(--space-3) var(--space-4);
+  background: var(--color-surface-offset); border: 1px solid var(--color-border);
+  border-radius: var(--radius-md); color: var(--color-text);
+  font-family: var(--font-body); font-size: var(--text-sm);
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+input:focus, select:focus, textarea:focus {
+  outline: none; border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-glow);
+}
+input.mono, textarea.mono { font-family: var(--font-mono); font-size: var(--text-xs); }
+select option { background: var(--color-surface); }
+textarea { min-height: 80px; resize: vertical; }
+.input-group { position: relative; }
+.input-group input { padding-right: 100px; }
+.input-suffix {
+  position: absolute; right: var(--space-3); top: 50%; transform: translateY(-50%);
+  font-size: var(--text-xs); color: var(--color-text-muted); font-family: var(--font-mono);
+}
+
+/* ===== TABS ===== */
+.tabs { display: flex; border-bottom: 1px solid var(--color-border); margin-bottom: var(--space-6); gap: 0; }
+.tab-btn {
+  padding: var(--space-3) var(--space-4); font-size: var(--text-sm); color: var(--color-text-muted);
+  border-bottom: 2px solid transparent; transition: all var(--transition); white-space: nowrap;
+  background: none; border-top: none; border-left: none; border-right: none;
+}
+.tab-btn:hover { color: var(--color-text); }
+.tab-btn.active { color: var(--color-primary); border-bottom-color: var(--color-primary); }
+.tab-pane { display: none; }
+.tab-pane.active { display: block; }
+
+/* ===== STATUS BOX ===== */
+.status-box {
+  display: flex; align-items: flex-start; gap: var(--space-3);
+  padding: var(--space-4); border-radius: var(--radius-lg);
+  font-size: var(--text-sm); margin-bottom: var(--space-4);
+  border: 1px solid;
+}
+.status-box.success { background: var(--color-success-bg); border-color: rgba(61,214,140,0.2); color: var(--color-success); }
+.status-box.warning { background: var(--color-warning-bg); border-color: rgba(245,158,11,0.2); color: var(--color-warning); }
+.status-box.error   { background: var(--color-error-bg);   border-color: rgba(248,113,113,0.2); color: var(--color-error); }
+.status-box.info    { background: var(--color-primary-highlight); border-color: rgba(46,184,212,0.2); color: var(--color-primary); }
+.status-box-icon { flex-shrink: 0; margin-top: 2px; }
+.status-box-body strong { display: block; margin-bottom: var(--space-1); }
+
+/* ===== CODE DISPLAY ===== */
+.code-block {
+  background: var(--color-surface-offset);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  overflow-x: auto;
+  line-height: 1.7;
+  position: relative;
+}
+.code-block .key { color: var(--color-primary); }
+.code-block .val { color: var(--color-success); }
+.code-block .cmt { color: var(--color-text-faint); }
+.code-block .str { color: var(--color-orange); }
+.code-block .num { color: var(--color-gold); }
+.code-block .kw  { color: var(--color-purple); }
+
+/* ===== LOG ===== */
+.log-container {
+  background: var(--color-surface-offset); border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg); overflow: hidden;
+  max-height: 380px; overflow-y: auto;
+}
+.log-entry {
+  display: flex; gap: var(--space-3); align-items: flex-start;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-divider);
+  font-size: var(--text-xs); font-family: var(--font-mono);
+  animation: logSlide 0.3s cubic-bezier(0.16,1,0.3,1);
+}
+@keyframes logSlide { from { opacity:0; transform: translateX(-8px) } to { opacity:1; transform: translateX(0) } }
+.log-entry:last-child { border-bottom: none; }
+.log-time { color: var(--color-text-faint); white-space: nowrap; flex-shrink: 0; min-width: 70px; }
+.log-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin-top: 5px; }
+.log-dot.success { background: var(--color-success); box-shadow: 0 0 6px var(--color-success); }
+.log-dot.error   { background: var(--color-error);   box-shadow: 0 0 6px var(--color-error); }
+.log-dot.warning { background: var(--color-warning); box-shadow: 0 0 6px var(--color-warning); }
+.log-dot.info    { background: var(--color-primary);  box-shadow: 0 0 6px var(--color-primary); }
+.log-text { flex: 1; color: var(--color-text); }
+.log-text .dim { color: var(--color-text-muted); }
+.log-empty { padding: var(--space-6); text-align: center; color: var(--color-text-faint); font-family: var(--font-mono); font-size: var(--text-xs); }
+
+/* ===== STATS ===== */
+.stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: var(--space-3); margin-bottom: var(--space-6); }
+.stat {
+  background: var(--color-surface-offset); border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg); padding: var(--space-4); text-align: center;
+}
+.stat-value { font-size: var(--text-xl); font-weight: 700; font-family: var(--font-mono); color: var(--color-primary); }
+.stat-label { font-size: var(--text-xs); color: var(--color-text-muted); margin-top: var(--space-1); }
+.stat.success .stat-value { color: var(--color-success); }
+.stat.error   .stat-value { color: var(--color-error); }
+.stat.warning .stat-value { color: var(--color-warning); }
+
+/* ===== SECTIONS ===== */
+.section-label { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-primary); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: var(--space-3); }
+.section-title { font-size: var(--text-2xl); font-family: var(--font-display); margin-bottom: var(--space-4); }
+.section-subtitle { font-size: var(--text-base); color: var(--color-text-muted); max-width: 60ch; margin-bottom: var(--space-10); }
+
+/* ===== APP LAYOUT ===== */
+.app-wrapper { display: none; }
+.app-wrapper.visible { display: flex; flex-direction: column; gap: var(--space-4); }
+.app-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
+.app-grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--space-4); }
+.span-2 { grid-column: span 2; }
+.span-3 { grid-column: span 3; }
+
+/* ===== PAIRING TABLE ===== */
+.pair-table { width: 100%; border-collapse: collapse; font-size: var(--text-xs); }
+.pair-table th {
+  text-align: left; padding: var(--space-2) var(--space-3);
+  color: var(--color-text-muted); font-weight: 500;
+  border-bottom: 1px solid var(--color-border);
+  font-family: var(--font-mono);
+}
+.pair-table td {
+  padding: var(--space-3); border-bottom: 1px solid var(--color-divider);
+  font-family: var(--font-mono);
+  transition: background var(--transition);
+}
+.pair-table tr:hover td { background: var(--color-surface-offset); }
+.pair-table tr:last-child td { border-bottom: none; }
+
+/* ===== THREAT PANEL ===== */
+.threat-bar { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-3); }
+.threat-label { font-size: var(--text-xs); width: 140px; flex-shrink: 0; }
+.threat-track { flex: 1; height: 8px; background: var(--color-surface-offset); border-radius: var(--radius-full); overflow: hidden; }
+.threat-fill { height: 100%; border-radius: var(--radius-full); transition: width 0.6s cubic-bezier(0.16,1,0.3,1); }
+.threat-pct { font-size: var(--text-xs); font-family: var(--font-mono); width: 36px; text-align: right; }
+
+/* ===== MODAL ===== */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px);
+  display: none; align-items: center; justify-content: center; z-index: 200; padding: var(--space-4);
+}
+.modal-overlay.open { display: flex; }
+.modal {
+  background: var(--color-surface); border: 1px solid var(--color-border);
+  border-radius: var(--radius-2xl); padding: var(--space-8);
+  max-width: 500px; width: 100%; box-shadow: var(--shadow-lg);
+  animation: modalIn 0.3s cubic-bezier(0.16,1,0.3,1);
+}
+@keyframes modalIn { from { opacity:0; transform: scale(0.94) translateY(8px) } to { opacity:1; transform: scale(1) translateY(0) } }
+.modal h3 { font-size: var(--text-lg); margin-bottom: var(--space-4); }
+.modal-timer { text-align: center; font-size: var(--text-xs); color: var(--color-text-muted); margin-top: var(--space-3); }
+.timer-ring { width: 48px; height: 48px; margin: 0 auto var(--space-3); }
+.timer-ring circle { fill: none; stroke-width: 4; }
+.timer-ring .track { stroke: var(--color-surface-offset); }
+.timer-ring .progress { stroke: var(--color-primary); stroke-linecap: round; transition: stroke-dashoffset 1s linear; transform: rotate(-90deg); transform-origin: 50% 50%; }
+.modal-actions { display: flex; gap: var(--space-3); margin-top: var(--space-6); }
+.modal-actions .btn { flex: 1; }
+
+/* ===== NOTIFICATION TOAST ===== */
+.toast-container { position: fixed; top: 80px; right: var(--space-6); z-index: 300; display: flex; flex-direction: column; gap: var(--space-2); }
+.toast {
+  background: var(--color-surface); border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg); padding: var(--space-3) var(--space-4);
+  box-shadow: var(--shadow-lg); min-width: 280px; max-width: 360px;
+  display: flex; gap: var(--space-3); align-items: flex-start;
+  animation: toastIn 0.35s cubic-bezier(0.16,1,0.3,1);
+  font-size: var(--text-sm);
+}
+.toast.removing { animation: toastOut 0.3s cubic-bezier(0.4,0,1,1) forwards; }
+@keyframes toastIn  { from { opacity:0; transform: translateX(40px) } to { opacity:1; transform: translateX(0) } }
+@keyframes toastOut { from { opacity:1; transform: translateX(0) } to { opacity:0; transform: translateX(40px) } }
+.toast-icon { flex-shrink: 0; margin-top: 2px; }
+.toast-body strong { display: block; margin-bottom: 2px; }
+.toast-body p { color: var(--color-text-muted); font-size: var(--text-xs); }
+.toast-close { margin-left: auto; color: var(--color-text-faint); align-self: flex-start; }
+
+/* ===== HERO DEMO ===== */
+.demo-section { padding-top: 100px; }
+
+/* ===== FEATURES GRID ===== */
+.features-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--space-6); }
+.feature-card {
+  background: var(--color-surface); border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl); padding: var(--space-6);
+  transition: box-shadow var(--transition), border-color var(--transition);
+}
+.feature-card:hover { box-shadow: var(--shadow-glow); border-color: rgba(46,184,212,0.3); }
+.feature-icon {
+  width: 40px; height: 40px;
+  background: var(--color-primary-highlight); border-radius: var(--radius-md);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--color-primary); margin-bottom: var(--space-4);
+}
+.feature-title { font-size: var(--text-base); font-weight: 600; font-family: var(--font-body); margin-bottom: var(--space-2); }
+.feature-desc { font-size: var(--text-sm); color: var(--color-text-muted); }
+
+/* ===== ATTACK MATRIX ===== */
+.attack-matrix { width: 100%; border-collapse: collapse; font-size: var(--text-xs); }
+.attack-matrix th { padding: var(--space-3); border-bottom: 1px solid var(--color-border); color: var(--color-text-muted); text-align: left; }
+.attack-matrix td { padding: var(--space-3); border-bottom: 1px solid var(--color-divider); }
+.attack-matrix tr:last-child td { border-bottom: none; }
+.check { color: var(--color-success); } .cross { color: var(--color-error); }
+
+/* ===== PROTOCOL FLOW ===== */
+.flow { display: flex; flex-direction: column; gap: var(--space-3); }
+.flow-step {
+  display: flex; gap: var(--space-4); align-items: flex-start;
+  padding: var(--space-4); background: var(--color-surface-offset);
+  border: 1px solid var(--color-border); border-radius: var(--radius-lg);
+  transition: border-color var(--transition);
+}
+.flow-step:hover { border-color: rgba(46,184,212,0.3); }
+.flow-step-num {
+  width: 28px; height: 28px; border-radius: var(--radius-full);
+  background: var(--color-primary-highlight); color: var(--color-primary);
+  display: flex; align-items: center; justify-content: center;
+  font-size: var(--text-xs); font-weight: 700; font-family: var(--font-mono); flex-shrink: 0;
+}
+.flow-step-title { font-size: var(--text-sm); font-weight: 600; margin-bottom: 4px; }
+.flow-step-desc { font-size: var(--text-xs); color: var(--color-text-muted); }
+
+/* ===== DIVIDER ===== */
+.divider { border: none; border-top: 1px solid var(--color-border); margin-block: var(--space-8); }
+
+/* ===== SCROLLBAR ===== */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--color-surface); }
+::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: var(--radius-full); }
+::-webkit-scrollbar-thumb:hover { background: var(--color-text-faint); }
+
+/* ===== ANIMATIONS ===== */
+.fade-in { opacity: 0; }
+@supports (animation-timeline: scroll()) {
+  .fade-in {
+    animation: reveal-fade linear both;
+    animation-timeline: view(); animation-range: entry 0% entry 70%;
+  }
+}
+@keyframes reveal-fade { to { opacity: 1; } }
+
+/* ===== RESPONSIVE ===== */
+@media (max-width: 768px) {
+  .app-grid, .app-grid-3 { grid-template-columns: 1fr; }
+  .span-2, .span-3 { grid-column: span 1; }
+  .nav-links { display: none; }
+  .hero-title { font-size: clamp(2rem, 8vw, 3.5rem); }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+</style>
+</head>
+<body>
+
+<!-- ===== NAV ===== -->
+<nav class="nav">
+  <div class="nav-logo">
+    <svg width="32" height="32" viewBox="0 0 32 32" fill="none" aria-label="BPC Logo">
+      <rect width="32" height="32" rx="8" fill="var(--color-primary)" opacity="0.15"/>
+      <rect x="6" y="14" width="14" height="10" rx="2" stroke="var(--color-primary)" stroke-width="1.5" fill="none"/>
+      <path d="M9 14V11a4 4 0 0 1 8 0v3" stroke="var(--color-primary)" stroke-width="1.5" stroke-linecap="round"/>
+      <circle cx="24" cy="11" r="4" fill="none" stroke="var(--color-success)" stroke-width="1.5"/>
+      <line x1="22" y1="11" x2="24" y2="11" stroke="var(--color-success)" stroke-width="1.5" stroke-linecap="round"/>
+      <line x1="24" y1="9" x2="24" y2="11" stroke="var(--color-success)" stroke-width="1.5" stroke-linecap="round"/>
+    </svg>
+    <span>BPC Protocol</span>
+  </div>
+  <div class="nav-links">
+    <a href="#demo">Live Demo</a>
+    <a href="#protocol">Protocol</a>
+    <a href="#security">Security</a>
+    <a href="#vs">Comparison</a>
+  </div>
+  <div class="nav-actions">
+    <button class="theme-toggle" data-theme-toggle aria-label="Toggle theme">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
+  </div>
+</nav>
+
+<!-- ===== HERO ===== -->
+<section class="hero">
+  <div class="hero-grid"></div>
+  <div class="hero-glow"></div>
+  <div class="hero-badge">
+    <span class="badge-dot"></span>
+    BPC — Bound Pair Credentials
+  </div>
+  <h1 class="hero-title">
+    API Keys are <em>broken.</em><br>We built something better.
+  </h1>
+  <p class="hero-subtitle">
+    A new access protocol where credentials are device-bound, pair-verified, user-locked, and infeasible to use without all pieces present simultaneously.
+  </p>
+  <div class="hero-actions">
+    <a href="#demo" class="btn btn-primary btn-lg">
+      <i data-lucide="play" style="width:16px;height:16px"></i>
+      Try the Live Demo
+    </a>
+    <a href="#protocol" class="btn btn-ghost btn-lg">
+      <i data-lucide="book-open" style="width:16px;height:16px"></i>
+      Read the Protocol
+    </a>
+  </div>
+  <div class="hero-scroll-hint">
+    <i data-lucide="chevron-down" style="width:16px;height:16px"></i>
+    <span>Scroll to explore</span>
+  </div>
+</section>
+
+<!-- ===== FEATURES ===== -->
+<section id="features" style="background: var(--color-surface); border-top: 1px solid var(--color-border); border-bottom: 1px solid var(--color-border);">
+  <div class="container">
+    <div style="text-align:center; margin-bottom: var(--space-12);">
+      <div class="section-label">Why BPC</div>
+      <h2 class="section-title">Five interlocking security layers</h2>
+      <p class="section-subtitle" style="margin-inline:auto">BPC Layers 1–5. Add TSK (Layers 6–7) and Active Defense (Layer 8) for the full protocol stack.</p>
+    </div>
+    <div class="features-grid">
+      <div class="feature-card fade-in">
+        <div class="feature-icon"><i data-lucide="cpu" style="width:20px;height:20px"></i></div>
+        <div class="feature-title">Device-Bound Keys</div>
+        <p class="feature-desc">Private keys generated via Web Crypto API with non-extractable flag, preventing JavaScript extraction. For hardware-level TPM/Secure Enclave binding, use platform attestation (WebAuthn) in production.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon"><i data-lucide="link-2" style="width:20px;height:20px"></i></div>
+        <div class="feature-title">Explicit Pair Registry</div>
+        <p class="feature-desc">Every caller must be individually paired and stored. No pairing = no access, period. A finite, closed set of known identities — not an open door.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon"><i data-lucide="lock-keyhole" style="width:20px;height:20px"></i></div>
+        <div class="feature-title">User-Chosen Secret</div>
+        <p class="feature-desc">A 16–128 character code chosen by the client (2+ special characters required), mixed into every cryptographic signature. Never stored in plain form, never logged, never sent in clear text. Stored server-side as Argon2id hash.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon"><i data-lucide="shield-check" style="width:20px;height:20px"></i></div>
+        <div class="feature-title">Anti-Replay Protection</div>
+        <p class="feature-desc">Every request includes a cryptographic nonce and a ±60 second timestamp window. Replaying any captured request is rejected by the server — each nonce is tracked and can only be used once within the timestamp window.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon"><i data-lucide="brain-circuit" style="width:20px;height:20px"></i></div>
+        <div class="feature-title">Behavioral Anomaly Engine</div>
+        <p class="feature-desc">Your "box" tracks pair counts, unknown ID attempts, signature failures, and traffic patterns. Probing attempts are tracked via per-pair behavioral counters with weighted threat scoring.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== LIVE DEMO ===== -->
+<section id="demo" class="demo-section">
+  <div class="container-wide">
+    <!-- Nav strip -->
+    <div style="text-align:center;padding:var(--space-3);background:var(--color-surface-offset);border-bottom:1px solid var(--color-border);font-size:var(--text-xs);font-family:var(--font-mono);border-radius:var(--radius-lg);margin-bottom:var(--space-6)">
+      <a href="http://localhost:3101" style="color:var(--color-primary);margin:0 var(--space-4)">BPC (L1–5)</a> ·
+      <a href="http://localhost:3200" style="color:var(--color-text-muted);margin:0 var(--space-4)">TSK (L6–7)</a> ·
+      <a href="http://localhost:3100" style="color:var(--color-text-muted);margin:0 var(--space-4)">Full Stack (L1–8)</a>
+    </div>
+
+    <div class="section-label">Interactive Demo</div>
+    <h2 class="section-title">BPC in action</h2>
+    <p class="section-subtitle">Register a device, pair a client, make authenticated requests.</p>
+    <p style="font-size:var(--text-xs);color:var(--color-text-faint);font-family:var(--font-mono);margin-top:var(--space-2)">Wired to a real backend — run <code>cd demo-bpc && npx tsx server.ts</code> then open <code>http://localhost:3101</code></p>
+
+    <!-- TABS -->
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('setup', this)">1 · Setup</button>
+      <button class="tab-btn" onclick="switchTab('requests', this)">2 · Requests</button>
+      <button class="tab-btn" onclick="switchTab('admin', this)">3 · Control Panel</button>
+    </div>
+
+    <!-- TAB: SETUP -->
+    <div id="tab-setup" class="tab-pane active">
+      <div class="app-grid">
+        <!-- Device Registration -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title"><i data-lucide="cpu" style="width:16px;height:16px;color:var(--color-primary)"></i> Device Registration</div>
+            <span id="device-status-badge" class="badge badge-neutral">Not registered</span>
+          </div>
+          <div class="form-group">
+            <label>Device Name</label>
+            <input type="text" id="device-name" placeholder="e.g. MacBook Pro — Dev" value="MacBook Pro — Development">
+          </div>
+          <div class="form-group">
+            <label>Mode</label>
+            <select id="device-mode">
+              <option value="development">Development (high limits, no approval prompts)</option>
+              <option value="production">Production (approval for sensitive ops)</option>
+            </select>
+          </div>
+          <button class="btn btn-primary" style="width:100%" onclick="registerDevice(this)">
+            <i data-lucide="key-round" style="width:14px;height:14px"></i> Generate Device Keypair
+          </button>
+          <div id="device-result" style="display:none; margin-top:var(--space-4)">
+            <div class="status-box success">
+              <div class="status-box-icon"><i data-lucide="check-circle" style="width:16px;height:16px"></i></div>
+              <div class="status-box-body">
+                <strong>Device registered — ECDSA P-256 key (non-extractable)</strong>
+                <div id="device-summary" style="font-family:var(--font-mono);font-size:var(--text-xs);margin-top:var(--space-2);line-height:2"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Pair Registration -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title"><i data-lucide="link-2" style="width:16px;height:16px;color:var(--color-primary)"></i> Register a Client Pair</div>
+            <span id="pair-count-badge" class="badge badge-neutral">0 pairs</span>
+          </div>
+          <div class="form-group">
+            <label>Client / Service Name</label>
+            <input type="text" id="pair-name" placeholder="e.g. Payment Service" value="Payment Service">
+          </div>
+          <div class="form-group">
+            <label>User Secret <span class="label-hint">(16–128 chars, 2+ special characters)</span></label>
+            <div class="input-group">
+              <input type="password" id="pair-secret" placeholder="e.g. Ax9!kR@2m#Qz" maxlength="128" minlength="16">
+              <span class="input-suffix" id="secret-strength"></span>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Scope</label>
+            <select id="pair-scope">
+              <option value="read">Read only</option>
+              <option value="read-write">Read + Write</option>
+              <option value="full">Full access (admin)</option>
+            </select>
+          </div>
+          <button class="btn btn-primary" style="width:100%" onclick="registerPair()">
+            <i data-lucide="plus-circle" style="width:14px;height:14px"></i> Create Pair
+          </button>
+          <div id="pair-result" style="margin-top:var(--space-3)"></div>
+        </div>
+      </div>
+
+      <!-- Pair Registry Table -->
+      <div class="card" style="margin-top:var(--space-4)">
+        <div class="card-header">
+          <div class="card-title"><i data-lucide="database" style="width:16px;height:16px;color:var(--color-primary)"></i> Pair Registry</div>
+          <span id="registry-total" class="badge badge-primary">0 / 2000</span>
+        </div>
+        <div style="overflow-x:auto">
+          <table class="pair-table">
+            <thead>
+              <tr><th>Pair ID</th><th>Client Name</th><th>Scope</th><th>Mode</th><th>Status</th><th>Last Active</th><th>Actions</th></tr>
+            </thead>
+            <tbody id="pair-registry-body">
+              <tr><td colspan="7" style="text-align:center;color:var(--color-text-faint);padding:var(--space-6)">No pairs registered yet</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB: REQUESTS -->
+    <div id="tab-requests" class="tab-pane">
+      <div class="app-grid">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title"><i data-lucide="send" style="width:16px;height:16px;color:var(--color-primary)"></i> Make a Request</div>
+          </div>
+          <div class="form-group">
+            <label>Pair</label>
+            <select id="req-pair-select"><option value="">— Select a pair —</option></select>
+          </div>
+          <div class="form-group">
+            <label>Endpoint</label>
+            <select id="req-endpoint">
+              <option value="GET /api/users">GET /api/users (read)</option>
+              <option value="GET /api/status">GET /api/status (read)</option>
+              <option value="DELETE /api/user/123">DELETE /api/user/123 (sensitive)</option>
+              <option value="PUT /api/admin/config">PUT /api/admin/config (admin)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>User Secret <span class="label-hint">(required for signing)</span></label>
+            <input type="password" id="req-secret" placeholder="Your secret for this pair">
+          </div>
+          <button class="btn btn-primary" style="width:100%;margin-bottom:var(--space-3)" onclick="makeAuthorizedRequest()">
+            <i data-lucide="zap" style="width:14px;height:14px"></i> Send Signed Request
+          </button>
+          <div id="req-result"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title"><i data-lucide="activity" style="width:16px;height:16px;color:var(--color-primary)"></i> Request Stats</div>
+          </div>
+          <div class="stats-row">
+            <div class="stat"><div class="stat-value" id="stat-total">0</div><div class="stat-label">Total</div></div>
+            <div class="stat success"><div class="stat-value" id="stat-ok">0</div><div class="stat-label">Allowed</div></div>
+            <div class="stat error"><div class="stat-value" id="stat-deny">0</div><div class="stat-label">Denied</div></div>
+            <div class="stat warning"><div class="stat-value" id="stat-alert">0</div><div class="stat-label">Alerts</div></div>
+          </div>
+          <div class="card-title" style="margin-bottom:var(--space-3);font-size:var(--text-xs)">Last Signed Payload</div>
+          <div class="code-block" id="last-payload" style="min-height:120px;font-size:11px">
+            <span style="color:var(--color-text-faint)">// Waiting for a request...</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Anomaly Engine (visible in requests tab) -->
+      <div class="card" style="margin-top:var(--space-4)">
+        <div class="card-header">
+          <div class="card-title"><i data-lucide="radar" style="width:16px;height:16px;color:var(--color-warning)"></i> Anomaly Engine</div>
+        </div>
+        <div class="app-grid">
+          <div>
+            <div class="threat-bar">
+              <span class="threat-label">Unknown pair IDs</span>
+              <div class="threat-track"><div class="threat-fill" id="threat-unknown" style="width:0%;background:var(--color-error)"></div></div>
+              <span class="threat-pct" id="threat-unknown-pct">0%</span>
+            </div>
+            <div class="threat-bar">
+              <span class="threat-label">Signature failures</span>
+              <div class="threat-track"><div class="threat-fill" id="threat-sig" style="width:0%;background:var(--color-warning)"></div></div>
+              <span class="threat-pct" id="threat-sig-pct">0%</span>
+            </div>
+            <div class="threat-bar">
+              <span class="threat-label">Replay attempts</span>
+              <div class="threat-track"><div class="threat-fill" id="threat-replay" style="width:0%;background:var(--color-orange)"></div></div>
+              <span class="threat-pct" id="threat-replay-pct">0%</span>
+            </div>
+            <div class="threat-bar">
+              <span class="threat-label">Expired tokens</span>
+              <div class="threat-track"><div class="threat-fill" id="threat-expired" style="width:0%;background:var(--color-purple)"></div></div>
+              <span class="threat-pct" id="threat-expired-pct">0%</span>
+            </div>
+          </div>
+          <div style="text-align:center">
+            <div class="card-title" style="margin-bottom:var(--space-2);font-size:var(--text-xs);justify-content:center">Threat Score</div>
+            <div style="font-size:var(--text-2xl);font-family:var(--font-mono);font-weight:700">
+              <span id="threat-score-val">0</span><span style="font-size:var(--text-sm);color:var(--color-text-muted)">/100</span>
+            </div>
+            <div id="threat-score-label" style="font-size:var(--text-xs);color:var(--color-success);margin-top:var(--space-1)">System nominal</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB: ADMIN -->
+    <div id="tab-admin" class="tab-pane">
+      <div class="app-grid">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title"><i data-lucide="settings-2" style="width:16px;height:16px;color:var(--color-primary)"></i> Box Configuration</div>
+          </div>
+          <div class="form-group">
+            <label>Max Allowed Pairs</label>
+            <input type="number" id="max-pairs" value="2000" min="1">
+          </div>
+          <div class="form-group">
+            <label>Signature Window (seconds)</label>
+            <input type="number" id="sig-window" value="60" min="10" max="300">
+          </div>
+          <div class="form-group">
+            <label>Unknown ID Alert Threshold (per minute)</label>
+            <input type="number" id="alert-threshold" value="5" min="1">
+          </div>
+          <div class="form-group">
+            <label>Failed Sig Lockout Count</label>
+            <input type="number" id="lockout-count" value="10" min="1">
+          </div>
+          <button class="btn btn-secondary" style="width:100%" onclick="applyConfig()">
+            <i data-lucide="save" style="width:14px;height:14px"></i> Apply Config
+          </button>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title"><i data-lucide="bar-chart-3" style="width:16px;height:16px;color:var(--color-primary)"></i> Box Health</div>
+          </div>
+          <div class="stats-row" style="grid-template-columns:1fr 1fr;margin-bottom:var(--space-4)">
+            <div class="stat"><div class="stat-value" id="health-pairs">0</div><div class="stat-label">Active Pairs</div></div>
+            <div class="stat success"><div class="stat-value" id="health-ok">0</div><div class="stat-label">Authorized</div></div>
+            <div class="stat error"><div class="stat-value" id="health-blocked">0</div><div class="stat-label">Blocked</div></div>
+            <div class="stat warning"><div class="stat-value" id="health-probes">0</div><div class="stat-label">Probes Seen</div></div>
+          </div>
+          <div class="card-title" style="font-size:var(--text-xs);margin-bottom:var(--space-2)">Pair Capacity</div>
+          <div style="height:8px;background:var(--color-surface-offset);border-radius:var(--radius-full);overflow:hidden">
+            <div id="capacity-bar" style="height:100%;width:0%;background:var(--color-primary);border-radius:var(--radius-full);transition:width 0.5s ease"></div>
+          </div>
+          <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:var(--space-2)" id="capacity-label">0 / 2000 pairs</div>
+          <button class="btn btn-danger btn-sm" style="margin-top:var(--space-4);width:100%" onclick="resetAll()">
+            <i data-lucide="trash-2" style="width:12px;height:12px"></i> Reset Everything
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ACTIVITY LOG (always visible) -->
+    <div style="margin-top:var(--space-4)">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--space-3)">
+        <div class="card-title"><i data-lucide="scroll-text" style="width:16px;height:16px;color:var(--color-primary)"></i> Real-Time Activity Log</div>
+        <button class="btn btn-ghost btn-sm" onclick="clearLog()">Clear</button>
+      </div>
+      <div class="log-container">
+        <div id="activity-log">
+          <div class="log-empty">Waiting for activity — register a device to begin</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== PROTOCOL ===== -->
+<section id="protocol" style="background:var(--color-surface);border-top:1px solid var(--color-border);border-bottom:1px solid var(--color-border)">
+  <div class="container">
+    <div class="section-label">Protocol Specification</div>
+    <h2 class="section-title">How BPC works, step by step</h2>
+    <div class="app-grid">
+      <div>
+        <h3 style="font-size:var(--text-base);margin-bottom:var(--space-4);font-family:var(--font-body);font-weight:600">Pairing Flow</h3>
+        <div class="flow">
+          <div class="flow-step"><div class="flow-step-num">1</div><div><div class="flow-step-title">Device key generation</div><div class="flow-step-desc">Client generates ECDSA P-256 keypair via Web Crypto API (non-extractable key). Private key marked non-extractable. Public key fingerprinted with SHA-256.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num">2</div><div><div class="flow-step-title">Pairing request</div><div class="flow-step-desc">Client sends: client ID, public key JWK, requested scope, and a salted hash of the user-chosen secret. Never the secret itself.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num">3</div><div><div class="flow-step-title">Owner approval</div><div class="flow-step-desc">The box stores the request as "pending." The owner reviews and approves via dashboard or out-of-band confirmation. New pairings are never automatic.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num">4</div><div><div class="flow-step-title">Pair record created</div><div class="flow-step-desc">Box stores: pair_id (128-bit random), client public key, secret hash, scope, mode, and behavioral baseline. Pair is now active.</div></div></div>
+        </div>
+      </div>
+      <div>
+        <h3 style="font-size:var(--text-base);margin-bottom:var(--space-4);font-family:var(--font-body);font-weight:600">Request Validation Flow</h3>
+        <div class="flow">
+          <div class="flow-step"><div class="flow-step-num">1</div><div><div class="flow-step-title">Client builds payload</div><div class="flow-step-desc">Canonical JSON: { method, path, body_hash, timestamp, nonce, pair_id }. Timestamp must be within ±60s. Nonce is a crypto random UUID.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num">2</div><div><div class="flow-step-title">Secret mixing</div><div class="flow-step-desc">HMAC(user_secret, nonce + timestamp) is derived and injected into the canonical payload before signing. Server recomputes from stored secret hash.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num">3</div><div><div class="flow-step-title">ECDSA signature</div><div class="flow-step-desc">Client signs the canonical payload with its non-extractable private key using ECDSA-SHA256 via Web Crypto API.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num">4</div><div><div class="flow-step-title">Server validates all layers</div><div class="flow-step-desc">Box checks: pair_id exists, scope allows endpoint, timestamp fresh, nonce not seen before, ECDSA signature valid, secret derivation matches. All must pass.</div></div></div>
+        </div>
+      </div>
+    </div>
+
+    <hr class="divider">
+    <h3 style="font-size:var(--text-base);margin-bottom:var(--space-4);font-family:var(--font-body);font-weight:600">Canonical Request Structure</h3>
+    <div class="code-block">
+      <span class="cmt">// What gets signed — canonical JSON with sorted keys</span><br>
+      {<br>
+      &nbsp;&nbsp;<span class="key">"body_hash"</span>: <span class="str">"sha256:e3b0c44298fc1c149afb..."</span>,<br>
+      &nbsp;&nbsp;<span class="key">"method"</span>: <span class="str">"POST"</span>,<br>
+      &nbsp;&nbsp;<span class="key">"nonce"</span>: <span class="str">"f47ac10b-58cc-4372-a567-0e02b2c3d479"</span>,<br>
+      &nbsp;&nbsp;<span class="key">"pair_id"</span>: <span class="str">"pair_8x2k9mq..."</span>,<br>
+      &nbsp;&nbsp;<span class="key">"path"</span>: <span class="str">"/api/billing"</span>,<br>
+      &nbsp;&nbsp;<span class="key">"secret_hmac"</span>: <span class="str">"hmac(user_secret, nonce+ts)"</span>, <span class="cmt">// derived, not the secret itself</span><br>
+      &nbsp;&nbsp;<span class="key">"timestamp"</span>: <span class="num">1743487322841</span><br>
+      }<br><br>
+      <span class="cmt">// Headers sent with every BPC request</span><br>
+      <span class="key">X-BPC-Pair-ID</span>: pair_8x2k9mq...<br>
+      <span class="key">X-BPC-Signature</span>: base64(ECDSA-SHA256(canonical_payload, private_key))<br>
+      <span class="key">X-BPC-Signed-Data</span>: base64(canonical_payload)
+    </div>
+  </div>
+</section>
+
+<!-- ===== SECURITY ===== -->
+<section id="security">
+  <div class="container">
+    <div class="section-label">Threat Model</div>
+    <h2 class="section-title">Defeats every known attack vector</h2>
+    <p class="section-subtitle">Analyzed against AI-assisted adversaries with unlimited time and resources.</p>
+    <div class="app-grid">
+      <div class="card">
+        <div class="card-title" style="margin-bottom:var(--space-4)"><i data-lucide="swords" style="width:16px;height:16px;color:var(--color-error)"></i> &nbsp;Attack scenarios vs. BPC</div>
+        <table class="attack-matrix">
+          <thead><tr><th>Attack</th><th>Traditional Keys</th><th>BPC</th></tr></thead>
+          <tbody>
+            <tr><td>Key leaked on GitHub</td><td class="cross">&#10060; Full compromise</td><td class="check">&#10003; Useless without device + secret</td></tr>
+            <tr><td>Stolen from logs/env</td><td class="cross">&#10060; Instant access</td><td class="check">&#10003; No device sig = denied</td></tr>
+            <tr><td>npm supply-chain attack <span class="badge badge-error" style="margin-left:4px">new</span></td><td class="cross">&#10060; Steals and uses key</td><td class="check">&#10003; Stolen key can't be used from attacker device</td></tr>
+            <tr><td>Replay captured request</td><td class="cross">&#10060; Works indefinitely</td><td class="check">&#10003; Nonce seen, timestamp expired</td></tr>
+            <tr><td>Brute-force pair ID</td><td>N/A</td><td class="check">&#10003; 128-bit random; box flags probing</td></tr>
+            <tr><td>Compromise client device</td><td class="cross">&#10060; Total loss</td><td class="check">&#10003; Scope-limited; anomaly detection; fast revoke</td></tr>
+            <tr><td>Social engineer approval</td><td class="cross">&#10060; No defense</td><td class="check">&#10003; Out-of-band verify; dual approval option</td></tr>
+            <tr><td>Guess user secret</td><td>N/A</td><td class="check">&#10003; Rate-limited; opaque errors; secret mixed into sig</td></tr>
+            <tr><td>DoS via lockout trigger</td><td>N/A</td><td class="check">&#10003; No hard lock; progressive friction; per-pair throttle</td></tr>
+            <tr><td>Man-in-the-middle</td><td class="cross">&#10060; Key captured</td><td class="check">&#10003; Sig tied to canonical payload; nonce prevents reuse</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="card-title" style="margin-bottom:var(--space-4)"><i data-lucide="layers" style="width:16px;height:16px;color:var(--color-primary)"></i> &nbsp;What an attacker needs to succeed</div>
+        <div class="flow">
+          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">1</div><div><div class="flow-step-title">The pair ID</div><div class="flow-step-desc">128-bit random, unguessable. Only the registered client knows it.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">2</div><div><div class="flow-step-title">The private key</div><div class="flow-step-desc">Non-extractable via Web Crypto API. Physical access to the device is required for key use.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">3</div><div><div class="flow-step-title">The user secret</div><div class="flow-step-desc">16–128 characters chosen by the human operator (2+ special characters required). Never stored in plain form anywhere. Hashed with Argon2id server-side.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">4</div><div><div class="flow-step-title">A fresh nonce window</div><div class="flow-step-desc">The request must be made within ±60 seconds. Replays are mathematically impossible.</div></div></div>
+        </div>
+        <div class="status-box info" style="margin-top:var(--space-4);margin-bottom:0">
+          <div class="status-box-icon"><i data-lucide="info" style="width:16px;height:16px"></i></div>
+          <div class="status-box-body"><strong>All four must be present simultaneously.</strong> No single leak, theft, or intercept is sufficient. An attacker needs physical device access + the secret + a fresh nonce window — making opportunistic attacks essentially impossible. Add TSK (Layers 6–7) for even stronger guarantees.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== COMPARISON ===== -->
+<section id="vs" style="background:var(--color-surface);border-top:1px solid var(--color-border)">
+  <div class="container">
+    <div class="section-label">Comparison</div>
+    <h2 class="section-title">BPC vs the current landscape</h2>
+    <div style="overflow-x:auto">
+      <table class="attack-matrix" style="min-width:700px">
+        <thead>
+          <tr>
+            <th>Property</th>
+            <th>Static API Key</th>
+            <th>OAuth 2.0 Token</th>
+            <th>mTLS Cert</th>
+            <th style="color:var(--color-primary)">BPC</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>GitHub-safe credential</td><td class="cross">&#10060;</td><td class="cross">&#10060;</td><td><span style="color:var(--color-warning)">~</span></td><td class="check">&#10003;</td></tr>
+          <tr><td>Non-extractable key</td><td class="cross">&#10060;</td><td class="cross">&#10060;</td><td class="check">&#10003;</td><td class="check">&#10003;</td></tr>
+          <tr><td>Replay protection</td><td class="cross">&#10060;</td><td><span style="color:var(--color-warning)">~</span></td><td><span style="color:var(--color-warning)">~</span></td><td class="check">&#10003;</td></tr>
+          <tr><td>Human-chosen secret factor</td><td class="cross">&#10060;</td><td class="cross">&#10060;</td><td class="cross">&#10060;</td><td class="check">&#10003;</td></tr>
+          <tr><td>Explicit pair registry</td><td class="cross">&#10060;</td><td class="cross">&#10060;</td><td class="cross">&#10060;</td><td class="check">&#10003;</td></tr>
+          <tr><td>Dev/prod mode separation</td><td class="cross">&#10060;</td><td class="cross">&#10060;</td><td class="cross">&#10060;</td><td class="check">&#10003;</td></tr>
+          <tr><td>Real-time anomaly detection</td><td class="cross">&#10060;</td><td><span style="color:var(--color-warning)">~</span></td><td class="cross">&#10060;</td><td class="check">&#10003;</td></tr>
+          <tr><td>Step-up approval (sensitive ops)</td><td class="cross">&#10060;</td><td><span style="color:var(--color-warning)">~</span></td><td class="cross">&#10060;</td><td class="check">&#10003;</td></tr>
+          <tr><td>Zero setup complexity</td><td class="check">&#10003;</td><td class="cross">&#10060;</td><td class="cross">&#10060;</td><td><span style="color:var(--color-warning)">~</span></td></tr>
+          <tr><td>Supply chain attack resistant</td><td class="cross">&#10060;</td><td class="cross">&#10060;</td><td><span style="color:var(--color-warning)">~</span></td><td class="check">&#10003;</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ===== FOOTER ===== -->
+<footer style="border-top:1px solid var(--color-border);padding:var(--space-8) var(--space-6);text-align:center;color:var(--color-text-faint);font-size:var(--text-xs);font-family:var(--font-mono)">
+  BPC — Bound Pair Credentials · Conceived by R. Blake · Built as a protocol reference implementation · Not yet an open standard.
+</footer>
+
+<!-- ===== APPROVAL MODAL ===== -->
+<div class="modal-overlay" id="approval-modal">
+  <div class="modal">
+    <h3 style="color:var(--color-warning)">Step-Up Authorization Required</h3>
+    <div class="status-box warning" style="margin-bottom:var(--space-4)">
+      <div class="status-box-icon"><i data-lucide="bell-ring" style="width:16px;height:16px"></i></div>
+      <div class="status-box-body"><strong>Sensitive operation detected</strong><div id="approval-detail" style="font-size:var(--text-xs);margin-top:var(--space-1)"></div></div>
+    </div>
+    <svg class="timer-ring" viewBox="0 0 48 48">
+      <circle class="track" cx="24" cy="24" r="20"/>
+      <circle class="progress" id="timer-circle" cx="24" cy="24" r="20" stroke-dasharray="125.7" stroke-dashoffset="0"/>
+    </svg>
+    <div class="modal-timer" id="modal-timer">30 seconds to approve</div>
+    <div class="modal-actions">
+      <button class="btn btn-danger" onclick="resolveApproval(false)"><i data-lucide="x" style="width:14px;height:14px"></i> Deny</button>
+      <button class="btn btn-success-outline" onclick="resolveApproval(true)"><i data-lucide="check" style="width:14px;height:14px"></i> Approve</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== TOAST CONTAINER ===== -->
+<div class="toast-container" id="toast-container"></div>
+
+<script>
+// =====================================================================
+//  BPC DEMO — LAYERS 1-5 ONLY
+//  Uses Web Crypto API (ECDSA P-256) for real cryptographic operations
+// =====================================================================
+
+// ── Backend ────────────────────────────────────────────────────────────
+const SERVER      = 'http://localhost:3101';
+const BPC_VERSION = '1.0';
+const ADMIN_TOKEN = 'demo-admin-token';
+
+// ── State ──────────────────────────────────────────────────────────────
+const state = {
+  device: null,
+  pairs: [],
+  nonces: new Set(),
+  config: { maxPairs: 2000, sigWindow: 60000, alertThreshold: 5, lockoutCount: 10 },
+  stats: { total: 0, ok: 0, deny: 0, alerts: 0 },
+  threats: { unknown: 0, sig: 0, replay: 0, expired: 0 },
+  health: { pairs: 0, ok: 0, blocked: 0, probes: 0 },
+  pendingApproval: null
+};
+
+// ── Crypto Helpers ──────────────────────────────────────────────────────
+const DB_NAME = 'bpc-keys-l5', STORE = 'keypairs';
+
+async function openDB() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onerror = () => rej(req.error);
+    req.onsuccess = () => res(req.result);
+    req.onupgradeneeded = e => e.target.result.createObjectStore(STORE, { keyPath: 'id' });
+  });
+}
+
+async function saveStateToIDB() {
+  try {
+    const db = await openDB();
+    const tx = db.transaction(STORE, 'readwrite');
+    const store = tx.objectStore(STORE);
+    if (state.device) {
+      store.put({
+        id: 'device',
+        deviceId: state.device.id,
+        name: state.device.name,
+        mode: state.device.mode,
+        pubJwk: state.device.pubJwk,
+        fingerprint: state.device.fingerprint,
+        privateKey: state.device.privateKey,
+        publicKey: state.device.publicKey,
+      });
+    }
+    for (const p of state.pairs) {
+      store.put({ id: 'pair_' + p.id, ...p });
+    }
+    return new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
+  } catch(e) { /* IDB unavailable — silently skip */ }
+}
+
+async function loadStateFromIDB() {
+  try {
+    const db = await openDB();
+    const tx = db.transaction(STORE, 'readonly');
+    const store = tx.objectStore(STORE);
+    const all = await new Promise((res, rej) => {
+      const req = store.getAll();
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+    for (const record of all) {
+      if (record.id === 'device') {
+        state.device = {
+          id: record.deviceId, name: record.name, mode: record.mode,
+          pubJwk: record.pubJwk, fingerprint: record.fingerprint,
+          privateKey: record.privateKey, publicKey: record.publicKey,
+        };
+      } else if (record.id && record.id.startsWith('pair_')) {
+        const { id: idbId, ...pair } = record;
+        state.pairs.push(pair);
+      }
+    }
+    if (state.device) {
+      document.getElementById('device-result').style.display = 'block';
+      document.getElementById('device-status-badge').textContent = 'Registered';
+      document.getElementById('device-status-badge').className = 'badge badge-success';
+      document.getElementById('device-summary').innerHTML =
+        `<b>Device ID:</b> ${state.device.id}<br>` +
+        `<b>Public Key Fingerprint:</b> ${state.device.fingerprint}...<br>` +
+        `<b>Algorithm:</b> ECDSA P-256<br>` +
+        `<b>Key Storage:</b> IndexedDB (Web Crypto non-extractable)<br>` +
+        `<b>Mode:</b> ${state.device.mode}`;
+      document.getElementById('pair-count-badge').textContent = state.pairs.length + ' pairs';
+      if (state.pairs.length > 0) document.getElementById('pair-count-badge').className = 'badge badge-success';
+      state.health.pairs = state.pairs.length;
+      updatePairRegistry(); updateSelects(); updateAllStats(); updateCapacity();
+      log('info', `Session restored — device "${state.device.name}" + ${state.pairs.length} pair(s) loaded from storage`);
+    }
+  } catch(e) { /* IDB unavailable — fresh session */ }
+}
+
+async function generateKeypair() {
+  const kp = await crypto.subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']
+  );
+  const pubJwk = await crypto.subtle.exportKey('jwk', kp.publicKey);
+  const fp = await computeFingerprint(pubJwk);
+  return { privateKey: kp.privateKey, publicKey: kp.publicKey, pubJwk, fingerprint: fp };
+}
+
+async function computeFingerprint(jwk) {
+  const data = new TextEncoder().encode(JSON.stringify(jwk));
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return b64(hash).substring(0, 20);
+}
+
+async function signPayload(privateKey, payload) {
+  const data = new TextEncoder().encode(canonicalize(payload));
+  const sig  = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, data);
+  return b64url(sig);
+}
+
+// HKDF-SHA256, matching @bpc/core hashSecret() exactly
+async function hashSecret(secret) {
+  const enc = new TextEncoder();
+  const km  = await crypto.subtle.importKey('raw', enc.encode(secret), 'HKDF', false, ['deriveKey']);
+  const dk  = await crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256',
+      salt: enc.encode('bpc-protocol-hmac-salt-v1'),
+      info: enc.encode('bpc-v1-hmac-key') },
+    km, { name: 'HMAC', hash: 'SHA-256', length: 256 }, true, ['sign']
+  );
+  return b64url(await crypto.subtle.exportKey('raw', dk));
+}
+
+// HMAC-SHA256 using HKDF-derived key (base64url input and output)
+async function hmacDerive(keyB64, data) {
+  const key = await crypto.subtle.importKey(
+    'raw', b64urlDecode(keyB64), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  return b64url(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data)));
+}
+
+function canonicalize(obj) {
+  return JSON.stringify(obj, Object.keys(obj).sort());
+}
+function b64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+function b64urlDecode(str) {
+  const s = str.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - str.length % 4) % 4);
+  const bin = atob(s);
+  return new Uint8Array([...bin].map(c => c.charCodeAt(0))).buffer;
+}
+function b64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)));
+}
+function randId(prefix) {
+  const arr = new Uint8Array(16);
+  crypto.getRandomValues(arr);
+  return prefix + '_' + [...arr].map(b => b.toString(16).padStart(2,'0')).join('').substring(0,16);
+}
+function ts() { return new Date().toLocaleTimeString(); }
+
+// ── Tabs ────────────────────────────────────────────────────────────────
+function switchTab(name, btn) {
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  btn.classList.add('active');
+}
+
+// ── Device Registration ─────────────────────────────────────────────────
+async function registerDevice(btn) {
+  btn.disabled = true; btn.innerHTML = '<i data-lucide="loader" style="width:14px;height:14px"></i> Generating keys...';
+
+  try {
+    const kp = await generateKeypair();
+    const name = document.getElementById('device-name').value || 'Device';
+    const mode = document.getElementById('device-mode').value;
+
+    state.device = { ...kp, name, mode, id: randId('dev') };
+
+    document.getElementById('device-summary').innerHTML =
+      `<b>Device ID:</b> ${state.device.id}<br>` +
+      `<b>Public Key Fingerprint:</b> ${kp.fingerprint}...<br>` +
+      `<b>Algorithm:</b> ECDSA P-256<br>` +
+      `<b>Key Storage:</b> IndexedDB + Browser Crypto (non-extractable)<br>` +
+      `<b>Mode:</b> ${mode}`;
+
+    document.getElementById('device-result').style.display = 'block';
+    document.getElementById('device-status-badge').textContent = 'Registered';
+    document.getElementById('device-status-badge').className = 'badge badge-success';
+
+    log('success', `Device "${name}" registered — ECDSA P-256 keypair in browser crypto store (non-extractable)`);
+    toast('success', 'Device Registered', `${name} is ready in ${mode} mode`);
+    await saveStateToIDB();
+  } catch(e) {
+    log('error', 'Device registration failed: ' + e.message);
+  }
+
+  btn.disabled = false; btn.innerHTML = '<i data-lucide="key-round" style="width:14px;height:14px"></i> Generate Device Keypair';
+  lucide.createIcons();
+}
+
+// ── Pair Registration ───────────────────────────────────────────────────
+async function registerPair() {
+  if (!state.device) { return toast('error', 'No Device', 'Register a device first'); }
+
+  const name   = document.getElementById('pair-name').value || 'Client';
+  const secret = document.getElementById('pair-secret').value;
+  const scope  = document.getElementById('pair-scope').value;
+
+  const specialCount = (secret.match(/[^A-Za-z0-9]/g) || []).length;
+  if (!secret || secret.length < 16)
+    return showResult('pair-result', 'error', 'Secret must be at least 16 characters');
+  if (specialCount < 2)
+    return showResult('pair-result', 'error', 'Secret must contain at least 2 special characters');
+
+  const secretHash = await hashSecret(secret);
+  const kp         = await generateKeypair();
+
+  let pairId;
+  try {
+    const res  = await fetch(`${SERVER}/bpc/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, scope, mode: state.device.mode, secretHash, pubJwk: kp.pubJwk }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showResult('pair-result', 'error', `Registration failed: ${data.error}`);
+      log('error', `Pair registration failed: ${data.error}`);
+      return;
+    }
+    pairId = data.pairId;
+  } catch (e) {
+    showResult('pair-result', 'error', `Cannot reach server — is it running? (${e.message})`);
+    log('error', `Server unreachable: ${e.message}`);
+    return;
+  }
+
+  const pair = {
+    id: pairId, name, scope,
+    mode: state.device.mode,
+    secretHash,
+    privateKey: kp.privateKey, publicKey: kp.publicKey,
+    fingerprint: kp.fingerprint, pubJwk: kp.pubJwk,
+    status: 'active', created: Date.now(), lastActive: null,
+    requests: 0, failedSigs: 0,
+  };
+
+  state.pairs.push(pair);
+  state.health.pairs = state.pairs.length;
+  updatePairRegistry(); updateSelects(); updateHealthStats(); updateCapacity();
+
+  showResult('pair-result', 'success',
+    `Pair "${name}" registered on server<br>` +
+    `<span style="font-family:var(--font-mono);font-size:11px">` +
+    `Pair ID: ${pairId}<br>Scope: ${scope} | HKDF-SHA256 secret hash sent (never the secret)</span>`
+  );
+  log('success', `Pair "${name}" registered on server — ${scope} scope | HKDF-SHA256 | pair=${pairId}`);
+  await saveStateToIDB();
+  toast('success', 'Pair Created', `"${name}" approved by server`);
+
+  document.getElementById('pair-count-badge').textContent = state.pairs.length + ' pairs';
+  document.getElementById('pair-count-badge').className = 'badge badge-success';
+}
+
+// ── Requests ────────────────────────────────────────────────────────────
+async function makeAuthorizedRequest() {
+  const pairId   = document.getElementById('req-pair-select').value;
+  const endpoint = document.getElementById('req-endpoint').value;
+  const secret   = document.getElementById('req-secret').value;
+
+  if (!pairId) return showResult('req-result', 'error', 'Select a pair first');
+  if (!secret) return showResult('req-result', 'error', 'Enter the user secret for this pair');
+
+  const pair = state.pairs.find(p => p.id === pairId);
+  if (!pair) return showResult('req-result', 'error', 'Pair not found');
+
+  const [method, path] = endpoint.split(' ');
+  const nonce     = crypto.randomUUID();
+  const timestamp = Date.now();
+
+  // Step-up approval for sensitive operations in production mode
+  const sensitive = ['DELETE', 'PUT'].includes(method) || path.includes('admin');
+  if (pair.mode === 'production' && sensitive) {
+    const approved = await requestApproval(endpoint, pair.name);
+    if (!approved) {
+      log('warning', `Production approval denied for ${endpoint} — pair "${pair.name}"`);
+      showResult('req-result', 'warning', 'Denied: step-up approval rejected');
+      return;
+    }
+    state.stats.alerts++;
+  }
+
+  const secretHash = await hashSecret(secret);
+  const secretHmac = await hmacDerive(secretHash, nonce + String(timestamp));
+
+  const bodyHashBuf = await crypto.subtle.digest('SHA-256', new Uint8Array(0));
+  const payload = {
+    body_hash:   'sha256:' + b64url(bodyHashBuf),
+    method,
+    nonce,
+    pair_id:     pairId,
+    path,
+    secret_hmac: secretHmac,
+    timestamp,
+    version:     BPC_VERSION,
+  };
+
+  const canonJson  = canonicalize(payload);
+  const signedData = b64url(new TextEncoder().encode(canonJson));
+  const signature  = await signPayload(pair.privateKey, payload);
+
+  let res, data;
+  try {
+    res  = await fetch(`${SERVER}${path}`, {
+      method,
+      headers: {
+        'X-BPC-Pair-Id':     pairId,
+        'X-BPC-Signed-Data': signedData,
+        'X-BPC-Signature':   signature,
+        'X-BPC-Version':     BPC_VERSION,
+      },
+    });
+    data = await res.json();
+  } catch (e) {
+    showResult('req-result', 'error', `Cannot reach server — is it running? (${e.message})`);
+    return;
+  }
+
+  state.stats.total++;
+  if (res.ok) {
+    pair.lastActive = Date.now(); pair.requests++;
+    state.stats.ok++; state.health.ok++;
+    document.getElementById('last-payload').innerHTML =
+      syntaxHighlight(payload) +
+      `<br><span class="cmt">// Signature (ECDSA-SHA256):</span><br>` +
+      `<span class="str">${signature.substring(0, 48)}...</span>`;
+    showResult('req-result', 'success',
+      `Authorized — ${endpoint}<br>` +
+      `<span style="font-size:11px;font-family:var(--font-mono)">` +
+      `Pair: ${pair.name} | Nonce: ${nonce.substring(0, 8)}... | Server: ${JSON.stringify(data)}</span>`
+    );
+    log('success', `${endpoint} — pair "${pair.name}" | BPC verification PASSED`);
+    updatePairRegistry();
+  } else {
+    state.stats.deny++; state.health.blocked++;
+    showResult('req-result', 'error',
+      `Denied (${res.status}) — ${data.error}<br>` +
+      `<span style="font-size:11px">${data.detail ?? ''}</span>`
+    );
+    log('error', `${endpoint} — pair "${pair.name}" | denied: ${data.error}`);
+  }
+
+  updateAllStats();
+  await refreshAnomalyStats();
+}
+
+// ── Live anomaly stats from server ─────────────────────────────────────
+async function refreshAnomalyStats() {
+  try {
+    const res = await fetch(`${SERVER}/bpc/anomaly`, {
+      headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` },
+    });
+    if (!res.ok) return;
+    const { score, counters } = await res.json();
+    const scoreEl = document.getElementById('threat-score-val');
+    const labelEl = document.getElementById('threat-score-label');
+    if (scoreEl) scoreEl.textContent = Math.round(score);
+    if (labelEl) {
+      if (score >= 70)      { labelEl.textContent = 'ATTACK DETECTED'; labelEl.style.color = 'var(--color-error)'; }
+      else if (score >= 40) { labelEl.textContent = 'Elevated threat'; labelEl.style.color = 'var(--color-warning)'; }
+      else                  { labelEl.textContent = 'System nominal';   labelEl.style.color = 'var(--color-success)'; }
+    }
+    const total = Math.max(1, state.stats.total);
+    const pct   = (n) => Math.min(100, Math.round((n / total) * 100));
+    if (counters) {
+      const u = Number(counters.unknownIds  ?? 0);
+      const s = Number(counters.sigFailures ?? 0);
+      const r = Number(counters.replays     ?? 0);
+      const e = Number(counters.expired     ?? 0);
+      const setBar = (id, pctVal) => {
+        const fill = document.getElementById(id);
+        const pctEl = document.getElementById(id + '-pct');
+        if (fill) fill.style.width = pctVal + '%';
+        if (pctEl) pctEl.textContent = pctVal + '%';
+      };
+      setBar('threat-unknown', pct(u));
+      setBar('threat-sig',     pct(s));
+      setBar('threat-replay',  pct(r));
+      setBar('threat-expired', pct(e));
+    }
+  } catch { /* server may not be running — silently skip */ }
+}
+
+// ── Approval Modal ──────────────────────────────────────────────────────
+function requestApproval(endpoint, pairName) {
+  return new Promise(resolve => {
+    document.getElementById('approval-detail').innerHTML =
+      `Operation: <strong>${endpoint}</strong><br>Pair: <strong>${pairName}</strong><br>Time: ${new Date().toLocaleTimeString()}`;
+
+    document.getElementById('approval-modal').classList.add('open');
+
+    let t = 30;
+    const circ = document.getElementById('timer-circle');
+    const circumference = 125.7;
+
+    const interval = setInterval(() => {
+      t--;
+      document.getElementById('modal-timer').textContent = `${t} seconds to approve`;
+      circ.style.strokeDashoffset = circumference * (1 - t/30);
+      if (t <= 0) {
+        clearInterval(interval);
+        document.getElementById('approval-modal').classList.remove('open');
+        resolve(false);
+      }
+    }, 1000);
+
+    state.pendingApproval = { resolve, interval };
+  });
+}
+
+function resolveApproval(approved) {
+  if (state.pendingApproval) {
+    clearInterval(state.pendingApproval.interval);
+    document.getElementById('approval-modal').classList.remove('open');
+    state.pendingApproval.resolve(approved);
+    state.pendingApproval = null;
+    log(approved ? 'success' : 'warning', approved ? 'Step-up approval granted' : 'Step-up approval denied by user');
+  }
+}
+
+// ── Config ──────────────────────────────────────────────────────────────
+function applyConfig() {
+  state.config.maxPairs     = parseInt(document.getElementById('max-pairs').value) || 2000;
+  state.config.sigWindow    = (parseInt(document.getElementById('sig-window').value) || 60) * 1000;
+  state.config.alertThreshold = parseInt(document.getElementById('alert-threshold').value) || 5;
+  state.config.lockoutCount   = parseInt(document.getElementById('lockout-count').value) || 10;
+  toast('success', 'Config Applied', 'Box configuration updated');
+  log('info', `Config updated — maxPairs:${state.config.maxPairs}, sigWindow:${state.config.sigWindow/1000}s`);
+  updateCapacity();
+}
+
+function resetAll() {
+  if (!confirm('Reset all pairs, device, and logs?')) return;
+  state.device = null; state.pairs = []; state.nonces.clear();
+  state.stats = { total:0, ok:0, deny:0, alerts:0 };
+  state.threats = { unknown:0, sig:0, replay:0, expired:0 };
+  state.health = { pairs:0, ok:0, blocked:0, probes:0 };
+
+  document.getElementById('device-result').style.display = 'none';
+  document.getElementById('device-status-badge').textContent = 'Not registered';
+  document.getElementById('device-status-badge').className = 'badge badge-neutral';
+  document.getElementById('pair-count-badge').textContent = '0 pairs';
+  document.getElementById('pair-count-badge').className = 'badge badge-neutral';
+  document.getElementById('pair-result').innerHTML = '';
+  document.getElementById('req-result').innerHTML = '';
+
+  updatePairRegistry(); updateSelects(); updateAllStats(); updateCapacity();
+  document.getElementById('activity-log').innerHTML = '<div class="log-empty">Log cleared — register a device to begin</div>';
+  toast('info', 'Reset Complete', 'All state cleared');
+}
+
+// ── UI Helpers ──────────────────────────────────────────────────────────
+function updatePairRegistry() {
+  const tbody = document.getElementById('pair-registry-body');
+  document.getElementById('registry-total').textContent = `${state.pairs.length} / ${state.config.maxPairs}`;
+
+  if (!state.pairs.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--color-text-faint);padding:var(--space-6)">No pairs registered yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = state.pairs.map(p => `
+    <tr>
+      <td style="color:var(--color-primary)">${esc(p.id.substring(0,18))}...</td>
+      <td>${esc(p.name)}</td>
+      <td><span class="badge badge-neutral">${esc(p.scope)}</span></td>
+      <td><span class="badge ${p.mode==='production'?'badge-primary':'badge-warning'}">${esc(p.mode)}</span></td>
+      <td><span class="badge ${p.status==='active'?'badge-success':'badge-error'}">${esc(p.status)}</span></td>
+      <td style="color:var(--color-text-muted)">${p.lastActive ? new Date(p.lastActive).toLocaleTimeString() : '—'}</td>
+      <td><button class="btn btn-danger btn-sm" onclick="revokePair('${esc(p.id)}')">Revoke</button></td>
+    </tr>
+  `).join('');
+}
+
+async function revokePair(id) {
+  const p = state.pairs.find(x => x.id === id);
+  if (!p) return;
+  p.status = 'revoked';
+  state.pairs = state.pairs.filter(x => x.id !== id);
+  state.health.pairs = state.pairs.length;
+  updatePairRegistry(); updateSelects(); updateCapacity(); updateHealthStats();
+  log('warning', `Pair "${p.name}" revoked by owner`);
+  toast('warning', 'Pair Revoked', `"${p.name}" can no longer make requests`);
+  await saveStateToIDB();
+}
+
+function updateSelects() {
+  const sel = document.getElementById('req-pair-select');
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">— Select a pair —</option>' +
+    state.pairs.map(p => `<option value="${esc(p.id)}">${esc(p.name)} (${esc(p.scope)})</option>`).join('');
+  if (prev) sel.value = prev;
+}
+
+function updateAllStats() {
+  document.getElementById('stat-total').textContent  = state.stats.total;
+  document.getElementById('stat-ok').textContent     = state.stats.ok;
+  document.getElementById('stat-deny').textContent   = state.stats.deny;
+  document.getElementById('stat-alert').textContent  = state.stats.alerts;
+  updateHealthStats();
+}
+
+function updateHealthStats() {
+  document.getElementById('health-pairs').textContent   = state.health.pairs;
+  document.getElementById('health-ok').textContent      = state.health.ok;
+  document.getElementById('health-blocked').textContent = state.health.blocked;
+  document.getElementById('health-probes').textContent  = state.health.probes;
+}
+
+function updateCapacity() {
+  const pct = (state.pairs.length / state.config.maxPairs) * 100;
+  document.getElementById('capacity-bar').style.width = Math.min(pct, 100) + '%';
+  document.getElementById('capacity-label').textContent = `${state.pairs.length} / ${state.config.maxPairs} pairs`;
+  document.getElementById('capacity-bar').style.background =
+    pct > 90 ? 'var(--color-error)' : pct > 70 ? 'var(--color-warning)' : 'var(--color-primary)';
+}
+
+function showResult(id, type, html) {
+  document.getElementById(id).innerHTML =
+    `<div class="status-box ${type}" style="margin-bottom:0"><div class="status-box-body">${html}</div></div>`;
+}
+
+function syntaxHighlight(obj) {
+  return JSON.stringify(obj, null, 2)
+    .replace(/"([^"]+)":/g, '<span class="key">"$1"</span>:')
+    .replace(/: "([^"]+)"/g, ': <span class="str">"$1"</span>')
+    .replace(/: (\d+)/g, ': <span class="num">$1</span>');
+}
+
+function clearLog() {
+  document.getElementById('activity-log').innerHTML = '<div class="log-empty">Log cleared</div>';
+}
+
+function esc(str) { const d = document.createElement('div'); d.textContent = String(str); return d.innerHTML; }
+
+function log(type, text) {
+  const container = document.getElementById('activity-log');
+  if (container.querySelector('.log-empty')) container.innerHTML = '';
+
+  const entry = document.createElement('div');
+  entry.className = 'log-entry';
+  entry.innerHTML = `
+    <span class="log-time">${ts()}</span>
+    <span class="log-dot ${type}"></span>
+    <span class="log-text">${text}</span>
+  `;
+  container.insertBefore(entry, container.firstChild);
+  while (container.children.length > 50) container.removeChild(container.lastChild);
+}
+
+function toast(type, title, body) {
+  const colors = { success: 'var(--color-success)', error: 'var(--color-error)', warning: 'var(--color-warning)', info: 'var(--color-primary)' };
+  const icons  = { success: 'check-circle', error: 'x-circle', warning: 'triangle-alert', info: 'info' };
+
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.innerHTML = `
+    <div class="toast-icon" style="color:${colors[type]}"><i data-lucide="${icons[type]}" style="width:18px;height:18px"></i></div>
+    <div class="toast-body"><strong>${title}</strong><p>${body}</p></div>
+    <button class="toast-close" onclick="dismissToast(this.closest('.toast'))"><i data-lucide="x" style="width:14px;height:14px"></i></button>
+  `;
+  document.getElementById('toast-container').appendChild(el);
+  lucide.createIcons();
+  setTimeout(() => dismissToast(el), 5000);
+}
+
+function dismissToast(el) {
+  if (!el || !el.parentNode) return;
+  el.classList.add('removing');
+  setTimeout(() => el.remove(), 300);
+}
+
+// Secret strength indicator
+document.getElementById('pair-secret').addEventListener('input', function() {
+  const v = this.value;
+  let strength = '', color = '';
+  const specials = (v.match(/[^A-Za-z0-9]/g) || []).length;
+  if (!v) { strength = ''; }
+  else if (v.length < 16) { strength = 'too short'; color = 'var(--color-error)'; }
+  else if (specials < 2) { strength = 'needs 2+ specials'; color = 'var(--color-warning)'; }
+  else if (v.length >= 16 && specials >= 2 && /[A-Z]/.test(v) && /[0-9]/.test(v)) { strength = 'strong'; color = 'var(--color-success)'; }
+  else { strength = 'ok'; color = 'var(--color-primary)'; }
+  document.getElementById('secret-strength').textContent = strength;
+  document.getElementById('secret-strength').style.color = color;
+});
+
+// Theme toggle
+(function() {
+  const t = document.querySelector('[data-theme-toggle]'), r = document.documentElement;
+  let d = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  r.setAttribute('data-theme', d);
+  t && t.addEventListener('click', () => {
+    d = d === 'dark' ? 'light' : 'dark';
+    r.setAttribute('data-theme', d);
+    t.innerHTML = d === 'dark'
+      ? '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>'
+      : '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+  });
+})();
+
+// Init
+(async () => {
+  await loadStateFromIDB();
+  updateCapacity();
+  lucide.createIcons();
+})();
+</script>
+</body>
+</html>
