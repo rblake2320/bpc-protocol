@@ -1,0 +1,9 @@
+{
+  "name": "bpc-demo-server",
+  "description": "BPC Demo — real backend server for the interactive demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "npx tsx server.ts"
+  }
+}

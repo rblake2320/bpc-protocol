@@ -1065,6 +1065,11 @@ textarea { min-height: 80px; resize: vertical; }
 //  Uses Web Crypto API (ECDSA P-256) for real cryptographic operations
 // =====================================================================
 
+// ── Backend ────────────────────────────────────────────────────────────
+const SERVER      = 'http://localhost:3100';
+const BPC_VERSION = '1.0';
+const ADMIN_TOKEN = 'demo-admin-token';
+
 // ── State ──────────────────────────────────────────────────────────────
 const state = {
   device: null,
@@ -1181,8 +1186,8 @@ async function computeFingerprint(jwk) {
 
 async function signPayload(privateKey, payload) {
   const data = new TextEncoder().encode(canonicalize(payload));
-  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, data);
-  return b64(sig);
+  const sig  = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, data);
+  return b64url(sig);
 }
 
 async function verifyPayload(publicKey, payload, signature) {
@@ -1193,23 +1198,41 @@ async function verifyPayload(publicKey, payload, signature) {
   } catch { return false; }
 }
 
-async function hmacDerive(secret, data) {
-  const key = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+// HKDF-SHA256, matching @bpc/core hashSecret() exactly
+async function hashSecret(secret) {
+  const enc = new TextEncoder();
+  const km  = await crypto.subtle.importKey('raw', enc.encode(secret), 'HKDF', false, ['deriveKey']);
+  const dk  = await crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256',
+      salt: enc.encode('bpc-protocol-hmac-salt-v1'),
+      info: enc.encode('bpc-v1-hmac-key') },
+    km, { name: 'HMAC', hash: 'SHA-256', length: 256 }, true, ['sign']
   );
-  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
-  return b64(sig).substring(0, 16);
+  return b64url(await crypto.subtle.exportKey('raw', dk));
 }
 
-async function hashSecret(secret) {
-  const data = new TextEncoder().encode('bpc:' + secret);
-  const hash = await crypto.subtle.digest('SHA-256', data);
-  return b64(hash);
+// HMAC-SHA256 using HKDF-derived key (base64url input and output)
+async function hmacDerive(keyB64, data) {
+  const key = await crypto.subtle.importKey(
+    'raw', b64urlDecode(keyB64), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  return b64url(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data)));
 }
 
 function canonicalize(obj) {
   return JSON.stringify(obj, Object.keys(obj).sort());
 }
+// base64url (no padding) — matches Node.js Buffer.toString('base64url')
+function b64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+function b64urlDecode(str) {
+  const s = str.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - str.length % 4) % 4);
+  const bin = atob(s);
+  return new Uint8Array([...bin].map(c => c.charCodeAt(0))).buffer;
+}
+// standard base64 kept for display/fingerprints
 function b64(buf) {
   return btoa(String.fromCharCode(...new Uint8Array(buf)));
 }
@@ -1268,207 +1291,369 @@ async function registerDevice(btn) {
 // ── Pair Registration ───────────────────────────────────────────────────
 async function registerPair() {
   if (!state.device) { return toast('error', 'No Device', 'Register a device first'); }
-  
-  const name = document.getElementById('pair-name').value || 'Client';
+
+  const name   = document.getElementById('pair-name').value || 'Client';
   const secret = document.getElementById('pair-secret').value;
-  const scope = document.getElementById('pair-scope').value;
-  
+  const scope  = document.getElementById('pair-scope').value;
+
   const specialCount = (secret.match(/[^A-Za-z0-9]/g) || []).length;
-  if (!secret || secret.length < 16) {
+  if (!secret || secret.length < 16)
     return showResult('pair-result', 'error', 'Secret must be at least 16 characters');
-  }
-  if (specialCount < 2) {
+  if (specialCount < 2)
     return showResult('pair-result', 'error', 'Secret must contain at least 2 special characters');
-  }
-  if (state.pairs.length >= state.config.maxPairs) {
-    return showResult('pair-result', 'error', `Pair capacity reached (${state.config.maxPairs} max)`);
-  }
-  
+
+  // Derive HKDF key — this is what gets sent to the server and used for HMAC signing
   const secretHash = await hashSecret(secret);
-  const kp = await generateKeypair();
+  const kp         = await generateKeypair();
+
+  // POST to real server
+  let pairId;
+  try {
+    const res  = await fetch(`${SERVER}/bpc/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, scope, mode: state.device.mode, secretHash, pubJwk: kp.pubJwk }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showResult('pair-result', 'error', `Registration failed: ${data.error}`);
+      log('error', `Pair registration failed: ${data.error}`);
+      return;
+    }
+    pairId = data.pairId;
+  } catch (e) {
+    showResult('pair-result', 'error', `Cannot reach server — is it running? (${e.message})`);
+    log('error', `Server unreachable: ${e.message}`);
+    return;
+  }
+
   const pair = {
-    id: randId('pair'),
+    id: pairId,
     name, scope,
     mode: state.device.mode,
-    secretHash,
+    secretHash,               // stored locally for request signing
     privateKey: kp.privateKey,
-    publicKey: kp.publicKey,
+    publicKey:  kp.publicKey,
     fingerprint: kp.fingerprint,
+    pubJwk:     kp.pubJwk,
     status: 'active',
     created: Date.now(),
     lastActive: null,
     requests: 0,
-    failedSigs: 0
+    failedSigs: 0,
   };
-  
+
   state.pairs.push(pair);
   state.health.pairs = state.pairs.length;
-  
-  updatePairRegistry();
-  updateSelects();
-  updateHealthStats();
-  updateCapacity();
-  
+  updatePairRegistry(); updateSelects(); updateHealthStats(); updateCapacity();
+
   showResult('pair-result', 'success',
-    `✓ Pair "${name}" created<br><span style="font-family:var(--font-mono);font-size:11px">Pair ID: ${pair.id}<br>Scope: ${scope} | Secret: hashed (never stored plaintext)</span>`
+    `✓ Pair "${name}" registered on server<br>` +
+    `<span style="font-family:var(--font-mono);font-size:11px">` +
+    `Pair ID: ${pairId}<br>Scope: ${scope} | HKDF-SHA256 secret hash sent (never the secret)</span>`
   );
-  
-  log('success', `Pair "${name}" registered — ${scope} scope, secret hashed with SHA-256`);
+  log('success', `Pair "${name}" registered on server — ${scope} scope | HKDF-SHA256 | pair=${pairId}`);
   await saveStateToIDB();
-  toast('success', 'Pair Created', `"${name}" is now active`);
-  
+  toast('success', 'Pair Created', `"${name}" approved by server`);
+
   document.getElementById('pair-count-badge').textContent = state.pairs.length + ' pairs';
   document.getElementById('pair-count-badge').className = 'badge badge-success';
 }
 
 // ── Requests ────────────────────────────────────────────────────────────
 async function makeAuthorizedRequest() {
-  const pairId = document.getElementById('req-pair-select').value;
+  const pairId   = document.getElementById('req-pair-select').value;
   const endpoint = document.getElementById('req-endpoint').value;
-  const secret = document.getElementById('req-secret').value;
-  
+  const secret   = document.getElementById('req-secret').value;
+
   if (!pairId) return showResult('req-result', 'error', 'Select a pair first');
   if (!secret) return showResult('req-result', 'error', 'Enter the user secret for this pair');
-  
+
   const pair = state.pairs.find(p => p.id === pairId);
   if (!pair) return showResult('req-result', 'error', 'Pair not found');
-  
+
   const [method, path] = endpoint.split(' ');
-  const nonce = crypto.randomUUID();
+  const nonce     = crypto.randomUUID();
   const timestamp = Date.now();
-  
-  // Check secret
-  const inputHash = await hashSecret(secret);
-  if (inputHash !== pair.secretHash) {
-    state.stats.total++; state.stats.deny++;
-    state.threats.sig = Math.min(100, state.threats.sig + 15);
-    state.health.blocked++;
-    updateAllStats();
-    log('error', `Signature failure — wrong secret for pair "${pair.name}" (${endpoint})`);
-    showResult('req-result', 'error', '❌ Denied: wrong user secret. This attempt is logged.');
-    toast('error', 'Wrong Secret', 'Denied — logged as signature failure');
-    return;
-  }
-  
-  // Build secret HMAC
-  const secretHash = await hashSecret(secret);
-  const secretHmac = await hmacDerive(secretHash, nonce + timestamp);
-  
-  const payload = {
-    body_hash: 'sha256:' + b64(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(''))),
-    method, path,
-    nonce, pair_id: pairId,
-    secret_hmac: secretHmac,
-    timestamp
-  };
-  
-  // Check sensitive + production
-  const sensitive = ['DELETE','PUT'].includes(method) || path.includes('billing') || path.includes('admin');
+
+  // Step-up approval for sensitive operations in production mode
+  const sensitive = ['DELETE', 'PUT'].includes(method) || path.includes('billing') || path.includes('admin');
   if (pair.mode === 'production' && sensitive) {
     const approved = await requestApproval(endpoint, pair.name);
     if (!approved) {
-      state.stats.total++; state.stats.deny++;
-      state.health.blocked++;
-      updateAllStats();
       log('warning', `Production approval denied for ${endpoint} — pair "${pair.name}"`);
-      showResult('req-result', 'warning', '⚠ Denied: user rejected the step-up approval');
+      showResult('req-result', 'warning', '⚠ Denied: step-up approval rejected');
       return;
     }
     state.stats.alerts++;
   }
-  
-  const signature = await signPayload(pair.privateKey, payload);
-  state.capturedRequest = { payload, signature, pairId };
-  
-  // Verify (server side simulation)
-  const valid = await verifyPayload(pair.publicKey, payload, signature);
-  
-  if (valid) {
-    pair.lastActive = Date.now(); pair.requests++;
-    state.stats.total++; state.stats.ok++; state.health.ok++;
-    updateAllStats();
-    
-    document.getElementById('last-payload').innerHTML = syntaxHighlight(payload) +
-      `<br><span class="cmt">// Signature (ECDSA-SHA256):</span><br><span class="str">${signature.substring(0,48)}…</span>`;
-    
-    showResult('req-result', 'success',
-      `✓ Authorized — ${endpoint}<br><span style="font-size:11px;font-family:var(--font-mono)">Pair: ${pair.name} | Nonce: ${nonce.substring(0,8)}… | Timestamp: valid</span>`
-    );
-    log('success', `✓ ${endpoint} — pair "${pair.name}" | sig valid | nonce fresh`);
-    updatePairRegistry();
+
+  // Derive secretHash from entered secret then HMAC-derive for this request
+  const secretHash = await hashSecret(secret);
+  const secretHmac = await hmacDerive(secretHash, nonce + String(timestamp));
+
+  // Empty body hash for GET requests
+  const bodyHashBuf = await crypto.subtle.digest('SHA-256', new Uint8Array(0));
+  const payload = {
+    body_hash:   'sha256:' + b64url(bodyHashBuf),
+    method,
+    nonce,
+    pair_id:     pairId,
+    path,
+    secret_hmac: secretHmac,
+    timestamp,
+    version:     BPC_VERSION,
+  };
+
+  const canonJson  = canonicalize(payload);
+  const signedData = b64url(new TextEncoder().encode(canonJson));
+  const signature  = await signPayload(pair.privateKey, payload);
+
+  // Capture for replay attack demo
+  state.capturedRequest = { payload, signature, pairId, signedData };
+
+  // Send to real server
+  let res, data;
+  try {
+    res  = await fetch(`${SERVER}${path}`, {
+      method,
+      headers: {
+        'X-BPC-Pair-Id':     pairId,
+        'X-BPC-Signed-Data': signedData,
+        'X-BPC-Signature':   signature,
+        'X-BPC-Version':     BPC_VERSION,
+      },
+    });
+    data = await res.json();
+  } catch (e) {
+    showResult('req-result', 'error', `Cannot reach server — is it running? (${e.message})`);
+    return;
   }
+
+  state.stats.total++;
+  if (res.ok) {
+    pair.lastActive = Date.now(); pair.requests++;
+    state.stats.ok++; state.health.ok++;
+    document.getElementById('last-payload').innerHTML =
+      syntaxHighlight(payload) +
+      `<br><span class="cmt">// Signature (ECDSA-SHA256):</span><br>` +
+      `<span class="str">${signature.substring(0, 48)}…</span>`;
+    showResult('req-result', 'success',
+      `✓ Authorized — ${endpoint}<br>` +
+      `<span style="font-size:11px;font-family:var(--font-mono)">` +
+      `Pair: ${pair.name} | Nonce: ${nonce.substring(0, 8)}… | Server: ${JSON.stringify(data)}</span>`
+    );
+    log('success', `✓ ${endpoint} — pair "${pair.name}" | 12-step verification PASSED`);
+    updatePairRegistry();
+  } else {
+    state.stats.deny++; state.health.blocked++;
+    showResult('req-result', 'error',
+      `❌ Denied (${res.status}) — ${data.error}<br>` +
+      `<span style="font-size:11px">${data.detail ?? ''}</span>`
+    );
+    log('error', `✗ ${endpoint} — pair "${pair.name}" | denied: ${data.error}`);
+  }
+
+  updateAllStats();
+  await refreshAnomalyStats();
 }
 
 // ── Attack Sim ──────────────────────────────────────────────────────────
 async function runAttack() {
-  const type = document.getElementById('attack-type').value;
+  const type     = document.getElementById('attack-type').value;
   const targetId = document.getElementById('attack-target').value;
-  
-  if (!targetId && type !== 'unknown-pair') return showResult('attack-result', 'error', 'Select a target pair');
-  
-  const pair = state.pairs.find(p => p.id === targetId);
-  const endpoint = 'GET /api/users';
-  
-  state.stats.total++; state.stats.deny++; state.health.blocked++; state.health.probes++;
+  const pair     = state.pairs.find(p => p.id === targetId);
+
+  if (!targetId && !['unknown-pair', 'tsk-segment', 'structural-secrecy'].includes(type))
+    return showResult('attack-result', 'error', 'Select a target pair');
+
   state.threats.totalAttacks++;
-  
-  let resultMsg = '', logMsg = '', threatType = '';
-  
-  if (type === 'no-sig') {
-    threatType = 'sig';
-    state.threats.sig = Math.min(100, state.threats.sig + 20);
-    resultMsg = '❌ DENIED: No device signature<br><span style="font-size:11px">Server requires X-BPC-Signature header signed by registered device. Stolen key alone = zero access.</span>';
-    logMsg = `🚨 Attack blocked — stolen key used from unknown device (no device signature)`;
-    toast('error', '🚨 Security Alert', 'Stolen key attempt — no device signature');
-  } else if (type === 'wrong-secret') {
-    threatType = 'sig';
-    state.threats.sig = Math.min(100, state.threats.sig + 25);
-    resultMsg = '❌ DENIED: Secret mismatch<br><span style="font-size:11px">secret_hmac in signed payload does not match stored hash for this pair.</span>';
-    logMsg = `🚨 Attack blocked — correct pair ID, wrong user secret`;
-    toast('error', '🚨 Security Alert', 'Wrong secret attempt on pair "' + (pair?.name || 'unknown') + '"');
-  } else if (type === 'replay') {
-    if (!state.capturedRequest) {
-      return showResult('attack-result', 'warning', '⚠ Make a legitimate request first so we have one to replay');
-    }
-    threatType = 'replay';
-    state.threats.replay = Math.min(100, state.threats.replay + 30);
-    resultMsg = '❌ DENIED: Replay detected<br><span style="font-size:11px">Nonce "' + state.capturedRequest.payload.nonce.substring(0,8) + '…" already seen in this session. Timestamp may also be expired.</span>';
-    logMsg = `🚨 Replay attack blocked — nonce already consumed`;
-    toast('error', '🚨 Replay Blocked', 'Captured request cannot be reused');
-  } else if (type === 'unknown-pair') {
-    threatType = 'unknown';
-    state.threats.unknown = Math.min(100, state.threats.unknown + 20);
-    const fakePairId = randId('pair');
-    resultMsg = '❌ DENIED: Unknown pair ID<br><span style="font-size:11px">Pair ID "' + fakePairId + '" is not in the registry. Box flagged this as a probe attempt. Alert sent to owner.</span>';
-    logMsg = `🚨 Unknown pair ID probe — not in registry (fake: ${fakePairId.substring(0,20)}…)`;
-    toast('error', '🚨 Probe Detected', 'Unknown pair ID flagged by anomaly engine');
-  } else if (type === 'expired-ts') {
-    threatType = 'expired';
-    state.threats.expired = Math.min(100, state.threats.expired + 25);
-    const oldTs = Date.now() - 90000;
-    resultMsg = '❌ DENIED: Expired timestamp<br><span style="font-size:11px">Timestamp ' + new Date(oldTs).toISOString() + ' is outside the ±60s window. Request rejected as stale.</span>';
-    logMsg = `🚨 Expired timestamp rejected — request from 90s ago blocked`;
-    toast('warning', 'Timestamp Expired', 'Request outside valid window');
-  } else if (type === 'tsk-segment') {
-    threatType = 'sig';
+
+  // Layer 6 + 7 are TSK/Structural Secrecy — not yet in the server package,
+  // shown as protocol-level educational simulations.
+  if (type === 'tsk-segment') {
     state.threats.sig = Math.min(100, state.threats.sig + 30);
-    resultMsg = '❌ DENIED: TSK segment insufficient (Layer 6)<br><span style="font-size:11px">Attacker obtained the TOTP segment alone. Server requires all three segments — static (monthly), TOTP (30s), and HOTP (event-counter) — cryptographically combined. A single segment grants zero access.</span>';
-    logMsg = `🚨 TSK Layer 6 attack blocked — TOTP-only segment cannot authenticate`;
+    updateThreatBars();
+    showResult('attack-result', 'error',
+      '❌ DENIED: TSK segment insufficient (Layer 6)<br>' +
+      '<span style="font-size:11px">Attacker obtained the TOTP segment alone. All three segments — ' +
+      'static (monthly), TOTP (30s), HOTP (event-counter) — must be valid simultaneously. ' +
+      'A single segment grants zero access.</span>'
+    );
+    log('error', '🚨 TSK Layer 6 attack blocked — TOTP-only segment cannot authenticate');
     toast('error', '🚨 TSK Attack Blocked', 'Single-segment key attempt denied by Layer 6');
-  } else if (type === 'structural-secrecy') {
-    threatType = 'sig';
+    return;
+  }
+  if (type === 'structural-secrecy') {
     state.threats.sig = Math.min(100, state.threats.sig + 35);
     const guesses = ['static→TOTP→HOTP', 'HOTP→TOTP→static', 'TOTP→static→HOTP'];
-    const guess = guesses[Math.floor(Math.random() * guesses.length)];
-    resultMsg = '❌ DENIED: Structural secrecy violation (Layer 7)<br><span style="font-size:11px">Attacker guessed segment order "' + guess + '". The true positional map is a server-only secret that changes per-session. There are 6 possible orderings — all produce a valid-looking but non-matching key. Server detected the mismatch immediately.</span>';
-    logMsg = `🚨 TSK Layer 7 attack blocked — segment order guess "${guess}" rejected by structural secrecy`;
+    const guess   = guesses[Math.floor(Math.random() * guesses.length)];
+    updateThreatBars();
+    showResult('attack-result', 'error',
+      `❌ DENIED: Structural secrecy violation (Layer 7)<br>` +
+      `<span style="font-size:11px">Guessed order "${guess}". ` +
+      `The positional map is a server-only per-session secret — 6 orderings, none revealed to the client. ` +
+      `Wrong order = wrong key, detected immediately.</span>`
+    );
+    log('error', `🚨 TSK Layer 7 blocked — order guess "${guess}" rejected by structural secrecy`);
     toast('error', '🚨 Structural Secrecy', 'Segment order attack blocked by Layer 7');
+    return;
   }
-  
+
+  // Layers 1–5 attacks hit the real server
+  let res, data, logMsg;
+  try {
+    if (type === 'no-sig') {
+      // Send pair ID with no signing headers — server rejects at header-presence check
+      res  = await fetch(`${SERVER}/api/users`, {
+        headers: { 'X-BPC-Pair-Id': targetId, 'X-BPC-Version': BPC_VERSION },
+      });
+      data = await res.json();
+      logMsg = `🚨 no-sig attack — server responded ${res.status}: ${data.error}`;
+      toast('error', '🚨 Security Alert', 'Stolen key attempt — no device signature');
+
+    } else if (type === 'wrong-secret') {
+      // Sign with a completely wrong secret — HMAC won't match server's stored hash
+      const nonce     = crypto.randomUUID();
+      const timestamp = Date.now();
+      const badHash   = await hashSecret('completely-wrong-secret!!ABC123xyz');
+      const badHmac   = await hmacDerive(badHash, nonce + String(timestamp));
+      const bodyHash  = 'sha256:' + b64url(await crypto.subtle.digest('SHA-256', new Uint8Array(0)));
+      const payload   = { body_hash: bodyHash, method: 'GET', nonce, pair_id: targetId,
+                          path: '/api/users', secret_hmac: badHmac, timestamp, version: BPC_VERSION };
+      const canonJson = canonicalize(payload);
+      const signature = await signPayload(pair.privateKey, payload);
+      res  = await fetch(`${SERVER}/api/users`, {
+        headers: {
+          'X-BPC-Pair-Id':     targetId,
+          'X-BPC-Signed-Data': b64url(new TextEncoder().encode(canonJson)),
+          'X-BPC-Signature':   signature,
+          'X-BPC-Version':     BPC_VERSION,
+        },
+      });
+      data = await res.json();
+      logMsg = `🚨 wrong-secret attack — server responded ${res.status}: ${data.error}`;
+      toast('error', '🚨 Security Alert', 'Wrong secret attempt on pair "' + (pair?.name || 'unknown') + '"');
+
+    } else if (type === 'replay') {
+      if (!state.capturedRequest)
+        return showResult('attack-result', 'warning', '⚠ Make a legitimate request first so we have one to replay');
+      // Resend the exact same signed request — nonce already consumed
+      const { pairId, signedData, signature } = state.capturedRequest;
+      res  = await fetch(`${SERVER}/api/users`, {
+        headers: {
+          'X-BPC-Pair-Id':     pairId,
+          'X-BPC-Signed-Data': signedData,
+          'X-BPC-Signature':   signature,
+          'X-BPC-Version':     BPC_VERSION,
+        },
+      });
+      data = await res.json();
+      logMsg = `🚨 replay attack — server responded ${res.status}: ${data.error}`;
+      toast('error', '🚨 Replay Blocked', 'Captured request cannot be reused');
+
+    } else if (type === 'unknown-pair') {
+      // Probe with a fake pair ID — server flags as unknown_pair
+      const fakePairId = 'pair_' + b64url(crypto.getRandomValues(new Uint8Array(8))).substring(0, 12);
+      res  = await fetch(`${SERVER}/api/users`, {
+        headers: { 'X-BPC-Pair-Id': fakePairId, 'X-BPC-Version': BPC_VERSION,
+                   'X-BPC-Signed-Data': 'aa', 'X-BPC-Signature': 'aa' },
+      });
+      data = await res.json();
+      logMsg = `🚨 unknown-pair probe (${fakePairId}) — server responded ${res.status}: ${data.error}`;
+      toast('error', '🚨 Probe Detected', 'Unknown pair ID flagged by anomaly engine');
+
+    } else if (type === 'expired-ts') {
+      // Build a legitimately signed request but with a timestamp 91 seconds in the past
+      const nonce     = crypto.randomUUID();
+      const oldTs     = Date.now() - 91_000;
+      const secretHash = pair.secretHash; // use stored HKDF hash
+      const secretHmac = await hmacDerive(secretHash, nonce + String(oldTs));
+      const bodyHash   = 'sha256:' + b64url(await crypto.subtle.digest('SHA-256', new Uint8Array(0)));
+      const payload    = { body_hash: bodyHash, method: 'GET', nonce, pair_id: targetId,
+                           path: '/api/users', secret_hmac: secretHmac, timestamp: oldTs, version: BPC_VERSION };
+      const canonJson  = canonicalize(payload);
+      const signature  = await signPayload(pair.privateKey, payload);
+      res  = await fetch(`${SERVER}/api/users`, {
+        headers: {
+          'X-BPC-Pair-Id':     targetId,
+          'X-BPC-Signed-Data': b64url(new TextEncoder().encode(canonJson)),
+          'X-BPC-Signature':   signature,
+          'X-BPC-Version':     BPC_VERSION,
+        },
+      });
+      data = await res.json();
+      logMsg = `🚨 expired-ts attack — server responded ${res.status}: ${data.error}`;
+      toast('warning', 'Timestamp Expired', 'Request outside valid window');
+    }
+  } catch (e) {
+    showResult('attack-result', 'error', `Cannot reach server — is it running? (${e.message})`);
+    return;
+  }
+
+  const denied = !res.ok;
+  state.stats.total++;
+  if (denied) { state.stats.deny++; state.health.blocked++; state.health.probes++; }
+
+  // Map server error codes to threat bars
+  const errCode = data?.error ?? '';
+  if (['invalid_signature', 'hmac_mismatch', 'missing_headers'].includes(errCode))
+    state.threats.sig = Math.min(100, state.threats.sig + 20);
+  else if (errCode === 'replay_detected')
+    state.threats.replay = Math.min(100, state.threats.replay + 30);
+  else if (errCode === 'unknown_pair')
+    state.threats.unknown = Math.min(100, state.threats.unknown + 20);
+  else if (errCode === 'timestamp_expired')
+    state.threats.expired = Math.min(100, state.threats.expired + 25);
+
   updateAllStats();
   updateThreatBars();
-  showResult('attack-result', 'error', resultMsg);
+  showResult('attack-result', denied ? 'error' : 'warning',
+    denied
+      ? `❌ DENIED (${res.status}): ${errCode}<br><span style="font-size:11px">${data?.detail ?? 'Request blocked by BPC server'}</span>`
+      : `⚠ Server returned ${res.status} — check server logs`
+  );
   log('error', logMsg);
+  await refreshAnomalyStats();
+}
+
+// ── Live anomaly stats from server ─────────────────────────────────────
+async function refreshAnomalyStats() {
+  try {
+    const res = await fetch(`${SERVER}/bpc/anomaly`, {
+      headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` },
+    });
+    if (!res.ok) return;
+    const { score, counters } = await res.json();
+    // Update threat score display
+    const scoreEl = document.getElementById('threat-score-val');
+    const labelEl = document.getElementById('threat-score-label');
+    if (scoreEl) scoreEl.textContent = Math.round(score);
+    if (labelEl) {
+      if (score >= 70)      { labelEl.textContent = '⚠ ATTACK DETECTED'; labelEl.style.color = 'var(--color-error)'; }
+      else if (score >= 40) { labelEl.textContent = '⚠ Elevated threat'; labelEl.style.color = 'var(--color-warning)'; }
+      else                  { labelEl.textContent = '✓ System nominal';   labelEl.style.color = 'var(--color-success)'; }
+    }
+    // Map server counters to threat bars (totals, not percentages — normalize to 100)
+    const total = Math.max(1, state.stats.total);
+    const pct   = (n) => Math.min(100, Math.round((n / total) * 100));
+    if (counters) {
+      const u = Number(counters.unknownIds  ?? 0);
+      const s = Number(counters.sigFailures ?? 0);
+      const r = Number(counters.replays     ?? 0);
+      const e = Number(counters.expired     ?? 0);
+      const setBar = (id, pctVal) => {
+        const fill = document.getElementById(id);
+        const pctEl = document.getElementById(id + '-pct');
+        if (fill) fill.style.width = pctVal + '%';
+        if (pctEl) pctEl.textContent = pctVal + '%';
+      };
+      setBar('threat-unknown', pct(u));
+      setBar('threat-sig',     pct(s));
+      setBar('threat-replay',  pct(r));
+      setBar('threat-expired', pct(e));
+    }
+  } catch { /* server may not be running — silently skip */ }
 }
 
 // ── Approval Modal ──────────────────────────────────────────────────────
