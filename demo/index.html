@@ -635,6 +635,7 @@ textarea { min-height: 80px; resize: vertical; }
       <button class="tab-btn" onclick="switchTab('requests', this)">2 · Requests</button>
       <button class="tab-btn" onclick="switchTab('attack', this)">3 · Attack Sim</button>
       <button class="tab-btn" onclick="switchTab('admin', this)">4 · Control Panel</button>
+      <button class="tab-btn" onclick="switchTab('about', this)">5 · About</button>
     </div>
 
     <!-- TAB: SETUP -->
@@ -891,6 +892,171 @@ textarea { min-height: 80px; resize: vertical; }
       </div>
     </div>
 
+    <!-- TAB: ABOUT -->
+    <div id="tab-about" class="tab-pane">
+      <div style="max-width:860px;margin:0 auto;padding:var(--space-6) 0">
+
+        <!-- Identity card -->
+        <div class="card" style="margin-bottom:var(--space-4)">
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:var(--space-4);flex-wrap:wrap">
+            <div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-faint);font-family:var(--font-mono);margin-bottom:var(--space-2)">PROTOCOL</div>
+              <h2 style="font-size:var(--text-2xl);font-weight:700;margin-bottom:var(--space-2)">BPC + TSK — 8-Layer Identity Gate</h2>
+              <p style="color:var(--color-text-muted);font-size:var(--text-sm);max-width:560px;line-height:1.6">
+                Bound Pair Credentials (Layers 1–5) plus Tumbler-Style Keys (Layers 6–8) form a unified identity stack designed for zero-trust API environments. Every authenticated request passes all eight independent verification stages simultaneously — a single failure at any layer blocks access.
+              </p>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:var(--space-2);align-items:flex-end;flex-shrink:0">
+              <span class="badge badge-success">Patent Pending</span>
+              <span class="badge badge-neutral" style="font-family:var(--font-mono)">v1.1</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Security layer grid -->
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:var(--space-3);margin-bottom:var(--space-4)">
+          <div class="card" style="text-align:center;padding:var(--space-4)">
+            <div style="font-size:1.5rem;margin-bottom:var(--space-2)">🔑</div>
+            <div style="font-size:var(--text-xs);font-weight:700;margin-bottom:var(--space-1)">ECDSA P-256</div>
+            <div style="font-size:var(--text-xs);color:var(--color-text-muted)">Per-device non-extractable keypair. Every request signed.</div>
+          </div>
+          <div class="card" style="text-align:center;padding:var(--space-4)">
+            <div style="font-size:1.5rem;margin-bottom:var(--space-2)">⏱</div>
+            <div style="font-size:var(--text-xs);font-weight:700;margin-bottom:var(--space-1)">Replay Guard</div>
+            <div style="font-size:var(--text-xs);color:var(--color-text-muted)">±60s timestamp window + one-time nonces eliminate replay.</div>
+          </div>
+          <div class="card" style="text-align:center;padding:var(--space-4)">
+            <div style="font-size:1.5rem;margin-bottom:var(--space-2)">🧬</div>
+            <div style="font-size:var(--text-xs);font-weight:700;margin-bottom:var(--space-1)">Tumbler Keys</div>
+            <div style="font-size:var(--text-xs);color:var(--color-text-muted)">TSK segments rotate independently. Position map is server-only.</div>
+          </div>
+          <div class="card" style="text-align:center;padding:var(--space-4)">
+            <div style="font-size:1.5rem;margin-bottom:var(--space-2)">📊</div>
+            <div style="font-size:var(--text-xs);font-weight:700;margin-bottom:var(--space-1)">Anomaly Engine</div>
+            <div style="font-size:var(--text-xs);color:var(--color-text-muted)">Behavioral scoring escalates threat level in real time.</div>
+          </div>
+          <div class="card" style="text-align:center;padding:var(--space-4)">
+            <div style="font-size:1.5rem;margin-bottom:var(--space-2)">🔒</div>
+            <div style="font-size:var(--text-xs);font-weight:700;margin-bottom:var(--space-1)">Secret Mixing</div>
+            <div style="font-size:var(--text-xs);color:var(--color-text-muted)">HMAC-derived secret injected into every signed payload.</div>
+          </div>
+          <div class="card" style="text-align:center;padding:var(--space-4)">
+            <div style="font-size:1.5rem;margin-bottom:var(--space-2)">📋</div>
+            <div style="font-size:var(--text-xs);font-weight:700;margin-bottom:var(--space-1)">Audit Log</div>
+            <div style="font-size:var(--text-xs);color:var(--color-text-muted)">Every action stamped. Pairs, rotations, anomalies all logged.</div>
+          </div>
+          <div class="card" style="text-align:center;padding:var(--space-4)">
+            <div style="font-size:1.5rem;margin-bottom:var(--space-2)">🔄</div>
+            <div style="font-size:var(--text-xs);font-weight:700;margin-bottom:var(--space-1)">Key Rotation</div>
+            <div style="font-size:var(--text-xs);color:var(--color-text-muted)">Pairs rotate with signed handoff. Old pair revoked atomically.</div>
+          </div>
+          <div class="card" style="text-align:center;padding:var(--space-4)">
+            <div style="font-size:1.5rem;margin-bottom:var(--space-2)">🛡</div>
+            <div style="font-size:var(--text-xs);font-weight:700;margin-bottom:var(--space-1)">Scope Gates</div>
+            <div style="font-size:var(--text-xs);color:var(--color-text-muted)">read-only / read-write / admin scopes enforced per endpoint.</div>
+          </div>
+        </div>
+
+        <!-- 8-layer stack -->
+        <div class="card" style="margin-bottom:var(--space-4)">
+          <div class="card-title" style="margin-bottom:var(--space-4)">The 8-Layer Verification Stack</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3)">
+            <div style="display:flex;gap:var(--space-3);align-items:flex-start">
+              <span style="min-width:28px;height:28px;border-radius:50%;background:var(--color-primary);color:var(--color-bg);display:flex;align-items:center;justify-content:center;font-size:var(--text-xs);font-weight:700">1</span>
+              <div><div style="font-weight:600;font-size:var(--text-sm)">Pair ID lookup</div><div style="font-size:var(--text-xs);color:var(--color-text-muted)">Unknown pair_id → instant reject. No timing side-channel.</div></div>
+            </div>
+            <div style="display:flex;gap:var(--space-3);align-items:flex-start">
+              <span style="min-width:28px;height:28px;border-radius:50%;background:var(--color-primary);color:var(--color-bg);display:flex;align-items:center;justify-content:center;font-size:var(--text-xs);font-weight:700">2</span>
+              <div><div style="font-weight:600;font-size:var(--text-sm)">Timestamp check</div><div style="font-size:var(--text-xs);color:var(--color-text-muted)">±60s window. Prevents offline brute-force replay.</div></div>
+            </div>
+            <div style="display:flex;gap:var(--space-3);align-items:flex-start">
+              <span style="min-width:28px;height:28px;border-radius:50%;background:var(--color-primary);color:var(--color-bg);display:flex;align-items:center;justify-content:center;font-size:var(--text-xs);font-weight:700">3</span>
+              <div><div style="font-weight:600;font-size:var(--text-sm)">Nonce uniqueness</div><div style="font-size:var(--text-xs);color:var(--color-text-muted)">UUID consumed on use. Exact replay blocked even within window.</div></div>
+            </div>
+            <div style="display:flex;gap:var(--space-3);align-items:flex-start">
+              <span style="min-width:28px;height:28px;border-radius:50%;background:var(--color-primary);color:var(--color-bg);display:flex;align-items:center;justify-content:center;font-size:var(--text-xs);font-weight:700">4</span>
+              <div><div style="font-weight:600;font-size:var(--text-sm)">Body hash</div><div style="font-size:var(--text-xs);color:var(--color-text-muted)">SHA-256 of body in canonical payload. Tampering detected.</div></div>
+            </div>
+            <div style="display:flex;gap:var(--space-3);align-items:flex-start">
+              <span style="min-width:28px;height:28px;border-radius:50%;background:var(--color-primary);color:var(--color-bg);display:flex;align-items:center;justify-content:center;font-size:var(--text-xs);font-weight:700">5</span>
+              <div><div style="font-weight:600;font-size:var(--text-sm)">ECDSA signature</div><div style="font-size:var(--text-xs);color:var(--color-text-muted)">P-256 over canonical payload. Server verifies with stored pubkey.</div></div>
+            </div>
+            <div style="display:flex;gap:var(--space-3);align-items:flex-start">
+              <span style="min-width:28px;height:28px;border-radius:50%;background:var(--color-warning);color:var(--color-bg);display:flex;align-items:center;justify-content:center;font-size:var(--text-xs);font-weight:700">6</span>
+              <div><div style="font-weight:600;font-size:var(--text-sm)">TSK static segment</div><div style="font-size:var(--text-xs);color:var(--color-text-muted)">HMAC-SHA256 keyed on shared secret. Rotates monthly.</div></div>
+            </div>
+            <div style="display:flex;gap:var(--space-3);align-items:flex-start">
+              <span style="min-width:28px;height:28px;border-radius:50%;background:var(--color-warning);color:var(--color-bg);display:flex;align-items:center;justify-content:center;font-size:var(--text-xs);font-weight:700">7</span>
+              <div><div style="font-weight:600;font-size:var(--text-sm)">TSK TOTP segment</div><div style="font-size:var(--text-xs);color:var(--color-text-muted)">Time-windowed 30s rotating segment. Invalid outside ±1 window.</div></div>
+            </div>
+            <div style="display:flex;gap:var(--space-3);align-items:flex-start">
+              <span style="min-width:28px;height:28px;border-radius:50%;background:var(--color-warning);color:var(--color-bg);display:flex;align-items:center;justify-content:center;font-size:var(--text-xs);font-weight:700">8</span>
+              <div><div style="font-weight:600;font-size:var(--text-sm)">TSK HOTP + order</div><div style="font-size:var(--text-xs);color:var(--color-text-muted)">Event counter segment + server-only positional map must match.</div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 3-site architecture -->
+        <div class="card" style="margin-bottom:var(--space-4)">
+          <div class="card-title" style="margin-bottom:var(--space-4)">Three-Site Demo Architecture</div>
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:var(--space-3)">
+            <div style="border:2px solid var(--color-primary);border-radius:var(--radius-md);padding:var(--space-4);position:relative">
+              <div style="position:absolute;top:-10px;left:12px;background:var(--color-primary);color:var(--color-bg);font-size:10px;font-weight:700;padding:2px 8px;border-radius:99px">YOU ARE HERE</div>
+              <div style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-primary);margin-bottom:var(--space-2)">:3100</div>
+              <div style="font-weight:700;margin-bottom:var(--space-1)">Full 8-Layer Stack</div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-muted)">BPC Layers 1–5 + TSK Layers 6–8. The complete identity gate in one demo.</div>
+            </div>
+            <div style="border:1px solid var(--color-border);border-radius:var(--radius-md);padding:var(--space-4)">
+              <div style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text-muted);margin-bottom:var(--space-2)">:3101</div>
+              <div style="font-weight:700;margin-bottom:var(--space-1)">BPC Layers 1–5</div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-muted)">Pair credentials, ECDSA signing, anomaly engine, audit log. No TSK.</div>
+            </div>
+            <div style="border:1px solid var(--color-border);border-radius:var(--radius-md);padding:var(--space-4)">
+              <div style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text-muted);margin-bottom:var(--space-2)">:3200</div>
+              <div style="font-weight:700;margin-bottom:var(--space-1)">TSK Tumbler Keys</div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-muted)">Rotating segment provisioning. Structural secrecy. Real HMAC-SHA256.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Inventor + version history -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-4);margin-bottom:var(--space-4)">
+          <div class="card">
+            <div class="card-title" style="margin-bottom:var(--space-3)">Inventor</div>
+            <div style="font-size:var(--text-sm);font-weight:600;margin-bottom:var(--space-1)">R. Blake</div>
+            <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6">Conceived and designed the BPC + TSK protocol stack as a unified approach to identity verification for zero-trust API environments. Patent filing in progress.</div>
+          </div>
+          <div class="card">
+            <div class="card-title" style="margin-bottom:var(--space-3)">Version History</div>
+            <div style="font-size:var(--text-xs);display:flex;flex-direction:column;gap:var(--space-2)">
+              <div style="display:flex;gap:var(--space-3)">
+                <span style="font-family:var(--font-mono);color:var(--color-text-muted);min-width:36px">v1.0</span>
+                <span>BPC Layers 1–5. ECDSA P-256, nonce store, anomaly engine, audit log.</span>
+              </div>
+              <div style="display:flex;gap:var(--space-3)">
+                <span style="font-family:var(--font-mono);color:var(--color-primary);min-width:36px">v1.1</span>
+                <span>TSK Layers 6–8 added. IL4/5/6/7 hardening. 3-site demo. Patent pending.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- CTA -->
+        <div class="card" style="text-align:center;padding:var(--space-8)">
+          <div style="font-size:var(--text-lg);font-weight:700;margin-bottom:var(--space-2)">Interested in the protocol?</div>
+          <div style="font-size:var(--text-sm);color:var(--color-text-muted);margin-bottom:var(--space-4)">This is a reference implementation. The full specification, integration guide, and access to the protocol SDK are available on request.</div>
+          <button class="btn btn-primary" onclick="trackEvent('cta_click',{cta:'request_access',site:'combined'});toast('success','Access Request Noted','We\'ll be in touch.')">
+            Request Access
+          </button>
+        </div>
+
+        <!-- Legal footer -->
+        <div style="text-align:center;font-size:var(--text-xs);color:var(--color-text-faint);font-family:var(--font-mono);margin-top:var(--space-6)">
+          BPC + TSK Protocol Stack · Conceived by R. Blake · Patent Pending · Reference Implementation Only · Not yet an open standard.
+        </div>
+      </div>
+    </div>
+
     <!-- ACTIVITY LOG (always visible) -->
     <div style="margin-top:var(--space-4)">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--space-3)">
@@ -1066,6 +1232,49 @@ textarea { min-height: 80px; resize: vertical; }
 //  BPC PROTOTYPE — FULL IMPLEMENTATION
 //  Uses Web Crypto API (ECDSA P-256) for real cryptographic operations
 // =====================================================================
+
+// ── Analytics ──────────────────────────────────────────────────────────
+const _analyticsSession = crypto.randomUUID();
+const _analyticsStart   = Date.now();
+const _analyticsQueue   = [];
+let   _analyticsFlushing = false;
+
+function trackEvent(name, data = {}) {
+  const evt = {
+    event: name, session: _analyticsSession,
+    ts: Date.now(), sessionAge: Date.now() - _analyticsStart,
+    url: location.href, site: 'combined', ...data,
+  };
+  _analyticsQueue.push(evt);
+  _flushAnalytics();
+}
+
+async function _flushAnalytics() {
+  if (_analyticsFlushing || !_analyticsQueue.length) return;
+  _analyticsFlushing = true;
+  while (_analyticsQueue.length) {
+    const evt = _analyticsQueue.shift();
+    try {
+      await fetch('http://localhost:3100/analytics/event', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(evt),
+      });
+    } catch { _analyticsQueue.unshift(evt); break; }
+  }
+  _analyticsFlushing = false;
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') trackEvent('visibility_hidden');
+  else trackEvent('visibility_visible');
+});
+window.addEventListener('beforeunload', () => {
+  navigator.sendBeacon('http://localhost:3100/analytics/event',
+    JSON.stringify({ event: 'session_end', session: _analyticsSession,
+      ts: Date.now(), sessionAge: Date.now() - _analyticsStart, site: 'combined' }));
+});
+
+trackEvent('session_start');
 
 // ── Backend ────────────────────────────────────────────────────────────
 const SERVER      = 'http://localhost:3100';
@@ -1255,6 +1464,7 @@ function switchTab(name, btn) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
   btn.classList.add('active');
+  trackEvent('tab_view', { tab: name });
 }
 
 // ── Device Registration ─────────────────────────────────────────────────
@@ -1357,6 +1567,7 @@ async function registerPair() {
   log('success', `Pair "${name}" registered on server — ${scope} scope | HKDF-SHA256 | pair=${pairId}`);
   await saveStateToIDB();
   toast('success', 'Pair Created', `"${name}" approved by server`);
+  trackEvent('pair_registered', { scope, pairId, site: 'combined' });
 
   document.getElementById('pair-count-badge').textContent = state.pairs.length + ' pairs';
   document.getElementById('pair-count-badge').className = 'badge badge-success';

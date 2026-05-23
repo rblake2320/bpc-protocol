@@ -9,7 +9,7 @@
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, appendFileSync } from 'node:fs';
 import { join, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -31,6 +31,10 @@ import type {
 const PORT        = 3100;
 const DEMO_DIR    = dirname(fileURLToPath(import.meta.url));
 const ADMIN_TOKEN = process.env['BPC_ADMIN_TOKEN'] ?? 'demo-admin-token';
+const EVENT_LOG   = join(DEMO_DIR, 'analytics.ndjson');
+
+interface AnalyticsEvent { event: string; session: string; ts: number; site: string; [k: string]: unknown; }
+const analyticsEvents: AnalyticsEvent[] = [];
 
 const ADMIN_AUTH: AdminAuthConfig = { bearerToken: ADMIN_TOKEN };
 
@@ -374,6 +378,32 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
         return;
       }
       json(res, 404, { error: 'not_found' });
+      return;
+    }
+
+    // ── Analytics ─────────────────────────────────────────────────────────
+    if (method === 'POST' && path === '/analytics/event') {
+      const rawBody = await readBody(req);
+      try {
+        const evt = JSON.parse(rawBody.toString()) as AnalyticsEvent;
+        evt.serverTs = Date.now(); evt.ip = ip;
+        analyticsEvents.push(evt);
+        appendFileSync(EVENT_LOG, JSON.stringify(evt) + '\n');
+        cors(res); res.writeHead(204); res.end();
+      } catch { json(res, 400, { error: 'invalid_json' }); }
+      return;
+    }
+    if (method === 'GET' && path === '/analytics') {
+      const counts: Record<string, number> = {};
+      const screens: Record<string, number> = {};
+      const sessions = new Set<string>();
+      for (const e of analyticsEvents) {
+        counts[e.event] = (counts[e.event] || 0) + 1;
+        if (e.event === 'tab_view' && e.tab) screens[e.tab as string] = (screens[e.tab as string] || 0) + 1;
+        if (e.session) sessions.add(e.session);
+      }
+      json(res, 200, { totalEvents: analyticsEvents.length, uniqueSessions: sessions.size,
+        eventCounts: counts, tabViews: screens, recentEvents: analyticsEvents.slice(-20).reverse() });
       return;
     }
 
