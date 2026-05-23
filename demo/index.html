@@ -573,8 +573,8 @@ textarea { min-height: 80px; resize: vertical; }
   <div class="container">
     <div style="text-align:center; margin-bottom: var(--space-12);">
       <div class="section-label">Why BPC</div>
-      <h2 class="section-title">Seven interlocking security layers</h2>
-      <p class="section-subtitle" style="margin-inline:auto">Each layer is independent. Together they create a credential that cannot be meaningfully compromised by stealing any single piece.</p>
+      <h2 class="section-title">Eight interlocking security layers</h2>
+      <p class="section-subtitle" style="margin-inline:auto">BPC (Layers 1–5) + TSK (Layers 6–7) + Active Defense (Layer 8). Each layer is independent. Together they create a credential that cannot be meaningfully compromised by stealing any single piece.</p>
     </div>
     <div class="features-grid">
       <div class="feature-card fade-in">
@@ -613,9 +613,9 @@ textarea { min-height: 80px; resize: vertical; }
         <p class="feature-desc">The positional mapping of TSK segment concatenation is a server-only secret that changes every session. The client never learns the true segment order. Even a fully compromised client cannot forge a valid key — the structure itself is the final barrier.</p>
       </div>
       <div class="feature-card fade-in">
-        <div class="feature-icon"><i data-lucide="code-2" style="width:20px;height:20px"></i></div>
-        <div class="feature-title">Dev / Prod Modes</div>
-        <p class="feature-desc">Development mode allows high-rate testing without approval spam. Production mode enforces step-up authentication for sensitive operations.</p>
+        <div class="feature-icon"><i data-lucide="ghost" style="width:20px;height:20px"></i></div>
+        <div class="feature-title">Active Defense — Layer 8</div>
+        <p class="feature-desc">Ghost Pairs (honeypots) are planted in bait environments. When an attacker uses them, they receive a deceptive <code>ok:true</code> shadow response — they believe they succeeded while the server flags their IP and routes every subsequent request into shadow mode. Cryptographic tarpit adds graduated delays (500ms → 2s) to occupy attacker connection pools.</p>
       </div>
     </div>
   </div>
@@ -627,7 +627,7 @@ textarea { min-height: 80px; resize: vertical; }
     <div class="section-label">Interactive Demo</div>
     <h2 class="section-title">BPC in action</h2>
     <p class="section-subtitle">Register a device, pair a client, make requests — and watch what happens when an attacker tries to use a stolen key.</p>
-    <p style="font-size:var(--text-xs);color:var(--color-text-faint);font-family:var(--font-mono);margin-top:var(--space-2)">Runs entirely in your browser — no server required. See <code>packages/server/</code> for the real Node.js implementation.</p>
+    <p style="font-size:var(--text-xs);color:var(--color-text-faint);font-family:var(--font-mono);margin-top:var(--space-2)">Wired to a real backend — run <code>cd demo && npx tsx server.ts</code> then open <code>http://localhost:3100</code></p>
 
     <!-- TABS -->
     <div class="tabs">
@@ -781,7 +781,7 @@ textarea { min-height: 80px; resize: vertical; }
           </div>
           <div class="status-box success">
             <div class="status-box-icon"><i data-lucide="shield-check" style="width:16px;height:16px"></i></div>
-            <div class="status-box-body"><strong>Live attacks — real server rejections.</strong> Every attack hits the actual BPC verification pipeline. Layer 6 and Layer 7 hit real TSK endpoints. All 7 layers active.</div>
+            <div class="status-box-body"><strong>Live attacks — real server rejections.</strong> Every attack hits the actual BPC + TSK + Active Defense pipeline. All 8 layers active.</div>
           </div>
           <div class="form-group">
             <label>Attack Type</label>
@@ -793,6 +793,7 @@ textarea { min-height: 80px; resize: vertical; }
               <option value="expired-ts">Expired timestamp (replay variant)</option>
               <option value="tsk-segment">TSK: TOTP segment stolen (Layer 6)</option>
               <option value="structural-secrecy">TSK: Wrong segment order guess (Layer 7)</option>
+              <option value="ghost-pair">Active Defense: Trigger ghost pair honeypot (Layer 8)</option>
             </select>
           </div>
           <div class="form-group">
@@ -976,6 +977,7 @@ textarea { min-height: 80px; resize: vertical; }
             <tr><td>Man-in-the-middle</td><td class="cross">❌ Key captured</td><td class="check">✓ Sig tied to canonical payload; nonce prevents reuse</td></tr>
             <tr><td>Steal TOTP segment alone</td><td>N/A</td><td class="check">✓ TSK Layer 6: single segment useless without the other two</td></tr>
             <tr><td>Guess TSK segment order</td><td>N/A</td><td class="check">✓ Layer 7 structural secrecy: 1-in-6 odds, each guess logged</td></tr>
+            <tr><td>Use stolen/leaked credentials <span class="badge badge-error" style="margin-left:4px">honeypot</span></td><td class="cross">❌ Attacker gets access</td><td class="check">✓ Layer 8: Ghost pair returns deceptive ok:true — attacker in shadow mode, IP flagged, tarpit engaged</td></tr>
           </tbody>
         </table>
       </div>
@@ -1536,6 +1538,87 @@ async function runAttack() {
     );
     log('error', `🚨 TSK Layer 7 attack — guessed "${guess}" — server responded ${res.status}: ${data.error ?? 'ok'}`);
     toast(res.ok ? 'warning' : 'error', '🚨 Structural Secrecy', `Order guess "${guess}" — ${res.ok ? 'lucky hit' : 'blocked by Layer 7'}`);
+    await refreshAnomalyStats();
+    return;
+  }
+
+  // Layer 8 — Ghost Pair (Honeypot) attack
+  if (type === 'ghost-pair') {
+    try {
+      // Plant a ghost pair (honeypot credentials)
+      const ghostRes  = await fetch(`${SERVER}/bpc/register-ghost`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'demo-bait-credential' }),
+      });
+      const ghost = await ghostRes.json();
+      if (!ghostRes.ok) {
+        showResult('attack-result', 'error', `Failed to plant ghost pair: ${ghost.error}`);
+        return;
+      }
+      // Now use the ghost credentials — server will return deceptive ok:true (shadow mode)
+      const nonce     = crypto.randomUUID();
+      const timestamp = Date.now();
+      // Re-derive the ghost secret hash from rawSecret (mimic HKDF)
+      const rawSecBuf = b64urlDecode(ghost.rawSecret);
+      const km  = await crypto.subtle.importKey('raw', rawSecBuf, 'HKDF', false, ['deriveKey']);
+      const dk  = await crypto.subtle.deriveKey(
+        { name: 'HKDF', hash: 'SHA-256',
+          salt: new TextEncoder().encode('bpc-protocol-hmac-salt-v1'),
+          info: new TextEncoder().encode('bpc-v1-hmac-key') },
+        km, { name: 'HMAC', hash: 'SHA-256', length: 256 }, true, ['sign'],
+      );
+      const ghostSecHash = b64url(await crypto.subtle.exportKey('raw', dk));
+      const secretHmac  = await hmacDerive(ghostSecHash, nonce + String(timestamp));
+      const bodyHash    = 'sha256:' + b64url(await crypto.subtle.digest('SHA-256', new Uint8Array(0)));
+      // Import the ghost private key for signing
+      const ghostPrivKey = await crypto.subtle.importKey(
+        'jwk', ghost.pubJwk,
+        { name: 'ECDSA', namedCurve: 'P-256' }, false, []
+      ).catch(() => null);
+      // Build and sign the payload (we have pubJwk not privKey — use HMAC only to show shadow)
+      const payload = { body_hash: bodyHash, method: 'GET', nonce,
+                        pair_id: ghost.pairId, path: '/api/users',
+                        secret_hmac: secretHmac, timestamp, version: BPC_VERSION };
+      const canonJson  = canonicalize(payload);
+      const signedData = b64url(new TextEncoder().encode(canonJson));
+      // Send with the ghost pair ID — signature will fail but shadow mode fires on ghost kind
+      res = await fetch(`${SERVER}/api/users`, {
+        headers: {
+          'X-BPC-Pair-Id':     ghost.pairId,
+          'X-BPC-Signed-Data': signedData,
+          'X-BPC-Signature':   signedData.slice(0, 86), // fake sig — ghost detection fires first
+          'X-BPC-Version':     BPC_VERSION,
+        },
+      });
+      data = await res.json();
+    } catch (e) {
+      showResult('attack-result', 'error', `Cannot reach server — is it running? (${e.message})`);
+      return;
+    }
+    state.threats.sig = Math.min(100, state.threats.sig + 50);
+    updateThreatBars();
+    state.stats.total++;
+    if (res.ok) {
+      // Shadow mode: server returned ok:true — attacker thinks they succeeded
+      state.stats.pass++;
+      showResult('attack-result', 'warning',
+        `⚠ GHOST PAIR TRIGGERED — Layer 8 Active Defense activated<br>` +
+        `<span style="font-size:11px">Server returned <strong>ok:true (shadow response)</strong> — ` +
+        `attacker believes they succeeded. In reality: IP is now flagged, all subsequent requests ` +
+        `route to shadow mode. Ghost alert logged. Cryptographic tarpit engaged.</span>`
+      );
+      log('error', `🚨 Layer 8: Ghost pair triggered — attacker in shadow mode (fake ok:true returned)`);
+      toast('warning', '🕵 Ghost Pair Triggered', 'Attacker routed to shadow mode — Layer 8 Active Defense');
+    } else {
+      showResult('attack-result', 'error',
+        `❌ DENIED (${res.status}): ${data?.error}<br>` +
+        `<span style="font-size:11px">Ghost pair detected before shadow mode engaged. IP flagged.</span>`
+      );
+      log('error', `🚨 Layer 8: Ghost pair denied ${res.status}: ${data?.error}`);
+      toast('error', '🚨 Ghost Pair Detected', 'Active Defense flagged the honeypot use');
+    }
+    updateAllStats();
     await refreshAnomalyStats();
     return;
   }

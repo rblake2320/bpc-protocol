@@ -210,6 +210,47 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
       }
     }
 
+    // ── Layer 8: Ghost Pair (Honeypot) registration ───────────────────────
+    if (method === 'POST' && path === '/bpc/register-ghost') {
+      const rawBody = await readBody(req);
+      let body: { name?: string };
+      try { body = JSON.parse(rawBody.toString()) as { name?: string }; }
+      catch { json(res, 400, { error: 'invalid_json' }); return; }
+      // Generate a real keypair and secret so the ghost pair verifies normally
+      const { subtle } = crypto;
+      const keyPair  = await subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+      const pubJwk   = await subtle.exportKey('jwk', keyPair.publicKey);
+      const rawSec   = crypto.getRandomValues(new Uint8Array(32));
+      const rawSecB64 = Buffer.from(rawSec).toString('base64url');
+      // HKDF-derive the secret hash (matching @bpc/core hashSecret)
+      const km  = await subtle.importKey('raw', rawSec, 'HKDF', false, ['deriveKey']);
+      const dk  = await subtle.deriveKey(
+        { name: 'HKDF', hash: 'SHA-256',
+          salt: Buffer.from('bpc-protocol-hmac-salt-v1'),
+          info: Buffer.from('bpc-v1-hmac-key') },
+        km, { name: 'HMAC', hash: 'SHA-256', length: 256 }, true, ['sign'],
+      );
+      const dkRaw = Buffer.from(await subtle.exportKey('raw', dk)).toString('base64url');
+      const pairId = await registry.registerGhostPair({
+        name:       body.name ?? 'ghost-honeypot',
+        pubJwk:     pubJwk as JsonWebKey,
+        secretHash: dkRaw,
+        scope:      'read',
+        mode:       'production',
+      }, 'registry_exfil');
+      await auditLog.write({ action: 'ghost_register', pairId, ip, method, path });
+      log(method, path, `GHOST PAIR PLANTED pair=${pairId}`);
+      // Return the credentials — in a real scenario these would be planted in bait env
+      json(res, 200, {
+        pairId,
+        kind: 'ghost',
+        rawSecret: rawSecB64,
+        pubJwk,
+        message: 'Ghost pair planted. Use these credentials in a bait environment to detect attackers.',
+      });
+      return;
+    }
+
     // ── TSK Layer 6/7 endpoints ───────────────────────────────────────────
     // GET /bpc/tsk/challenge — returns public segment identifiers (NOT the order)
     if (method === 'GET' && path === '/bpc/tsk/challenge') {
