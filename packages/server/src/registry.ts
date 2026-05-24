@@ -263,6 +263,11 @@ export class PairRegistry {
     pair.requests++;
     pair.lastActive = Date.now();
     if (success) {
+      // Enforce maxRequests cap: if the pair has a usage cap and it has now
+      // been reached, transition to 'expired' so all future requests are denied.
+      if (pair.maxRequests && pair.maxRequests > 0 && pair.requests >= pair.maxRequests) {
+        pair.status = 'expired';
+      }
       // Full reset on success
       pair.failedSigs = 0;
       pair.cumulativeFailures = 0;
@@ -335,5 +340,39 @@ export class PairRegistry {
       pair.failedSigs = 0;
       await this.store.set(pair);
     }
+  }
+
+  /**
+   * Update mutable lifecycle fields on an existing pair.
+   *
+   * Only the fields present in `updates` are changed. Fields not included
+   * are left untouched. Immutable fields (id, secretHash, pubJwk, created,
+   * requests, failedSigs) cannot be changed via this method.
+   *
+   * Allowed updates:
+   *   - scope:       Change the permission level (read / read-write / admin)
+   *   - expiresAt:   Set or clear the expiry timestamp (ms since epoch, or undefined)
+   *   - maxRequests: Set or clear the usage cap (positive integer, or undefined)
+   *   - name:        Rename the pair label
+   *
+   * Returns the updated pair, or undefined if the pairId does not exist.
+   */
+  async updatePair(
+    pairId: string,
+    updates: Partial<Pick<StoredPair, 'scope' | 'expiresAt' | 'maxRequests' | 'name'>>,
+  ): Promise<StoredPair | undefined> {
+    const pair = await this.store.get(pairId);
+    if (!pair) return undefined;
+    if (updates.scope !== undefined) {
+      if (!ALLOWED_SCOPES.has(updates.scope)) {
+        throw new Error(`Invalid scope: ${updates.scope}. Must be one of: ${[...ALLOWED_SCOPES].join(', ')}`);
+      }
+      pair.scope = updates.scope;
+    }
+    if ('expiresAt' in updates) pair.expiresAt = updates.expiresAt;
+    if ('maxRequests' in updates) pair.maxRequests = updates.maxRequests;
+    if (updates.name !== undefined) pair.name = updates.name;
+    await this.store.set(pair);
+    return pair;
   }
 }

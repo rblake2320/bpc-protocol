@@ -93,6 +93,15 @@ export interface StoredPair {
   firstFailureAt?: number | null;
   expiresAt?: number;
   /**
+   * Optional hard cap on the total number of successful requests this pair
+   * may serve. Once pair.requests reaches maxRequests the pair is
+   * automatically transitioned to 'expired' and all subsequent requests
+   * are denied with error code 'pair_usage_cap_exceeded'.
+   *
+   * Omit (or set to 0) for unlimited usage.
+   */
+  maxRequests?: number;
+  /**
    * Layer 8: Ghost Pair (canary token) flag.
    * Default: 'legitimate'. Set to 'ghost' via registerGhostPair().
    */
@@ -111,6 +120,8 @@ export interface PairRegistration {
   secretHash: string;
   pubJwk: JsonWebKey;
   expiresAt?: number;
+  /** Optional hard cap on total successful requests. 0 or omitted = unlimited. */
+  maxRequests?: number;
   /** Layer 8: Pair kind. Default: 'legitimate'. */
   kind?: PairKind;
   /** Layer 8: Canary class (required when kind === 'ghost'). */

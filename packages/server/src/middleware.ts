@@ -266,6 +266,13 @@ export async function verifyBPCRequest(
     registry.get(req.pairId).then(p => { if (p) { p.status = 'expired'; } }).catch(() => {});
     return deny('pair_expired');
   }
+  // Check maxRequests usage cap — pair.status is already 'expired' if the cap
+  // was hit on the previous request (set by recordActivity). This check catches
+  // the case where the pair was expired by a concurrent request that hasn't
+  // been persisted yet.
+  if (pair.maxRequests && pair.maxRequests > 0 && pair.requests >= pair.maxRequests) {
+    return deny('pair_usage_cap_exceeded');
+  }
   if (pair.status !== 'active') return deny('pair_revoked');
 
   // ── Layer 8: Tarpit for suspicious IPs (before heavy crypto work) ─────────
