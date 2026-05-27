@@ -185,6 +185,12 @@ export async function verifyBPCRequest(
     if (!rl.allowed) return deny('rate_limit_exceeded');
   }
 
+  // HIGH-09: Built-in health endpoint for load balancers
+  // Intercept before rate limiting or header checks
+  if (req.method === 'GET' && req.path === '/health') {
+    return { ok: true, pairId: 'health' };
+  }
+
   // Step 1b: Method allowlist — reject unknown HTTP methods immediately.
   if (!ALLOWED_METHODS.has(req.method)) {
     return deny('invalid_method');

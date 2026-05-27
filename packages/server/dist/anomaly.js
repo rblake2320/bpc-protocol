@@ -206,6 +206,10 @@ export class AnomalyEngine {
         const sigRate = Math.min(sigFail / total, 1);
         const replayRate = Math.min(replay / total, 1);
         const expiredRate = Math.min(expiredTs / total, 1);
+        // BPC-07 FIX: Weights sum to 100, so the raw weighted sum IS the score (0–100).
+        // The original * 100 multiplier produced scores of 0–10,000, causing the
+        // score >= 70 threshold to trigger on any single failed request, creating
+        // a permanent global 429 lockout for all clients after 2 unknown-pair probes.
         return Math.round(unknownRate * 30 + sigRate * 30 + replayRate * 20 + expiredRate * 20);
     }
     async counters() {
