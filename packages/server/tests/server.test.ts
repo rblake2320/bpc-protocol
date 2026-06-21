@@ -439,6 +439,63 @@ describe('@bpc/server — verifyBPCRequest', () => {
     expect(result.error).toBe('pair_expired');
   });
 
+  it('should expire a pair after its maxRequests cap is exhausted', async () => {
+    const cappedKeypair = await generateKeypair();
+    const cappedSecretHash = await hashSecret('capped-secret');
+    const cappedPairId = await registry.registerDirect({
+      name: 'capped-client',
+      scope: 'read-write',
+      mode: 'development',
+      secretHash: cappedSecretHash,
+      pubJwk: cappedKeypair.pubJwk,
+      maxRequests: 1,
+    });
+
+    const firstSigned = await buildSignedRequest(
+      cappedKeypair.privateKey, cappedPairId, 'GET', '/api/data', cappedSecretHash,
+    );
+    const first = await verifyBPCRequest(
+      makeReqData({
+        pairId: cappedPairId,
+        signedData: firstSigned.signedData,
+        signature: firstSigned.signature,
+        method: 'GET',
+        path: '/api/data',
+        bodyHash: firstSigned.bodyHash,
+      }),
+      registry,
+      nonceStore,
+      anomaly,
+    );
+    expect(first.ok).toBe(true);
+    const exhaustedPair = await registry.get(cappedPairId);
+    expect(exhaustedPair?.status).toBe('expired');
+    expect(exhaustedPair?.requests).toBe(1);
+
+    const secondSigned = await buildSignedRequest(
+      cappedKeypair.privateKey, cappedPairId, 'GET', '/api/data', cappedSecretHash,
+    );
+    const second = await verifyBPCRequest(
+      makeReqData({
+        pairId: cappedPairId,
+        signedData: secondSigned.signedData,
+        signature: secondSigned.signature,
+        method: 'GET',
+        path: '/api/data',
+        bodyHash: secondSigned.bodyHash,
+      }),
+      registry,
+      nonceStore,
+      anomaly,
+    );
+    expect(second.ok).toBe(false);
+    expect(second.error).toBe('pair_expired');
+
+    const cappedPair = await registry.get(cappedPairId);
+    expect(cappedPair?.status).toBe('expired');
+    expect(cappedPair?.requests).toBe(1);
+  });
+
   it('should reject a version mismatch', async () => {
     const { signedData, signature } = await buildSignedRequest(
       keypair.privateKey, pairId, 'GET', '/api/data', secretHash,

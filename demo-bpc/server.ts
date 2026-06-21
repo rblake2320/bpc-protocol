@@ -37,10 +37,11 @@ import {
   FileAnomalyStore,
 } from '../packages/server/src/file-store.ts';
 
-const PORT        = 3101;
-const DEMO_DIR    = dirname(fileURLToPath(import.meta.url));
-const ADMIN_TOKEN = process.env['BPC_ADMIN_TOKEN'] ?? 'demo-admin-token';
-const EVENT_LOG   = join(DEMO_DIR, 'analytics.ndjson');
+const PORT         = 3101;
+const DEMO_DIR     = dirname(fileURLToPath(import.meta.url));
+const ADMIN_TOKEN  = process.env['BPC_ADMIN_TOKEN'] ?? 'demo-admin-token';
+const EVENT_LOG    = join(DEMO_DIR, 'analytics.ndjson');
+const SERVER_START = Date.now();
 
 interface AnalyticsEvent { event: string; session: string; ts: number; site: string; [k: string]: unknown; }
 const analyticsEvents: AnalyticsEvent[] = [];
@@ -208,7 +209,7 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
     }
 
     // ── Admin endpoints ───────────────────────────────────────────────────
-    if (path === '/bpc/pairs' || path === '/bpc/anomaly' || path.startsWith('/bpc/audit/')) {
+    if (path === '/bpc/pairs' || path === '/bpc/anomaly' || path.startsWith('/bpc/audit/') || (path.startsWith('/bpc/pairs/') && path.endsWith('/report'))) {
       if (method !== 'GET') { json(res, 405, { error: 'method_not_allowed' }); return; }
       const authorized = await verifyAdminRequest(
         req.headers as Record<string, string | string[] | undefined>,
@@ -219,6 +220,29 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
         json(res, 401, { error: 'unauthorized' });
         return;
       }
+      // ── Pair report ──────────────────────────────────────────────────────
+      if (path.startsWith('/bpc/pairs/') && path.endsWith('/report')) {
+        const segments = path.split('/');
+        const pairId = segments[3]; // /bpc/pairs/<id>/report
+        const pair = await registry.get(pairId);
+        if (!pair) { json(res, 404, { error: 'pair_not_found' }); return; }
+        const now = Date.now();
+        json(res, 200, {
+          pairId: pair.id,
+          scope: pair.scope,
+          status: pair.status,
+          createdAt: new Date(pair.created).toISOString(),
+          expiresAt: pair.expiresAt ? new Date(pair.expiresAt).toISOString() : null,
+          expiresIn: pair.expiresAt ? Math.max(0, pair.expiresAt - now) : null,
+          requests: pair.requests,
+          maxRequests: pair.maxRequests ?? null,
+          remainingUses: pair.maxRequests !== undefined ? Math.max(0, pair.maxRequests - (pair.requests ?? 0)) : null,
+          failedSigs: pair.failedSigs,
+          lastActive: pair.lastActive ? new Date(pair.lastActive).toISOString() : null,
+          utilizationPct: pair.maxRequests ? Math.round((pair.requests / pair.maxRequests) * 100) : null,
+        });
+        return;
+      }
       if (path === '/bpc/pairs') {
         json(res, 200, { pairs: await registry.listRedacted() });
         return;
@@ -226,6 +250,15 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
       if (path === '/bpc/anomaly') {
         const [counters, score] = await Promise.all([anomaly.counters(), anomaly.threatScore()]);
         json(res, 200, { score, counters });
+        return;
+      }
+      // /bpc/audit/daily — today's audit entries (external traceability endpoint)
+      if (path === '/bpc/audit/daily') {
+        const today = new Date().toISOString().slice(0, 10);
+        const allEntries = auditLog.queryAll ? await auditLog.queryAll(500) : [];
+        const todayMs = new Date(today).getTime();
+        const todayEntries = allEntries.filter(e => e.timestamp >= todayMs);
+        json(res, 200, { date: today, count: todayEntries.length, entries: todayEntries });
         return;
       }
       if (path.startsWith('/bpc/audit/')) {
@@ -319,6 +352,26 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
       }
       json(res, 200, { totalEvents: analyticsEvents.length, uniqueSessions: sessions.size,
         eventCounts: counts, tabViews: screens, recentEvents: analyticsEvents.slice(-20).reverse() });
+      return;
+    }
+
+    // ── Health ────────────────────────────────────────────────────────────────
+    if (method === 'GET' && path === '/health') {
+      const pairs = await registry.listRedacted();
+      const [counters, threatScore] = await Promise.all([anomaly.counters(), anomaly.threatScore()]);
+      const sessions = new Set(analyticsEvents.map(e => e.session));
+      json(res, 200, {
+        status: 'ok',
+        uptimeMs: Date.now() - SERVER_START,
+        port: PORT,
+        pairCount: pairs.length,
+        activePairs: pairs.filter(p => p.status === 'active').length,
+        threatScore,
+        anomalyCounters: counters,
+        analyticsEvents: analyticsEvents.length,
+        uniqueSessions: sessions.size,
+        ts: Date.now(),
+      });
       return;
     }
 

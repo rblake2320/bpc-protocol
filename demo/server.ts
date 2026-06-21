@@ -237,6 +237,15 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
         json(res, 200, { score, counters });
         return;
       }
+      // /bpc/audit/daily — today's audit entries (external traceability endpoint)
+      if (path === '/bpc/audit/daily') {
+        const today = new Date().toISOString().slice(0, 10);
+        const allEntries = auditLog.queryAll ? await auditLog.queryAll(500) : [];
+        const todayMs = new Date(today).getTime();
+        const todayEntries = allEntries.filter(e => e.timestamp >= todayMs);
+        json(res, 200, { date: today, count: todayEntries.length, entries: todayEntries });
+        return;
+      }
       if (path.startsWith('/bpc/audit/')) {
         json(res, 200, { entries: await auditLog.query(path.split('/')[3]) });
         return;
