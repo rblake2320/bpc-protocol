@@ -16,6 +16,12 @@ See https://github.com/rblake2320/bpc-protocol for the full spec.
 
 from .client import BPCClient, BPCPair, BPCError, BPCAuthError, BPCPairLockedError
 from .crypto import generate_keypair, sign_request, compute_body_hash, derive_secret_hmac
+from .runtime_capture import (
+    collect_runtime_metadata,
+    emit_key_generation_capture,
+    sanitize_capture_value,
+    set_key_generation_capture_sink,
+)
 
 __version__ = "1.0.0"
 __all__ = [
@@ -28,4 +34,8 @@ __all__ = [
     "sign_request",
     "compute_body_hash",
     "derive_secret_hmac",
+    "collect_runtime_metadata",
+    "emit_key_generation_capture",
+    "sanitize_capture_value",
+    "set_key_generation_capture_sink",
 ]

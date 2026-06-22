@@ -14,12 +14,50 @@ export type { PgPool } from './pg-store.js';
 export type { RedisClient } from './redis-nonce.js';
 export type { RedisIncrClient } from './redis-anomaly.js';
 export type { RedisZSetClient } from './rate-limiter.js';
+export type {
+  AgentCredentialCacheExpectedState,
+  AgentCredentialCacheStore,
+  CreateAgentCredentialCacheEntryInput,
+  DpapiProtector,
+  DpapiScope,
+  SealedAgentCredentialCache,
+  AgentCredentialCacheEntry,
+} from './agent-cache.js';
+export type {
+  AuthorizationContext,
+  PrincipalChainVerifyResult,
+  PrincipalCheckpoint,
+  PrincipalEventType,
+  PrincipalRecord,
+  PrincipalSessionLedger,
+  PrincipalSessionProof,
+  PrincipalSessionProofPayload,
+  PrincipalStreamEvent,
+  PrincipalStreamRecord,
+  FallbackAuthorizationInput,
+  FallbackAuthorizationResult,
+  SealPrincipalCacheInput,
+  SealedPrincipalCache,
+  SessionBinding,
+} from './principal-session.js';
 
 // Admin endpoint authentication (Chain-3 / BPC-04 fix)
 export type { AdminAuthConfig, AdminRequestHeaders } from './admin.js';
 export { verifyAdminRequest } from './admin.js';
 
 // Implementations
+export {
+  CacheExpiredError,
+  CacheTamperedError,
+  CacheUnavailableError,
+  DpapiFailClosedAgentCache,
+  MemoryAgentCredentialCacheStore,
+  WindowsCurrentUserDpapiProtector,
+  computePermissionsHash,
+  createAgentCredentialCacheEntry,
+  openAgentCredentialCacheEntry,
+  sealAgentCredentialCacheEntry,
+} from './agent-cache.js';
 export { PairRegistry } from './registry.js';
 export type { RedactedPair } from './registry.js';
 export { AnomalyEngine } from './anomaly.js';
@@ -33,6 +71,17 @@ export { MemoryRateLimiter, RedisRateLimiter } from './rate-limiter.js';
 export { MemoryAuditLog, PgAuditLog, PG_AUDIT_SCHEMA } from './audit.js';
 export { handleRotation } from './rotation.js';
 export { BPC_ERRORS } from './errors.js';
+export {
+  MemoryPrincipalSessionLedger,
+  PRINCIPAL_BINDING_PURPOSE,
+  PRINCIPAL_GENESIS_HASH,
+  buildPrincipalSessionProofPayload,
+  makeStreamId,
+  principalIdFromFingerprint,
+  sealPrincipalCache,
+  verifyPrincipalSessionProof,
+  verifyFallbackAuthorization,
+} from './principal-session.js';
 
 // Factory function — creates a fully-wired BPC server with in-memory backends
 import { PairRegistry } from './registry.js';
@@ -40,12 +89,14 @@ import { AnomalyEngine } from './anomaly.js';
 import { ServerNonceStore } from './nonce-store.js';
 import { MemoryPairStore, MemoryNonceBackend, MemoryAnomalyStore } from './memory-store.js';
 import { MemoryAuditLog } from './audit.js';
+import { MemoryPrincipalSessionLedger } from './principal-session.js';
 
 export interface BPCServerInstance {
   registry: PairRegistry;
   nonceStore: ServerNonceStore;
   anomaly: AnomalyEngine;
   auditLog: MemoryAuditLog;
+  principalLedger: MemoryPrincipalSessionLedger;
   store: MemoryPairStore;
 }
 
@@ -54,12 +105,14 @@ export function createBPCServer(config?: { maxPairs?: number; lockoutCount?: num
   const nonceBackend = new MemoryNonceBackend();
   const anomalyStore = new MemoryAnomalyStore();
   const auditLog = new MemoryAuditLog();
+  const principalLedger = new MemoryPrincipalSessionLedger();
 
   return {
     registry: new PairRegistry(store, config?.maxPairs ?? 2000, config?.lockoutCount ?? 10),
     nonceStore: new ServerNonceStore(nonceBackend, config?.sigWindowMs ? config.sigWindowMs * 2 + 10_000 : 130_000),
     anomaly: new AnomalyEngine(anomalyStore),
     auditLog,
+    principalLedger,
     store,
   };
 }

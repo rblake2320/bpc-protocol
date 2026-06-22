@@ -1,7 +1,9 @@
 import { b64url, b64urlDecode } from './encoding.js';
 import type { BPCKeypair } from './types.js';
+import { emitKeyGenerationCapture } from './runtime-capture.js';
+import type { KeyGenerationCaptureOptions } from './runtime-capture.js';
 
-export async function generateKeypair(): Promise<BPCKeypair> {
+export async function generateKeypair(options: KeyGenerationCaptureOptions = {}): Promise<BPCKeypair> {
   const kp = await crypto.subtle.generateKey(
     { name: 'ECDSA', namedCurve: 'P-256' },
     false,  // non-extractable private key
@@ -9,6 +11,20 @@ export async function generateKeypair(): Promise<BPCKeypair> {
   );
   const pubJwk = await crypto.subtle.exportKey('jwk', kp.publicKey);
   const fingerprint = await computeFingerprint(pubJwk);
+  emitKeyGenerationCapture({
+    protocol: 'bpc',
+    packageName: '@bpc/core',
+    event: 'bpc.keypair.generated',
+    keyFingerprint: fingerprint,
+    algorithm: 'ECDSA P-256',
+    extractable: false,
+    runtime: options.runtimeMetadata,
+    details: {
+      publicKeyType: pubJwk.kty,
+      curve: pubJwk.crv,
+      ...options.captureDetails,
+    },
+  });
   return { privateKey: kp.privateKey, publicKey: kp.publicKey, pubJwk, fingerprint };
 }
 

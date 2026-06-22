@@ -33,13 +33,15 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from cryptography.hazmat.backends import default_backend
 
+from .runtime_capture import emit_key_generation_capture
+
 
 def _b64url(data: bytes) -> str:
     """Base64url encode without padding."""
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def generate_keypair() -> dict:
+def generate_keypair(runtime_metadata: dict | None = None, capture_details: dict | None = None) -> dict:
     """
     Generate an ECDSA P-256 keypair.
 
@@ -66,6 +68,23 @@ def generate_keypair() -> dict:
     # Fingerprint: base64url(SHA-256(sorted JSON of JWK))[:20]
     jwk_json = json.dumps(pub_jwk, sort_keys=True, separators=(",", ":"))
     fingerprint = _b64url(hashlib.sha256(jwk_json.encode()).digest())[:20]
+
+    emit_key_generation_capture(
+        {
+            "protocol": "bpc",
+            "packageName": "bpc-client",
+            "event": "bpc.python.keypair.generated",
+            "keyFingerprint": fingerprint,
+            "algorithm": "ECDSA P-256",
+            "extractable": True,
+            "runtime": runtime_metadata or {},
+            "details": {
+                "publicKeyType": pub_jwk["kty"],
+                "curve": pub_jwk["crv"],
+                **(capture_details or {}),
+            },
+        }
+    )
 
     return {
         "private_key": private_key,

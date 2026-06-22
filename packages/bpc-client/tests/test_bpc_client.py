@@ -31,6 +31,11 @@ from bpc_client.crypto import (
 )
 from bpc_client.client import BPCClient, BPCPair, BPCError, BPCAuthError, BPCPairLockedError
 from bpc_client.mcp.server import handle_tool_call, TOOLS
+from bpc_client.runtime_capture import (
+    collect_runtime_metadata,
+    sanitize_capture_value,
+    set_key_generation_capture_sink,
+)
 
 
 # ── Crypto tests ──────────────────────────────────────────────────────────────
@@ -59,6 +64,42 @@ class TestKeypairGeneration:
         kp2 = generate_keypair()
         assert kp1["fingerprint"] != kp2["fingerprint"]
         assert kp1["public_key_jwk"]["x"] != kp2["public_key_jwk"]["x"]
+
+    def test_key_generation_capture_is_opt_in_and_redacted(self):
+        events = []
+        set_key_generation_capture_sink(events.append)
+        try:
+            kp = generate_keypair(
+                runtime_metadata={"tool": "codex", "model": "gpt-5.5", "sessionId": "session-test"},
+                capture_details={"privateKey": "must-not-leak", "apiToken": "must-not-leak"},
+            )
+        finally:
+            set_key_generation_capture_sink(None)
+
+        assert len(events) == 1
+        assert events[0]["event"] == "bpc.python.keypair.generated"
+        assert events[0]["keyFingerprint"] == kp["fingerprint"]
+        assert events[0]["runtime"]["model"] == "gpt-5.5"
+        serialized = json.dumps(events[0])
+        assert "must-not-leak" not in serialized
+        assert "[REDACTED]" in serialized
+
+
+class TestRuntimeCapture:
+    def test_collects_runtime_metadata_from_env(self, monkeypatch):
+        monkeypatch.setenv("AI_RUNTIME_MODEL", "gpt-5.5")
+        monkeypatch.setenv("AI_RUNTIME_SESSION_ID", "runtime-session-123")
+        runtime = collect_runtime_metadata()
+        assert runtime["model"] == "gpt-5.5"
+        assert runtime["sessionId"] == "runtime-session-123"
+
+    def test_sanitize_redacts_nested_secret_fields(self):
+        sanitized = sanitize_capture_value(
+            {"ok": "visible", "nested": {"sharedSecret": "hidden", "rawKey": "hidden"}}
+        )
+        serialized = json.dumps(sanitized)
+        assert "visible" in serialized
+        assert "hidden" not in serialized
 
 
 class TestBodyHash:

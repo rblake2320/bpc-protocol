@@ -4,5 +4,5 @@ export { saveKeypair, loadKeypair, loadAll, deleteKeypair } from './idb-storage.
 export { saveKeypairToFile, loadKeypairFromFile, loadAllFromFile, deleteKeypairFromFile } from './node-storage.js';
 export { createStorage } from './storage.js';
 export type { BPCClientConfig, SignedHeaders } from './client.js';
-export type { RegistrationResult, RegistrationRequest } from './registration.js';
+export type { PrepareRegistrationOptions, RegistrationResult, RegistrationRequest } from './registration.js';
 export type { KeyStorage } from './storage.js';

@@ -5,6 +5,12 @@ import { hashSecret, hmacDerive, verifySecretHmac } from '../src/hmac.js';
 import { b64url, b64urlDecode } from '../src/encoding.js';
 import { generateNonce, NonceStore } from '../src/nonce.js';
 import { validateSecret, hashSecretForStorage, verifyStoredSecret } from '../src/secret.js';
+import {
+  collectRuntimeMetadata,
+  sanitizeCaptureValue,
+  setKeyGenerationCaptureSink,
+  type KeyGenerationCaptureEvent,
+} from '../src/runtime-capture.js';
 
 describe('encoding', () => {
   it('base64url round-trips', () => {
@@ -35,6 +41,37 @@ describe('crypto', () => {
     expect(kp.publicKey).toBeDefined();
   });
 
+  it('emits opt-in key generation capture without exposing private key material', async () => {
+    const events: KeyGenerationCaptureEvent[] = [];
+    setKeyGenerationCaptureSink(event => events.push(event));
+
+    try {
+      const kp = await generateKeypair({
+        runtimeMetadata: {
+          tool: 'codex',
+          model: 'gpt-5.5',
+          sessionId: 'session-test',
+        },
+        captureDetails: {
+          privateKey: 'must-not-leak',
+          apiToken: 'must-not-leak',
+        },
+      });
+
+      expect(events).toHaveLength(1);
+      expect(events[0].event).toBe('bpc.keypair.generated');
+      expect(events[0].keyFingerprint).toBe(kp.fingerprint);
+      expect(events[0].runtime.model).toBe('gpt-5.5');
+
+      const serialized = JSON.stringify(events[0]);
+      expect(serialized).toContain(kp.fingerprint);
+      expect(serialized).not.toContain('must-not-leak');
+      expect(serialized).toContain('[REDACTED]');
+    } finally {
+      setKeyGenerationCaptureSink(undefined);
+    }
+  });
+
   it('sign and verify round-trips', async () => {
     const kp = await generateKeypair();
     const payload = { method: 'GET', path: '/api/test', nonce: 'abc', timestamp: 123 };
@@ -51,6 +88,42 @@ describe('crypto', () => {
     const tampered = { ...payload, path: '/api/admin' };
     const valid = await verifyPayload(kp.publicKey, tampered, sig);
     expect(valid).toBe(false);
+  });
+});
+
+describe('runtime capture', () => {
+  it('collects Claude/Codex-style metadata from AI_RUNTIME env vars', () => {
+    const previousModel = process.env['AI_RUNTIME_MODEL'];
+    const previousSession = process.env['AI_RUNTIME_SESSION_ID'];
+    process.env['AI_RUNTIME_MODEL'] = 'gpt-5.5';
+    process.env['AI_RUNTIME_SESSION_ID'] = 'runtime-session-123';
+
+    try {
+      const runtime = collectRuntimeMetadata();
+      expect(runtime.model).toBe('gpt-5.5');
+      expect(runtime.sessionId).toBe('runtime-session-123');
+      expect(runtime.capturedAt).toBeDefined();
+    } finally {
+      if (previousModel === undefined) delete process.env['AI_RUNTIME_MODEL'];
+      else process.env['AI_RUNTIME_MODEL'] = previousModel;
+      if (previousSession === undefined) delete process.env['AI_RUNTIME_SESSION_ID'];
+      else process.env['AI_RUNTIME_SESSION_ID'] = previousSession;
+    }
+  });
+
+  it('redacts recursively named secret/token/private fields', () => {
+    const sanitized = sanitizeCaptureValue({
+      ok: 'visible',
+      nested: {
+        sharedSecret: 'hidden',
+        rawKey: 'hidden',
+        authorization: 'hidden',
+      },
+    }) as Record<string, unknown>;
+
+    const serialized = JSON.stringify(sanitized);
+    expect(serialized).toContain('visible');
+    expect(serialized).not.toContain('hidden');
   });
 });
 

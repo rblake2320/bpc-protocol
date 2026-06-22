@@ -8,4 +8,6 @@ dist/
 **/.vite/
 **/vitest/results.json
 package-lock.json
+__pycache__/
+*.py[cod]
 

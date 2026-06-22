@@ -1,6 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { BPCClient } from '../src/client.js';
-import { BPC_PROTOCOL_VERSION, generateKeypair, b64urlDecode, hashSecret, hmacDerive } from '../../core/src/index.js';
+import {
+  BPC_PROTOCOL_VERSION,
+  b64urlDecode,
+  generateKeypair,
+  hashSecret,
+  hmacDerive,
+} from '../../core/src/index.js';
+import { setKeyGenerationCaptureSink, type KeyGenerationCaptureEvent } from '@bpc/core';
 import { prepareRegistration } from '../src/registration.js';
 import type { BPCKeypair } from '../../core/src/index.js';
 
@@ -154,6 +161,38 @@ describe('prepareRegistration', () => {
     expect(typeof request.secretHash).toBe('string');
     expect(request.secretHash.length).toBeGreaterThan(10);
     expect(request.pubJwk).toEqual(keypair.pubJwk);
+  });
+
+  it('captures registration preparation as a non-secret event', async () => {
+    const events: KeyGenerationCaptureEvent[] = [];
+    setKeyGenerationCaptureSink(event => events.push(event));
+
+    try {
+      const { keypair } = await prepareRegistration(
+        'session-agent',
+        'DoNotCaptureThisSecret1!@',
+        'admin',
+        'development',
+        {
+          runtimeMetadata: {
+            tool: 'claude-code',
+            sessionId: 'session-abc',
+            permissions: 'Full Access',
+          },
+        },
+      );
+
+      expect(events.map(event => event.event)).toEqual([
+        'bpc.keypair.generated',
+        'bpc.registration.prepared',
+      ]);
+      expect(events[1].keyFingerprint).toBe(keypair.fingerprint);
+      const serialized = JSON.stringify(events);
+      expect(serialized).toContain('session-abc');
+      expect(serialized).not.toContain('DoNotCaptureThisSecret1');
+    } finally {
+      setKeyGenerationCaptureSink(undefined);
+    }
   });
 });
 
