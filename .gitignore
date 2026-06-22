@@ -11,3 +11,8 @@ package-lock.json
 __pycache__/
 *.py[cod]
 
+
+# FilePairStore persistent data — lives in ~/.bpc, never in repo
+demo/pairs.json
+demo/nonces.json
+demo/anomaly.json
