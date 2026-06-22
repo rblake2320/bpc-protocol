@@ -1,4 +1,6 @@
 export { BPCClient } from './client.js';
+export { FailoverTransport, PrimaryUnavailableError } from './failover-transport.js';
+export type { FailoverConfig } from './failover-transport.js';
 export { prepareRegistration } from './registration.js';
 export { saveKeypair, loadKeypair, loadAll, deleteKeypair } from './idb-storage.js';
 export { saveKeypairToFile, loadKeypairFromFile, loadAllFromFile, deleteKeypairFromFile } from './node-storage.js';

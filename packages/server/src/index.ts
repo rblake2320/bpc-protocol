@@ -64,6 +64,14 @@ export { AnomalyEngine } from './anomaly.js';
 export { ServerNonceStore } from './nonce-store.js';
 export { verifyBPCRequest } from './middleware.js';
 export { MemoryPairStore, MemoryNonceBackend, MemoryAnomalyStore } from './memory-store.js';
+export { ReplicatingPairStore } from './replicating-store.js';
+export type { ReplicaTarget, ReplicaOp, ReplicatingStoreOptions } from './replicating-store.js';
+export {
+  authorizeReplica, validateReplicaOp, applyReplicaOp, handleReplicaIngest,
+} from './replica-receiver.js';
+export type { ReplicaApplyResult } from './replica-receiver.js';
+export { PromotionController, assertWritable, handlePromotionCommand } from './promotion.js';
+export type { NodeRole, PromotionSnapshot, PromotionCommand } from './promotion.js';
 export { PgPairStore, PG_SCHEMA } from './pg-store.js';
 export { RedisNonceStore } from './redis-nonce.js';
 export { RedisAnomalyStore } from './redis-anomaly.js';
