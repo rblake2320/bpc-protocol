@@ -1,0 +1,11 @@
+{"event":"session_start","session":"d40e77d3-308e-47fe-a08b-dae447c4b96d","ts":1782152637714,"sessionAge":0,"url":"http://localhost:3100/","site":"combined","serverTs":1782152637715,"ip":"::1"}
+{"event":"tab_view","session":"d40e77d3-308e-47fe-a08b-dae447c4b96d","ts":1782152670624,"sessionAge":32910,"url":"http://localhost:3100/#demo","site":"combined","tab":"admin","serverTs":1782152670625,"ip":"::1"}
+{"event":"tab_view","session":"d40e77d3-308e-47fe-a08b-dae447c4b96d","ts":1782152739419,"sessionAge":101705,"url":"http://localhost:3100/#demo","site":"combined","tab":"setup","serverTs":1782152739421,"ip":"::1"}
+{"event":"pair_registered","session":"d40e77d3-308e-47fe-a08b-dae447c4b96d","ts":1782152787248,"sessionAge":149534,"url":"http://localhost:3100/#demo","site":"combined","scope":"read","pairId":"pair_28349da185d7a273","serverTs":1782152787250,"ip":"::1"}
+{"event":"tab_view","session":"d40e77d3-308e-47fe-a08b-dae447c4b96d","ts":1782152802100,"sessionAge":164386,"url":"http://localhost:3100/#demo","site":"combined","tab":"requests","serverTs":1782152802102,"ip":"::1"}
+{"event":"tab_view","session":"d40e77d3-308e-47fe-a08b-dae447c4b96d","ts":1782152850836,"sessionAge":213122,"url":"http://localhost:3100/#demo","site":"combined","tab":"attack","serverTs":1782152850837,"ip":"::1"}
+{"event":"tab_view","session":"d40e77d3-308e-47fe-a08b-dae447c4b96d","ts":1782152968612,"sessionAge":330898,"url":"http://localhost:3100/#demo","site":"combined","tab":"admin","serverTs":1782152968614,"ip":"::1"}
+{"event":"session_end","session":"d40e77d3-308e-47fe-a08b-dae447c4b96d","ts":1782153280090,"sessionAge":642376,"site":"combined","serverTs":1782153280093,"ip":"::1"}
+{"event":"session_start","session":"52d61f56-97f5-4774-b7a6-14c09a2fbecd","ts":1782153588343,"sessionAge":0,"url":"http://localhost:3100/","site":"combined","serverTs":1782153588345,"ip":"::1"}
+{"event":"visibility_visible","session":"52d61f56-97f5-4774-b7a6-14c09a2fbecd","ts":1782154745592,"sessionAge":1157249,"url":"http://localhost:3100/","site":"combined","serverTs":1782154745617,"ip":"::1"}
+{"event":"visibility_hidden","session":"52d61f56-97f5-4774-b7a6-14c09a2fbecd","ts":1782154766139,"sessionAge":1177796,"url":"http://localhost:3100/","site":"combined","serverTs":1782154766157,"ip":"::1"}
