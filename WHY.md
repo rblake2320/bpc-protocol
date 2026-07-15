@@ -67,3 +67,11 @@ and reloads usage caps, anomaly counters, ghost/canary identity, revocation,
 and pending-registration timestamps through a complete connection restart.
 Losing these fields can become fail-open behavior, so the test runs in CI
 against a real digest-pinned PostgreSQL service.
+
+## 2026-07-15: Make executable attack runners release gates
+
+An attack script that is documented but not run by CI can silently drift until
+it no longer reaches the control it claims to test. The HTTP adversarial and
+scope-escalation runners now execute through one command that owns an isolated
+loopback server. Static source observations and unavailable-endpoint skips are
+not counted as passing attack evidence.

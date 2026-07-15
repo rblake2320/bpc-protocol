@@ -37,6 +37,7 @@ and assessed attestation mechanism.
 npm ci
 npm run build
 npm test
+npm run test:adversarial
 npm run test:interop
 npm run test:pack
 ```
@@ -59,7 +60,9 @@ See [docs/REDIS_NONCE.md](docs/REDIS_NONCE.md) for production wiring and
 [docs/SCOPE_MODEL.md](docs/SCOPE_MODEL.md) for the deliberately closed scope
 model.
 
-`test:interop` executes Python and TypeScript against each other's signature,
+`test:adversarial` starts an isolated loopback demo server on an ephemeral port
+and runs the HTTP attack and scope-escalation suites. `test:interop` executes
+Python and TypeScript against each other's signature,
 HKDF/HMAC, and fingerprint formats. `test:pack` builds each npm workspace and
 verifies the publish manifest includes compiled `dist` entry points.
 
