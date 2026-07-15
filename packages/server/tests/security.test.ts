@@ -12,7 +12,7 @@
  *   BPC-04: Unauthenticated Pair Enumeration + Admin Endpoint Auth
  *   BPC-05: __proto__ Injection in Canonical Payload
  *   BPC-06: Rate Limiter Saturation (IP + per-pair dual-track)
- *   IL4-7:  Input validation, nonce format, method allowlist, type confusion
+ *   Input validation: nonce format, method allowlist, type confusion
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -422,7 +422,7 @@ describe('BPC-04 — Unauthenticated Pair Enumeration (FIXED)', () => {
     const denied = await verifyAdminRequest(
       { authorization: 'Bearer correct-token' },
       {
-        bearerToken: 'correct-token',
+        bearerToken: 'correct-token-with-at-least-32-bytes',
         verifier: async () => false,
       },
     );
@@ -430,9 +430,9 @@ describe('BPC-04 — Unauthenticated Pair Enumeration (FIXED)', () => {
 
     // Both pass
     const allowed = await verifyAdminRequest(
-      { authorization: 'Bearer correct-token' },
+      { authorization: 'Bearer correct-token-with-at-least-32-bytes' },
       {
-        bearerToken: 'correct-token',
+        bearerToken: 'correct-token-with-at-least-32-bytes',
         verifier: async () => true,
       },
     );
@@ -590,9 +590,9 @@ describe('BPC-06 — Rate Limiter Saturation (FIXED)', () => {
   });
 });
 
-// ─── IL4-7: Input Validation ──────────────────────────────────────────────────
+// ─── Input Validation ─────────────────────────────────────────────────────────
 
-describe('IL4-7 — Input Validation Hardening', () => {
+describe('Input Validation Hardening', () => {
   let registry: PairRegistry;
   let nonceStore: ServerNonceStore;
   let anomaly: AnomalyEngine;
@@ -662,6 +662,41 @@ describe('IL4-7 — Input Validation Hardening', () => {
     ).rejects.toThrow('scope');
   });
 
+  it('verifyAdminRequest() rejects an undersized configured bearer token', async () => {
+    expect(await verifyAdminRequest(
+      { authorization: 'Bearer short-token' },
+      { bearerToken: 'short-token' },
+    )).toBe(false);
+  });
+
+  it('rejects wildcard and namespaced scopes at registration and update', async () => {
+    const registry = new PairRegistry(new MemoryPairStore());
+    const kp = await generateKeypair();
+    const sh = await hashSecret('ValidSecret1!@#$');
+
+    await expect(
+      registry.registerDirect({
+        name: 'wildcard-test',
+        scope: 'read:*' as 'read',
+        mode: 'development',
+        secretHash: sh,
+        pubJwk: kp.pubJwk,
+      }),
+    ).rejects.toThrow('scope');
+
+    const pairId = await registry.registerDirect({
+      name: 'closed-scope-test',
+      scope: 'read',
+      mode: 'development',
+      secretHash: sh,
+      pubJwk: kp.pubJwk,
+    });
+
+    await expect(
+      registry.updatePair(pairId, { scope: 'admin:*' as 'admin' }),
+    ).rejects.toThrow('scope');
+  });
+
   it('rejects registration with invalid mode', async () => {
     const store    = new MemoryPairStore();
     const registry = new PairRegistry(store);
@@ -674,9 +709,9 @@ describe('IL4-7 — Input Validation Hardening', () => {
   });
 });
 
-// ─── IL4-7: Secret Policy ─────────────────────────────────────────────────────
+// ─── Secret Policy ────────────────────────────────────────────────────────────
 
-describe('IL4-7 — Secret Policy (MIN_SECRET_LENGTH = 16)', () => {
+describe('Secret Policy (MIN_SECRET_LENGTH = 16)', () => {
   it('rejects secrets shorter than 16 characters', () => {
     const result = validateSecret('Short1!');
     expect(result.valid).toBe(false);
@@ -689,7 +724,7 @@ describe('IL4-7 — Secret Policy (MIN_SECRET_LENGTH = 16)', () => {
     expect(result.reason).toContain('two special');
   });
 
-  it('accepts a valid IL4-7 compliant secret', () => {
+  it('accepts a secret meeting the configured project policy', () => {
     const result = validateSecret('ValidSecret1!@#$');
     expect(result.valid).toBe(true);
   });

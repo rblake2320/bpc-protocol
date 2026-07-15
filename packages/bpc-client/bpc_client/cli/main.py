@@ -25,7 +25,7 @@ from bpc_client.cli.config import get_config, set_config
 @click.group()
 @click.version_option(package_name="bpc-client")
 def cli():
-    """BPC (Bound Pair Credentials) — cryptographic device-binding for APIs."""
+    """BPC (Bound Pair Credentials) — pair-key signed requests for APIs."""
     pass
 
 
@@ -40,7 +40,7 @@ def pair():
 @pair.command("register")
 @click.option("--url", required=True, help="Base URL of the BPC-protected server")
 @click.option("--name", required=True, help="Human-readable name for this pair (e.g. 'my-laptop')")
-@click.option("--secret", required=True, help="Pair secret (8-64 chars, must include upper, lower, digit, symbol)")
+@click.option("--secret", required=True, help="Pair secret (16-128 chars; upper, lower, digit, and 2 special chars)")
 @click.option("--scope", default="read-write", type=click.Choice(["read", "read-write", "admin"]), help="Pair scope")
 @click.option("--mode", default="development", type=click.Choice(["development", "production"]), help="Pair mode")
 @click.option("--register-path", default="/bpc/register", help="Registration endpoint path")
@@ -101,13 +101,12 @@ def pair_info(name, as_json):
 
 @pair.command("rotate")
 @click.argument("name")
-@click.option("--new-secret", required=True, help="New secret for the pair")
 @click.option("--url", help="Override base URL")
-def pair_rotate(name, new_secret, url):
-    """Rotate the secret for a saved pair."""
+def pair_rotate(name, url):
+    """Rotate the signing key for a saved pair."""
     try:
         client = BPCClient.load(name=name, base_url=url)
-        new_client = client.rotate(new_secret=new_secret)
+        new_client = client.rotate()
         click.secho(f"✓ Pair '{name}' rotated successfully", fg="green")
         click.echo(f"  Pair ID: {new_client.pair_id}")
     except BPCError as e:

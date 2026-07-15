@@ -1,7 +1,7 @@
 /**
  * BPC HMAC Key Derivation and Verification
  *
- * Security hardening (IL4-7):
+ * Request HMAC hardening:
  *
  *  BPC-01 FIX — HMAC Authentication Bypass:
  *    The previous implementation returned `true` when `storedHmacKey` was empty,
@@ -13,7 +13,8 @@
  *    The previous `hashSecret` used a single SHA-256 digest, which is trivially
  *    brute-forceable at billions of hashes/second on commodity GPUs. The new
  *    implementation uses HKDF (RFC 5869) with SHA-256, a domain-specific salt,
- *    and a 256-bit output key. HKDF is FIPS 140-2/3 approved (SP 800-56C Rev 2).
+ *    and a 256-bit output key. Algorithm selection does not establish FIPS
+ *    validation of the deployed cryptographic module.
  *
  *  NIST SP 800-53 Rev 5 controls: IA-5, SC-13, SC-28.
  */
@@ -29,7 +30,7 @@ const HKDF_SALT = new TextEncoder().encode('bpc-protocol-hmac-salt-v1');
 /**
  * Derive a 256-bit HMAC key from a user secret using HKDF-SHA-256.
  * Replaces the previous SHA-256(bpc: + secret) approach.
- * FIPS 140-2/3 approved (SP 800-56C Rev 2).
+ * Uses HKDF-SHA-256 with protocol-specific domain separation.
  */
 export async function hashSecret(secret: string): Promise<string> {
   if (!secret || secret.length === 0) {
@@ -72,7 +73,7 @@ export async function hmacDerive(keyMaterial: string, data: string): Promise<str
 /**
  * Verify a request's `secret_hmac` field against the stored HMAC key.
  *
- * IL4-7 / BPC-01 FIX:
+ * BPC-01 fix:
  *  - Empty/missing `storedHmacKey` is a HARD FAILURE — no fallback, no bypass.
  *  - Minimum HMAC tag length: 43 chars (256-bit output, base64url-encoded).
  *  - Constant-time comparison prevents timing oracle attacks.

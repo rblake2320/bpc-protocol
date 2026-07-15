@@ -1,131 +1,183 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, expect, it } from 'vitest';
+
 import {
-  authorizeReplica, validateReplicaOp, applyReplicaOp, handleReplicaIngest,
+  authorizeReplica,
+  handleReplicaIngest,
+  validateReplicaOp,
 } from '../src/replica-receiver.js';
+import {
+  MemoryReplicaApplyGuard,
+  MemoryReplicaSequenceSource,
+  REPLICA_ENVELOPE_VERSION,
+  signReplicaEnvelope,
+  type ReplicaEnvelope,
+} from '../src/replica-envelope.js';
 import { ReplicatingPairStore } from '../src/replicating-store.js';
 import { MemoryPairStore } from '../src/memory-store.js';
+import type { ReplicaOp } from '../src/replicating-store.js';
 import type { StoredPair } from '../src/types.js';
+
+const KEY = 'replica-authentication-key-with-32-bytes-minimum';
+const SOURCE = 'primary-1';
 
 function pair(id: string, over: Partial<StoredPair> = {}): StoredPair {
   return {
-    id, name: `pair-${id}`, scope: 'read-write', mode: 'development',
-    secretHash: 'verifier-not-secret', pubJwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y' },
-    status: 'active', created: 1_700_000_000_000, lastActive: null, requests: 0, failedSigs: 0,
+    id,
+    name: `pair-${id}`,
+    scope: 'read-write',
+    mode: 'development',
+    secretHash: 'A'.repeat(43),
+    pubJwk: { kty: 'EC', crv: 'P-256', x: 'A'.repeat(43), y: 'B'.repeat(43) },
+    status: 'active',
+    created: 1_700_000_000_000,
+    lastActive: null,
+    requests: 0,
+    failedSigs: 0,
     ...over,
   } as StoredPair;
 }
 
-const TOKEN = 'replica-shared-token';
+function signedEnvelope(sequence: number, op: ReplicaOp, sentAt = Date.now()): {
+  envelope: ReplicaEnvelope;
+  headers: Record<string, string>;
+} {
+  const envelope: ReplicaEnvelope = {
+    version: REPLICA_ENVELOPE_VERSION,
+    sourceId: SOURCE,
+    sequence,
+    sentAt,
+    op,
+  };
+  return {
+    envelope,
+    headers: { 'x-replica-signature': signReplicaEnvelope(envelope, KEY) },
+  };
+}
 
-describe('replica-receiver auth (RX-01)', () => {
-  it('accepts the correct token', () => {
-    expect(authorizeReplica({ 'x-replica-token': TOKEN }, TOKEN)).toBe(true);
+describe('replica envelope authentication and validation', () => {
+  it('accepts an authentic envelope and rejects body tampering', () => {
+    const { envelope, headers } = signedEnvelope(1, { op: 'set', pair: pair('a') });
+    expect(authorizeReplica(headers, envelope, KEY)).toBe(true);
+    expect(authorizeReplica(headers, { ...envelope, sequence: 2 }, KEY)).toBe(false);
   });
-  it('rejects a wrong token', () => {
-    expect(authorizeReplica({ 'x-replica-token': 'nope' }, TOKEN)).toBe(false);
+
+  it('rejects duplicate signature headers', () => {
+    const { envelope, headers } = signedEnvelope(1, { op: 'set', pair: pair('a') });
+    expect(authorizeReplica({ 'x-replica-signature': [headers['x-replica-signature'], 'x'] }, envelope, KEY)).toBe(false);
   });
-  it('rejects a missing token', () => {
-    expect(authorizeReplica({}, TOKEN)).toBe(false);
+
+  it('rejects malformed pair state rather than importing it', () => {
+    expect(validateReplicaOp({ op: 'set', pair: { ...pair('a'), scope: 'admin:*' } }).ok).toBe(false);
+    expect(validateReplicaOp({ op: 'set', pair: { ...pair('a'), status: 'invented' } }).ok).toBe(false);
+    expect(validateReplicaOp({ op: 'set', pair: { ...pair('a'), pubJwk: {} } }).ok).toBe(false);
+    expect(validateReplicaOp({ op: 'set', pair: { ...pair('a'), maxRequests: 'unlimited' } }).ok).toBe(false);
+    expect(validateReplicaOp({ op: 'set', pair: { ...pair('a'), cumulativeFailures: -1 } }).ok).toBe(false);
+    expect(validateReplicaOp({ op: 'set', pair: { ...pair('a'), kind: 'ghost' } }).ok).toBe(false);
+    expect(validateReplicaOp({
+      op: 'set',
+      pair: { ...pair('a'), kind: 'legitimate', canaryClass: 'registry_exfil' },
+    }).ok).toBe(false);
   });
-  it('rejects an array-valued header', () => {
-    expect(authorizeReplica({ 'x-replica-token': [TOKEN, 'x'] }, TOKEN)).toBe(true); // first value used
-    expect(authorizeReplica({ 'x-replica-token': ['wrong'] }, TOKEN)).toBe(false);
+
+  it('accepts complete valid authorization state', () => {
+    expect(validateReplicaOp({
+      op: 'set',
+      pair: pair('ghost-a', {
+        kind: 'ghost',
+        canaryClass: 'registry_exfil',
+        maxRequests: 10,
+        cumulativeFailures: 1.5,
+        firstFailureAt: 1_700_000_000_001,
+        expiresAt: 1_800_000_000_000,
+      }),
+    }).ok).toBe(true);
   });
 });
 
-describe('replica-receiver op validation (RX-04)', () => {
-  it('rejects unknown op', () => {
-    expect(validateReplicaOp({ op: 'frobnicate' }).ok).toBe(false);
-  });
-  it('rejects set without a valid pair id', () => {
-    expect(validateReplicaOp({ op: 'set', pair: { name: 'x' } }).ok).toBe(false);
-  });
-  it('rejects delete without pairId', () => {
-    expect(validateReplicaOp({ op: 'delete' }).ok).toBe(false);
-  });
-  it('accepts a well-formed set', () => {
-    const v = validateReplicaOp({ op: 'set', pair: pair('a') });
-    expect(v.ok).toBe(true);
-  });
-});
-
-describe('replica-receiver apply (RX-02 idempotency)', () => {
-  let replica: MemoryPairStore;
-  beforeEach(() => { replica = new MemoryPairStore(); });
-
-  it('applies set then delete', async () => {
-    await applyReplicaOp(replica, { op: 'set', pair: pair('a') });
-    expect(await replica.get('a')).toBeDefined();
-    await applyReplicaOp(replica, { op: 'delete', pairId: 'a' });
+describe('monotonic replica application', () => {
+  it('rejects expired authenticated envelopes', async () => {
+    const replica = new MemoryPairStore();
+    const guard = new MemoryReplicaApplyGuard();
+    const now = Date.now();
+    const { envelope, headers } = signedEnvelope(1, { op: 'set', pair: pair('a') }, now - 60_001);
+    const result = await handleReplicaIngest(replica, headers, envelope, KEY, SOURCE, guard, now);
+    expect(result.status).toBe(400);
+    expect(result.result.error).toBe('replica_request_expired');
     expect(await replica.get('a')).toBeUndefined();
   });
 
-  it('is idempotent — re-applying set leaves identical state', async () => {
-    await applyReplicaOp(replica, { op: 'set', pair: pair('a', { requests: 5 }) });
-    await applyReplicaOp(replica, { op: 'set', pair: pair('a', { requests: 5 }) });
-    const all = await replica.list();
-    expect(all.length).toBe(1);
-    expect(all[0].requests).toBe(5);
+  it('treats an exact retry as idempotent', async () => {
+    const replica = new MemoryPairStore();
+    const guard = new MemoryReplicaApplyGuard();
+    const request = signedEnvelope(1, { op: 'set', pair: pair('a') });
+    expect((await handleReplicaIngest(replica, request.headers, request.envelope, KEY, SOURCE, guard)).status).toBe(200);
+    const duplicate = await handleReplicaIngest(replica, request.headers, request.envelope, KEY, SOURCE, guard);
+    expect(duplicate.status).toBe(200);
+    expect(duplicate.result.error).toBe('duplicate_ignored');
   });
 
-  it('re-applying delete on an absent pair is a no-op (idempotent)', async () => {
-    await applyReplicaOp(replica, { op: 'delete', pairId: 'ghost' });
-    await applyReplicaOp(replica, { op: 'delete', pairId: 'ghost' });
-    expect((await replica.list()).length).toBe(0);
-  });
-});
+  it('rejects a different operation that reuses an accepted sequence', async () => {
+    const replica = new MemoryPairStore();
+    const guard = new MemoryReplicaApplyGuard();
+    const create = signedEnvelope(1, { op: 'set', pair: pair('a') });
+    const conflict = signedEnvelope(1, { op: 'delete', pairId: 'a' });
+    expect((await handleReplicaIngest(replica, create.headers, create.envelope, KEY, SOURCE, guard)).status).toBe(200);
 
-describe('handleReplicaIngest end-to-end status mapping', () => {
-  it('401 on bad token, no mutation', async () => {
-    const replica = new MemoryPairStore();
-    const r = await handleReplicaIngest(replica, { 'x-replica-token': 'bad' }, { op: 'set', pair: pair('a') }, TOKEN);
-    expect(r.status).toBe(401);
-    expect((await replica.list()).length).toBe(0);
-  });
-  it('400 on malformed op', async () => {
-    const replica = new MemoryPairStore();
-    const r = await handleReplicaIngest(replica, { 'x-replica-token': TOKEN }, { op: 'set' }, TOKEN);
-    expect(r.status).toBe(400);
-  });
-  it('200 on a good op', async () => {
-    const replica = new MemoryPairStore();
-    const r = await handleReplicaIngest(replica, { 'x-replica-token': TOKEN }, { op: 'set', pair: pair('a') }, TOKEN);
-    expect(r.status).toBe(200);
+    const result = await handleReplicaIngest(replica, conflict.headers, conflict.envelope, KEY, SOURCE, guard);
+    expect(result.status).toBe(409);
+    expect(result.result.error).toBe('replica_sequence_conflict');
     expect(await replica.get('a')).toBeDefined();
   });
+
+  it('rejects an out-of-order gap without mutating the replica', async () => {
+    const replica = new MemoryPairStore();
+    const guard = new MemoryReplicaApplyGuard();
+    const request = signedEnvelope(2, { op: 'set', pair: pair('a') });
+    const result = await handleReplicaIngest(replica, request.headers, request.envelope, KEY, SOURCE, guard);
+    expect(result.status).toBe(409);
+    expect(result.result.error).toBe('replica_sequence_gap');
+    expect(await replica.get('a')).toBeUndefined();
+  });
+
+  it('prevents a captured stale set from resurrecting a deleted pair', async () => {
+    const replica = new MemoryPairStore();
+    const guard = new MemoryReplicaApplyGuard();
+    const create = signedEnvelope(1, { op: 'set', pair: pair('a') });
+    const remove = signedEnvelope(2, { op: 'delete', pairId: 'a' });
+
+    expect((await handleReplicaIngest(replica, create.headers, create.envelope, KEY, SOURCE, guard)).status).toBe(200);
+    expect((await handleReplicaIngest(replica, remove.headers, remove.envelope, KEY, SOURCE, guard)).status).toBe(200);
+    expect(await replica.get('a')).toBeUndefined();
+
+    const replay = await handleReplicaIngest(replica, create.headers, create.envelope, KEY, SOURCE, guard);
+    expect(replay.status).toBe(409);
+    expect(replay.result.error).toBe('replica_sequence_stale');
+    expect(await replica.get('a')).toBeUndefined();
+  });
 });
 
-describe('END-TO-END: ReplicatingPairStore -> wire -> receiver -> replica matches primary', () => {
-  it('replica store converges to the primary store', async () => {
+describe('ReplicatingPairStore to receiver', () => {
+  it('converges through authenticated, contiguous envelopes', async () => {
     const primary = new MemoryPairStore();
     const replica = new MemoryPairStore();
-
-    // fetchImpl routes the decorator's HTTP push straight into the receiver,
-    // simulating the VPS ingest endpoint in-process.
-    const fetchImpl = (async (_url: any, init: any) => {
-      const body = JSON.parse(init.body);
-      const headers = Object.fromEntries(Object.entries(init.headers));
-      const { status } = await handleReplicaIngest(replica, headers, body, TOKEN);
+    const guard = new MemoryReplicaApplyGuard();
+    const fetchImpl = (async (_url: unknown, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      const headers = Object.fromEntries(Object.entries(init.headers as Record<string, string>));
+      const { status } = await handleReplicaIngest(replica, headers, body, KEY, SOURCE, guard);
       return new Response('{}', { status });
-    }) as unknown as typeof fetch;
+    }) as typeof fetch;
+    const store = new ReplicatingPairStore(
+      primary,
+      { url: 'https://replica.test', sourceId: SOURCE, token: KEY },
+      { fetchImpl, sequenceSource: new MemoryReplicaSequenceSource() },
+    );
 
-    const store = new ReplicatingPairStore(primary, { url: 'https://vps/replica', token: TOKEN }, { fetchImpl });
-
-    await store.set(pair('a', { requests: 1 }));
-    await store.set(pair('b', { requests: 2 }));
-    await store.setPending('tok-1', { name: 'pending-x' } as any, 1_700_000_000_001);
-    await store.set(pair('a', { requests: 99 }));   // update
+    await store.set(pair('a'));
+    await store.set(pair('b'));
     await store.delete('b');
-    await store.deletePending('tok-1');
-    const drained = await store.flush(3000);
-    expect(drained).toBe(true);
-
-    // Replica must now mirror the primary exactly.
-    const primaryPairs = (await primary.list()).sort((x, y) => x.id.localeCompare(y.id));
-    const replicaPairs = (await replica.list()).sort((x, y) => x.id.localeCompare(y.id));
-    expect(replicaPairs).toEqual(primaryPairs);
-    expect(replicaPairs.length).toBe(1);          // only 'a' remains
-    expect(replicaPairs[0].requests).toBe(99);    // update propagated
-    expect(await replica.getPending('tok-1')).toBeUndefined();  // pending deleted
+    expect(await store.flush()).toBe(true);
+    expect(await replica.get('a')).toEqual(await primary.get('a'));
+    expect(await replica.get('b')).toBeUndefined();
   });
 });

@@ -1,4 +1,4 @@
-import { emitKeyGenerationCapture, generateKeypair, hashSecret } from '@bpc/core';
+import { emitKeyGenerationCapture, generateKeypair, hashSecret, validateSecret } from '@bpc/core';
 import type { AIRuntimeMetadata, BPCKeypair } from '@bpc/core';
 
 export interface RegistrationResult {
@@ -27,6 +27,10 @@ export async function prepareRegistration(
   mode: 'development' | 'production' = 'development',
   options: PrepareRegistrationOptions = {},
 ): Promise<{ keypair: BPCKeypair; request: RegistrationRequest }> {
+  const validation = validateSecret(secret);
+  if (!validation.valid) {
+    throw new TypeError(`BPC registration secret rejected: ${validation.reason}`);
+  }
   const keypair = await generateKeypair({
     runtimeMetadata: options.runtimeMetadata,
     captureDetails: {

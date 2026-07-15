@@ -13,9 +13,9 @@
  *
  *  HA-02 Bounded retry queue (no memory exhaustion):
  *    Failed pushes are retried with exponential backoff. The queue is capped
- *    (MAX_QUEUE) and sheds OLDEST entries when full — a long replica outage
- *    cannot exhaust primary memory. Shed events are surfaced via onDrop so the
- *    operator sees replication lag instead of a silent gap.
+ *    and sheds OLDEST entries when full. Because the receiver rejects sequence
+ *    gaps, shedding makes the replica ineligible for promotion until an
+ *    operator reconciles it from an authoritative snapshot.
  *
  *  HA-03 Replicate verifiers only, never secrets:
  *    A StoredPair contains secretHash (an HKDF-derived verifier) and pubJwk
@@ -33,6 +33,12 @@
  */
 import type { PairStore } from './store.js';
 import type { StoredPair, PairRegistration } from './types.js';
+import {
+  REPLICA_ENVELOPE_VERSION,
+  signReplicaEnvelope,
+  type ReplicaEnvelope,
+  type ReplicaSequenceSource,
+} from './replica-envelope.js';
 
 export type ReplicaOp =
   | { op: 'set'; pair: StoredPair }
@@ -43,13 +49,17 @@ export type ReplicaOp =
 export interface ReplicaTarget {
   /** Base URL of the replica ingest endpoint, e.g. https://srv1740069.hstgr.cloud/replica */
   url: string;
-  /** Shared replication auth token (sent as x-replica-token). NOT a BPC secret. */
+  /** Stable identifier for this primary. It must survive primary restarts. */
+  sourceId: string;
+  /** HMAC key used to authenticate each envelope. It is never sent on the wire. */
   token: string;
   /** Per-request timeout. Default 5000ms. */
   timeoutMs?: number;
 }
 
 export interface ReplicatingStoreOptions {
+  /** Durable monotonic sequence allocator. Required to prevent stale resurrection. */
+  sequenceSource: ReplicaSequenceSource;
   /** Max queued ops before oldest are shed. Default 5000. */
   maxQueue?: number;
   /** Base backoff in ms for retries. Default 1000. */
@@ -72,7 +82,7 @@ const DEFAULTS = {
 };
 
 export class ReplicatingPairStore implements PairStore {
-  private readonly queue: ReplicaOp[] = [];
+  private readonly queue: Array<{ sequence: number; op: ReplicaOp }> = [];
   private draining = false;
   private attempt = 0;
   private readonly opts: Required<Omit<ReplicatingStoreOptions, 'onDrop' | 'onPush' | 'fetchImpl'>> &
@@ -81,9 +91,10 @@ export class ReplicatingPairStore implements PairStore {
   constructor(
     private readonly primary: PairStore,
     private readonly replica: ReplicaTarget,
-    options: ReplicatingStoreOptions = {},
+    options: ReplicatingStoreOptions,
   ) {
     this.opts = {
+      sequenceSource: options.sequenceSource,
       maxQueue: options.maxQueue ?? DEFAULTS.maxQueue,
       backoffBaseMs: options.backoffBaseMs ?? DEFAULTS.backoffBaseMs,
       backoffMaxMs: options.backoffMaxMs ?? DEFAULTS.backoffMaxMs,
@@ -102,22 +113,22 @@ export class ReplicatingPairStore implements PairStore {
   // ── Writes: primary first (authoritative), then async mirror ────────────────
   async set(pair: StoredPair): Promise<void> {
     await this.primary.set(pair);
-    this.enqueue({ op: 'set', pair });
+    await this.enqueue({ op: 'set', pair });
   }
 
   async delete(pairId: string): Promise<void> {
     await this.primary.delete(pairId);
-    this.enqueue({ op: 'delete', pairId });
+    await this.enqueue({ op: 'delete', pairId });
   }
 
   async setPending(token: string, registration: PairRegistration, requestedAt: number): Promise<void> {
     await this.primary.setPending(token, registration, requestedAt);
-    this.enqueue({ op: 'setPending', token, registration, requestedAt });
+    await this.enqueue({ op: 'setPending', token, registration, requestedAt });
   }
 
   async deletePending(token: string): Promise<void> {
     await this.primary.deletePending(token);
-    this.enqueue({ op: 'deletePending', token });
+    await this.enqueue({ op: 'deletePending', token });
   }
 
   // ── Replication queue ───────────────────────────────────────────────────────
@@ -125,13 +136,14 @@ export class ReplicatingPairStore implements PairStore {
   /** Current number of unreplicated ops — wire to a "replication lag" gauge. */
   get queueDepth(): number { return this.queue.length; }
 
-  private enqueue(op: ReplicaOp): void {
+  private async enqueue(op: ReplicaOp): Promise<void> {
+    const sequence = await this.opts.sequenceSource.next();
     // HA-02: shed OLDEST when full so a long outage can't exhaust memory.
     if (this.queue.length >= this.opts.maxQueue) {
       const dropped = this.queue.shift();
-      if (dropped) this.opts.onDrop?.(dropped, this.queue.length);
+      if (dropped) this.opts.onDrop?.(dropped.op, this.queue.length);
     }
-    this.queue.push(op);
+    this.queue.push({ sequence, op });
     void this.drain();
   }
 
@@ -141,8 +153,8 @@ export class ReplicatingPairStore implements PairStore {
     this.draining = true;
     try {
       while (this.queue.length > 0) {
-        const op = this.queue[0];
-        const ok = await this.push(op);
+        const queued = this.queue[0];
+        const ok = await this.push(queued.sequence, queued.op);
         if (ok) {
           this.queue.shift();
           this.attempt = 0;
@@ -166,16 +178,24 @@ export class ReplicatingPairStore implements PairStore {
     return new Promise((r) => setTimeout(r, ms));
   }
 
-  private async push(op: ReplicaOp): Promise<boolean> {
+  private async push(sequence: number, op: ReplicaOp): Promise<boolean> {
     const doFetch = this.opts.fetchImpl ?? fetch;
     try {
+      const envelope: ReplicaEnvelope = {
+        version: REPLICA_ENVELOPE_VERSION,
+        sourceId: this.replica.sourceId,
+        sequence,
+        sentAt: Date.now(),
+        op,
+      };
+      const signature = signReplicaEnvelope(envelope, this.replica.token);
       const res = await doFetch(`${this.replica.url}/pair`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'x-replica-token': this.replica.token,
+          'x-replica-signature': signature,
         },
-        body: JSON.stringify({ ...op, ts: Date.now() }),
+        body: JSON.stringify(envelope),
         signal: AbortSignal.timeout(this.replica.timeoutMs ?? DEFAULTS.timeoutMs),
       });
       const ok = res.ok;

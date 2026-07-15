@@ -29,7 +29,7 @@ from bpc_server.nonce_store import InMemoryNonceStore
 
 def make_pair_and_client():
     """Create a test pair and matching bpc_client for signing."""
-    from bpc_client.crypto import generate_keypair
+    from bpc_client.crypto import derive_secret_key, generate_keypair
     from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
 
     kp = generate_keypair()
@@ -42,7 +42,7 @@ def make_pair_and_client():
         scope="read-write",
         mode="development",
         public_key_jwk=pub_jwk,
-        secret_hash="argon2id_placeholder",  # not used in Python verifier (HMAC-based)
+        secret_hash=derive_secret_key("MySecret1!"),
         status="active",
     )
 
@@ -232,6 +232,19 @@ class TestBPCVerifier:
         result = self.verifier.verify(headers, "GET", "/api/data")
         assert result.ok is False
         assert result.error_code == "signature_invalid"
+
+    def test_wrong_secret_hmac_fails_even_with_valid_pair_key(self):
+        headers = sign_headers(self.private_key, self.pair.pair_id, "WrongSecret1!", "GET", "/api/data")
+        result = self.verifier.verify(headers, "GET", "/api/data")
+        assert result.ok is False
+        assert result.error_code == "invalid_secret_hmac"
+
+    def test_invalid_signature_does_not_burn_legitimate_nonce(self):
+        headers = sign_headers(self.private_key, self.pair.pair_id, self.secret, "GET", "/api/data")
+        forged = dict(headers)
+        forged["X-BPC-Signature"] = forged["X-BPC-Signature"][:-4] + "AAAA"
+        assert self.verifier.verify(forged, "GET", "/api/data").error_code == "signature_invalid"
+        assert self.verifier.verify(headers, "GET", "/api/data").ok is True
 
     def test_scope_read_blocks_post(self):
         self.pair.scope = "read"

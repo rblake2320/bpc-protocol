@@ -129,7 +129,7 @@ export class AnomalyEngine {
      * Shadow state:
      * - Persists for 24 hours minimum
      * - Resets only on explicit operator action (clearShadowState)
-     * - All requests return { ok: true, shadow: true } with fake session token
+     * - All requests remain denied and carry shadow metadata for a response layer
      * - Tarpit delay of 2000ms applied before response
      */
     async enterShadowState(pairId, sourceIp, reason) {

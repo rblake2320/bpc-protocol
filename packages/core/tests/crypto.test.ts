@@ -41,6 +41,14 @@ describe('crypto', () => {
     expect(kp.publicKey).toBeDefined();
   });
 
+  it('fingerprints only required public JWK members in a stable order', async () => {
+    const a: JsonWebKey = { kty: 'EC', crv: 'P-256', x: 'x-value', y: 'y-value' };
+    const b: JsonWebKey = {
+      y: 'y-value', x: 'x-value', crv: 'P-256', kty: 'EC', ext: true, key_ops: ['verify'],
+    };
+    expect(await computeFingerprint(a)).toBe(await computeFingerprint(b));
+  });
+
   it('emits opt-in key generation capture without exposing private key material', async () => {
     const events: KeyGenerationCaptureEvent[] = [];
     setKeyGenerationCaptureSink(event => events.push(event));
@@ -176,9 +184,9 @@ describe('verifySecretHmac', () => {
 });
 
 describe('validateSecret', () => {
-  // IL4-7 policy: min 16 chars, max 128 chars, 2+ special chars.
+  // Project policy: min 16 chars, max 128 chars, 2+ special chars.
 
-  it('accepts a valid IL4-7 compliant secret', () => {
+  it('accepts a secret meeting the configured project policy', () => {
     const result = validateSecret('ValidSecret1!@#$');
     expect(result.valid).toBe(true);
     expect(result.reason).toBeUndefined();

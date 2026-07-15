@@ -63,7 +63,7 @@ TOOLS = [
             "properties": {
                 "base_url": {"type": "string", "description": "Server base URL"},
                 "name": {"type": "string", "description": "Human-readable pair name"},
-                "secret": {"type": "string", "description": "Pair secret (8-64 chars)"},
+                "secret": {"type": "string", "description": "Pair secret (16-128 chars; reference policy applies)"},
                 "scope": {
                     "type": "string",
                     "enum": ["read", "read-write", "admin"],
@@ -82,14 +82,13 @@ TOOLS = [
     },
     {
         "name": "bpc_rotate_pair",
-        "description": "Rotate the secret for a saved BPC pair",
+        "description": "Rotate the signing key for a saved BPC pair",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Pair name"},
-                "new_secret": {"type": "string", "description": "New secret"},
             },
-            "required": ["name", "new_secret"],
+            "required": ["name"],
         },
     },
     {
@@ -179,7 +178,7 @@ def handle_tool_call(name: str, arguments: dict) -> str:
 
         elif name == "bpc_rotate_pair":
             client = BPCClient.load(name=arguments["name"])
-            new_client = client.rotate(new_secret=arguments["new_secret"])
+            new_client = client.rotate()
             return _json_response({"ok": True, "pair_id": new_client.pair_id})
 
         elif name == "bpc_server_status":

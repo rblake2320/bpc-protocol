@@ -18,14 +18,16 @@ Steps:
 
 import base64
 import hashlib
+import hmac
 import json
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
 from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, EllipticCurvePublicKey, SECP256R1
 from cryptography.hazmat.primitives.hashes import SHA256
-from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.backends import default_backend
 
@@ -127,6 +129,8 @@ class BPCVerifier:
         signature_b64 = headers_lower["x-bpc-signature"]
         signed_data_b64 = headers_lower["x-bpc-signed-data"]
         version = headers_lower["x-bpc-version"]
+        if version != "1.0":
+            return BPCVerificationResult.failure("unsupported_version", "Unsupported BPC header version")
 
         # Step 3: Pair exists and is active
         pair = self.registry.get(pair_id)
@@ -159,6 +163,8 @@ class BPCVerifier:
         # Step 7: Timestamp within window
         now_ms = int(time.time() * 1000)
         ts = payload.get("timestamp", 0)
+        if not isinstance(ts, int):
+            return BPCVerificationResult.failure("invalid_signed_data", "Timestamp must be an integer")
         if abs(now_ms - ts) > self.sig_window_ms:
             self.registry.increment_failed_sigs(pair_id)
             return BPCVerificationResult.failure(
@@ -166,10 +172,21 @@ class BPCVerifier:
                 f"Timestamp {ts} is outside ±{self.sig_window_ms}ms window",
             )
 
-        # Step 8: Nonce not seen before
+        # Secret-factor verification. secret_hash is the base64url-encoded
+        # HKDF-derived HMAC key, not an Argon2 password hash.
         nonce = payload.get("nonce", "")
-        if not self.nonce_store.consume(nonce, ttl_ms=self.sig_window_ms * 2 + 10_000):
-            return BPCVerificationResult.failure("replay_detected", f"Nonce already consumed: {nonce}")
+        secret_hmac = payload.get("secret_hmac", "")
+        try:
+            uuid.UUID(nonce, version=4)
+            key = _b64url_decode(pair.secret_hash)
+            expected_hmac = base64.urlsafe_b64encode(
+                hmac.new(key, (nonce + str(ts)).encode(), hashlib.sha256).digest()
+            ).rstrip(b"=").decode()
+        except (TypeError, ValueError, KeyError):
+            return BPCVerificationResult.failure("invalid_secret_hmac", "Invalid nonce or stored HMAC key")
+        if not isinstance(secret_hmac, str) or not hmac.compare_digest(secret_hmac, expected_hmac):
+            self.registry.increment_failed_sigs(pair_id)
+            return BPCVerificationResult.failure("invalid_secret_hmac", "Secret HMAC verification failed")
 
         # Step 9: Method and path match
         if payload.get("method") != method.upper():
@@ -184,12 +201,15 @@ class BPCVerifier:
                 "method_path_mismatch",
                 f"Path mismatch: payload={payload.get('path')} request={path}",
             )
+        if payload.get("pair_id") != pair_id:
+            self.registry.increment_failed_sigs(pair_id)
+            return BPCVerificationResult.failure("pair_id_mismatch", "Payload pair ID does not match header")
 
         # Step 10: Body hash match
         body_data = body or b""
         expected_hash = "sha256:" + base64.urlsafe_b64encode(
             hashlib.sha256(body_data).digest()
-        ).rstrip(b"=").decode()[:32]
+        ).rstrip(b"=").decode()
         if payload.get("body_hash") != expected_hash:
             self.registry.increment_failed_sigs(pair_id)
             return BPCVerificationResult.failure(
@@ -201,7 +221,13 @@ class BPCVerifier:
         try:
             public_key = _import_public_key_jwk(pair.public_key_jwk)
             sig_bytes = _b64url_decode(signature_b64)
-            public_key.verify(sig_bytes, canonical_bytes, ECDSA(SHA256()))
+            if len(sig_bytes) != 64:
+                raise ValueError("ECDSA signature must be 64-byte P1363")
+            der_signature = encode_dss_signature(
+                int.from_bytes(sig_bytes[:32], "big"),
+                int.from_bytes(sig_bytes[32:], "big"),
+            )
+            public_key.verify(der_signature, canonical_bytes, ECDSA(SHA256()))
         except InvalidSignature:
             self.registry.increment_failed_sigs(pair_id)
             return BPCVerificationResult.failure("signature_invalid", "ECDSA signature verification failed")
@@ -216,6 +242,11 @@ class BPCVerifier:
                 "scope_denied",
                 f"Scope '{pair.scope}' does not allow {method.upper()}",
             )
+
+        # Consume only after every binding and cryptographic check passes. The
+        # nonce store must provide an atomic first-use operation in production.
+        if not self.nonce_store.consume(nonce, ttl_ms=self.sig_window_ms * 2 + 10_000):
+            return BPCVerificationResult.failure("replay_detected", f"Nonce already consumed: {nonce}")
 
         # All checks passed
         self.registry.reset_failed_sigs(pair_id)

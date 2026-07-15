@@ -7,9 +7,12 @@ dist/
 .DS_Store
 **/.vite/
 **/vitest/results.json
-package-lock.json
 __pycache__/
 *.py[cod]
+
+# The root workspace lock is authoritative. Ignore legacy nested locks.
+**/package-lock.json
+!/package-lock.json
 
 
 # FilePairStore persistent data — lives in ~/.bpc, never in repo

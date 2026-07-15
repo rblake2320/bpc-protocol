@@ -3,9 +3,9 @@ import {
   PromotionController, assertWritable, handlePromotionCommand,
 } from '../src/promotion.js';
 
-const GUARD = 'guard-token-xyz';
+const GUARD = 'guard-token-with-at-least-32-bytes';
 
-describe('PromotionController PR-01 single-writer invariant', () => {
+describe('PromotionController PR-01 local replica write gate', () => {
   it('a primary is always writable and cannot be promoted/demoted', () => {
     const p = new PromotionController('primary');
     expect(p.isWritable()).toBe(true);
@@ -53,6 +53,22 @@ describe('PR-03 guard-only control via admin command', () => {
     const res = handlePromotionCommand(r, { 'x-guard-token': 'wrong' }, { command: 'promote', by: 'x' }, GUARD);
     expect(res.status).toBe(401);
     expect(r.isWritable()).toBe(false);     // unchanged
+  });
+
+  it('rejects duplicate guard-token headers and undersized configured tokens', () => {
+    const r = new PromotionController('replica');
+    expect(handlePromotionCommand(
+      r,
+      { 'x-guard-token': [GUARD, GUARD] },
+      { command: 'promote', by: 'guard' },
+      GUARD,
+    ).status).toBe(401);
+    expect(handlePromotionCommand(
+      r,
+      { 'x-guard-token': 'short' },
+      { command: 'promote', by: 'guard' },
+      'short',
+    ).status).toBe(401);
   });
 
   it('rejects a missing token (401)', () => {

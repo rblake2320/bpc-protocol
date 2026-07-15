@@ -1,27 +1,28 @@
 /**
- * Promotion gate — Option A split-brain protection (guard-gated single writer).
+ * Promotion gate — guard-gated local replica write authority.
  *
- * The fleet guard is the SOLE authority for write routing. A replica node never
+ * The fleet guard is the local authority for replica write routing. A replica node never
  * self-promotes and a client never promotes it; only the guard, via the admin
  * command endpoint, may flip a replica between read-only and writable.
  *
- *  PR-01 Single writer invariant:
+ *  PR-01 Local replica write gate:
  *    A primary is always writable. A replica is writable ONLY while the guard
  *    has explicitly promoted it. assertWritable() returns 503 otherwise, so even
  *    a buggy client that routes a write to a non-promoted replica FAILS CLOSED —
- *    the replica can never accept an authoritative write it wasn't promoted for.
+ *    the replica cannot accept an authoritative write it was not promoted for.
  *
  *  PR-02 Explicit demotion (no fail-back race):
  *    promoted does NOT auto-clear. When the primary recovers, the guard must
  *    explicitly demote() the replica before traffic fails back. This removes the
- *    window where a recovering primary and a still-writable replica both accept
- *    writes. Demotion is a deliberate guard action, never automatic.
+ *    local fail-back risk. A distributed fence is still required to exclude a
+ *    simultaneously writable former primary. Demotion is never automatic.
  *
  *  PR-03 Guard-only control via constant-time admin auth:
  *    promote/demote commands require the guard token (x-guard-token), compared
  *    in constant time. Replication ingest (the primary mirroring to the replica)
  *    is a SEPARATE path and is unaffected — the replica keeps syncing while
- *    read-only, which is exactly what makes a later promotion safe.
+ *    read-only. A deployment still needs external fencing, a lease, or quorum
+ *    to prevent a reachable former primary from writing concurrently.
  *
  * NIST SP 800-53 Rev 5: AC-3 (access enforcement), CP-10, SC-7, AU-2.
  */
@@ -106,6 +107,7 @@ function constantTimeTokenMatch(presented: unknown, expected: string): boolean {
   if (presented.length > MAX_TOKEN_LEN || expected.length > MAX_TOKEN_LEN) return false;
   const a = Buffer.from(presented);
   const b = Buffer.from(expected);
+  if (b.byteLength < 32) return false;
   if (a.length !== b.length) {
     timingSafeEqual(a, a);
     return false;
@@ -130,7 +132,10 @@ export function handlePromotionCommand(
   guardToken: string,
 ): { status: number; result: unknown } {
   const raw = headers['x-guard-token'];
-  const presented = Array.isArray(raw) ? raw[0] : raw;
+  if (Array.isArray(raw)) {
+    return { status: 401, result: { ok: false, error: 'unauthorized' } };
+  }
+  const presented = raw;
   if (!constantTimeTokenMatch(presented, guardToken)) {
     return { status: 401, result: { ok: false, error: 'unauthorized' } };
   }

@@ -3,18 +3,18 @@
  *
  * Ingests replicated ReplicaOps into the replica node's local PairStore. This
  * is the VPS-side half of HA replication. Framework-agnostic: the demo/prod
- * HTTP server calls authorizeReplica() then applyReplicaOp().
+ * HTTP server calls handleReplicaIngest(), which authenticates the complete
+ * envelope before applying a strictly ordered mutation.
  *
  * Design:
- *  RX-01 Constant-time token auth:
- *    The x-replica-token header is compared in constant time to defeat timing
- *    oracles. A mismatch is rejected before any store mutation.
+ *  RX-01 Authenticated envelope:
+ *    The x-replica-signature header authenticates the source, sequence,
+ *    timestamp, and complete operation body with HMAC-SHA-256.
  *
- *  RX-02 Idempotent application:
- *    Replication is at-least-once — the decorator retries pushes, so an op that
- *    succeeded server-side but timed out client-side WILL be re-sent. Every op
- *    here is idempotent: set/delete are absolute; setPending/deletePending are
- *    absolute. Re-applying any op leaves the replica in the same state.
+ *  RX-02 Ordered, idempotent application:
+ *    The receiver accepts only the next sequence for a source and recognizes
+ *    an exact retry of the most recently accepted envelope. Stale or gapped
+ *    mutations are rejected before touching the store.
  *
  *  RX-03 Verifier-only by nature (BPC is asymmetric):
  *    A replicated StoredPair carries secretHash (verifier) + pubJwk (public).
@@ -26,42 +26,81 @@
  *
  * NIST SP 800-53 Rev 5: AU-9, SC-8, SI-10 (information input validation).
  */
-import { timingSafeEqual } from 'node:crypto';
 import type { PairStore } from './store.js';
 import type { ReplicaOp } from './replicating-store.js';
 import type { StoredPair, PairRegistration } from './types.js';
+import {
+  validateReplicaEnvelope,
+  verifyReplicaEnvelopeSignature,
+  replicaOperationDigest,
+  type ReplicaApplyGuard,
+  type ReplicaEnvelope,
+} from './replica-envelope.js';
 
 const MAX_PAIR_ID_LEN = 64;
 const MAX_TOKEN_LEN = 256;
+const VALID_SCOPES = new Set(['read', 'read-write', 'admin']);
+const VALID_MODES = new Set(['development', 'production']);
+const VALID_STATUSES = new Set(['active', 'locked', 'expired', 'rotated', 'revoked']);
+const VALID_PAIR_KINDS = new Set(['legitimate', 'ghost']);
+const VALID_CANARY_CLASSES = new Set(['env_file', 'docs', 'registry_exfil']);
 
 export interface ReplicaApplyResult {
   ok: boolean;
   error?: string;
 }
 
-/** Constant-time comparison of the presented replica token against the expected one. */
+/** Verify the HMAC that authenticates and integrity-protects a replica envelope. */
 export function authorizeReplica(
   headers: Record<string, string | string[] | undefined>,
-  expectedToken: string,
+  envelope: ReplicaEnvelope,
+  expectedKey: string,
 ): boolean {
-  const raw = headers['x-replica-token'];
-  const presented = Array.isArray(raw) ? raw[0] : raw;
-  if (!presented || typeof presented !== 'string') return false;
-  if (presented.length > MAX_TOKEN_LEN || expectedToken.length > MAX_TOKEN_LEN) return false;
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expectedToken);
-  // timingSafeEqual requires equal length; length itself is not a secret here,
-  // but we still avoid an early-return branch on the secret bytes.
-  if (a.length !== b.length) {
-    // Compare against self to keep timing roughly constant, then fail.
-    timingSafeEqual(a, a);
-    return false;
-  }
-  return timingSafeEqual(a, b);
+  const raw = headers['x-replica-signature'];
+  if (Array.isArray(raw)) return false;
+  return verifyReplicaEnvelopeSignature(envelope, raw, expectedKey);
 }
 
 function isValidPairId(id: unknown): id is string {
-  return typeof id === 'string' && id.length > 0 && id.length <= MAX_PAIR_ID_LEN;
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(id);
+}
+
+function isValidJwk(jwk: unknown): jwk is JsonWebKey {
+  if (!jwk || typeof jwk !== 'object' || Array.isArray(jwk)) return false;
+  const value = jwk as Record<string, unknown>;
+  return value['kty'] === 'EC' && value['crv'] === 'P-256' &&
+    typeof value['x'] === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value['x']) &&
+    typeof value['y'] === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value['y']);
+}
+
+function isValidRegistration(value: unknown): value is PairRegistration {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const registration = value as Partial<PairRegistration>;
+  return typeof registration.name === 'string' && registration.name.length >= 1 && registration.name.length <= 128 &&
+    VALID_SCOPES.has(registration.scope as string) && VALID_MODES.has(registration.mode as string) &&
+    typeof registration.secretHash === 'string' && /^[A-Za-z0-9_-]{43}$/.test(registration.secretHash) &&
+    isValidJwk(registration.pubJwk);
+}
+
+function isValidStoredPair(value: unknown): value is StoredPair {
+  if (!isValidRegistration(value)) return false;
+  const pair = value as StoredPair;
+  const kind = pair.kind ?? 'legitimate';
+  const canaryIsValid = kind === 'ghost'
+    ? VALID_CANARY_CLASSES.has(pair.canaryClass as string)
+    : pair.canaryClass === undefined;
+  return isValidPairId(pair.id) && VALID_STATUSES.has(pair.status) &&
+    Number.isSafeInteger(pair.created) && pair.created >= 0 &&
+    (pair.lastActive === null || (Number.isSafeInteger(pair.lastActive) && pair.lastActive >= 0)) &&
+    Number.isSafeInteger(pair.requests) && pair.requests >= 0 &&
+    Number.isSafeInteger(pair.failedSigs) && pair.failedSigs >= 0 &&
+    (pair.cumulativeFailures === undefined ||
+      (Number.isFinite(pair.cumulativeFailures) && pair.cumulativeFailures >= 0)) &&
+    (pair.firstFailureAt === undefined || pair.firstFailureAt === null ||
+      (Number.isSafeInteger(pair.firstFailureAt) && pair.firstFailureAt >= 0)) &&
+    (pair.expiresAt === undefined || (Number.isSafeInteger(pair.expiresAt) && pair.expiresAt >= 0)) &&
+    (pair.maxRequests === undefined || (Number.isSafeInteger(pair.maxRequests) && pair.maxRequests >= 0)) &&
+    VALID_PAIR_KINDS.has(kind) && canaryIsValid;
 }
 
 /** Validate the op envelope shape before touching the store (RX-04). */
@@ -71,7 +110,7 @@ export function validateReplicaOp(body: unknown): { ok: true; op: ReplicaOp } | 
   switch (op) {
     case 'set': {
       const pair = (body as { pair?: unknown }).pair as StoredPair | undefined;
-      if (!pair || typeof pair !== 'object' || !isValidPairId((pair as StoredPair).id)) {
+      if (!isValidStoredPair(pair)) {
         return { ok: false, error: 'invalid_set' };
       }
       return { ok: true, op: { op: 'set', pair } };
@@ -88,7 +127,7 @@ export function validateReplicaOp(body: unknown): { ok: true; op: ReplicaOp } | 
       if (typeof token !== 'string' || token.length === 0 || token.length > MAX_TOKEN_LEN) {
         return { ok: false, error: 'invalid_pending_token' };
       }
-      if (!registration || typeof registration !== 'object') {
+      if (!isValidRegistration(registration)) {
         return { ok: false, error: 'invalid_pending_registration' };
       }
       if (typeof requestedAt !== 'number' || !Number.isFinite(requestedAt)) {
@@ -131,15 +170,35 @@ export async function handleReplicaIngest(
   store: PairStore,
   headers: Record<string, string | string[] | undefined>,
   body: unknown,
-  expectedToken: string,
+  expectedKey: string,
+  expectedSourceId: string,
+  applyGuard: ReplicaApplyGuard,
+  nowMs = Date.now(),
 ): Promise<{ status: number; result: ReplicaApplyResult }> {
-  if (!authorizeReplica(headers, expectedToken)) {
+  const envelopeResult = validateReplicaEnvelope(body, expectedSourceId, nowMs);
+  if (!envelopeResult.ok) {
+    return { status: 400, result: { ok: false, error: envelopeResult.error } };
+  }
+  const envelope = envelopeResult.envelope;
+  if (!authorizeReplica(headers, envelope, expectedKey)) {
     return { status: 401, result: { ok: false, error: 'unauthorized' } };
   }
-  const validated = validateReplicaOp(body);
+  const validated = validateReplicaOp(envelope.op);
   if (!validated.ok) {
     return { status: 400, result: { ok: false, error: validated.error } };
   }
-  const result = await applyReplicaOp(store, validated.op);
-  return { status: result.ok ? 200 : 500, result };
+  let applyResult: ReplicaApplyResult = { ok: false, error: 'apply_failed' };
+  const disposition = await applyGuard.applyIfNext(
+    envelope.sourceId,
+    envelope.sequence,
+    replicaOperationDigest(validated.op),
+    async () => {
+      applyResult = await applyReplicaOp(store, validated.op);
+      return applyResult.ok;
+    },
+  );
+  if (disposition === 'applied') return { status: 200, result: { ok: true } };
+  if (disposition === 'duplicate') return { status: 200, result: { ok: true, error: 'duplicate_ignored' } };
+  if (disposition === 'apply_failed') return { status: 500, result: applyResult };
+  return { status: 409, result: { ok: false, error: `replica_sequence_${disposition}` } };
 }

@@ -21,11 +21,16 @@ import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from bpc_client.crypto import (
     generate_keypair,
     compute_body_hash,
+    derive_secret_key,
     derive_secret_hmac,
+    validate_secret,
     sign_request,
     _b64url,
 )
@@ -107,14 +112,14 @@ class TestBodyHash:
         h = compute_body_hash(None)
         assert h.startswith("sha256:")
         # SHA-256 of empty string
-        expected = "sha256:" + _b64url(hashlib.sha256(b"").digest())[:32]
+        expected = "sha256:" + _b64url(hashlib.sha256(b"").digest())
         assert h == expected
 
     def test_body_hash_with_content(self):
         body = b'{"key":"value"}'
         h = compute_body_hash(body)
         assert h.startswith("sha256:")
-        expected = "sha256:" + _b64url(hashlib.sha256(body).digest())[:32]
+        expected = "sha256:" + _b64url(hashlib.sha256(body).digest())
         assert h == expected
 
     def test_different_bodies_produce_different_hashes(self):
@@ -146,9 +151,17 @@ class TestHMACDerivation:
         nonce = "test-nonce-123"
         ts = 1700000000000
         message = (nonce + str(ts)).encode()
-        expected = _b64url(hmac.new(secret.encode(), message, hashlib.sha256).digest())
+        derived = base64.urlsafe_b64decode(derive_secret_key(secret) + "=")
+        expected = _b64url(hmac.new(derived, message, hashlib.sha256).digest())
         result = derive_secret_hmac(secret, nonce, ts)
         assert result == expected
+
+    def test_registration_secret_policy_rejects_weak_values(self):
+        with pytest.raises(ValueError):
+            validate_secret("weak")
+
+    def test_registration_secret_policy_accepts_reference_value(self):
+        validate_secret("ValidRegistration1!@")
 
 
 class TestRequestSigning:
@@ -222,7 +235,15 @@ class TestRequestSigning:
 
         # Verify with public key — should not raise
         public_key = self.kp["private_key"].public_key()
-        public_key.verify(sig_bytes, canonical_bytes, ECDSA(SHA256()))
+        assert len(sig_bytes) == 64
+        public_key.verify(
+            encode_dss_signature(
+                int.from_bytes(sig_bytes[:32], "big"),
+                int.from_bytes(sig_bytes[32:], "big"),
+            ),
+            canonical_bytes,
+            ECDSA(SHA256()),
+        )
 
     def test_each_request_has_unique_nonce(self):
         h1 = sign_request(self.private_key, "pair_abc", "MySecret1!", "GET", "/api/data")
@@ -315,6 +336,80 @@ class TestBPCClientConstruction:
             call_kwargs = mock_req.call_args
             headers = call_kwargs[1]["headers"]
             assert headers.get("Content-Type") == "application/json"
+
+    def test_registration_sends_derived_key_not_plaintext_secret(self):
+        response = MagicMock()
+        response.status_code = 201
+        response.json.return_value = {"pairId": "pair_registered"}
+        secret = "ValidRegistration1!@"
+        with patch("bpc_client.client.httpx.post", return_value=response) as post:
+            client = BPCClient.register(
+                "https://api.example.com", "registered", secret, save=False,
+            )
+        payload = post.call_args.kwargs["json"]
+        assert client.pair_id == "pair_registered"
+        assert "secret" not in payload
+        assert payload["secretHash"] == derive_secret_key(secret)
+
+    def test_rotation_uses_old_key_to_bind_new_key_and_pair_id(self):
+        pair = self._make_pair()
+        client = BPCClient(pair)
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"newPairId": "pair_rotated_002"}
+
+        with patch.object(client._http, "post", return_value=response) as post, \
+             patch.object(client, "_save_pair"):
+            rotated = client.rotate()
+
+        request = post.call_args.kwargs["json"]
+        canonical = base64.urlsafe_b64decode(
+            request["signedData"] + "=" * ((4 - len(request["signedData"]) % 4) % 4)
+        )
+        signature_bytes = base64.urlsafe_b64decode(
+            request["signature"] + "=" * ((4 - len(request["signature"]) % 4) % 4)
+        )
+        pair._private_key.public_key().verify(
+            encode_dss_signature(
+                int.from_bytes(signature_bytes[:32], "big"),
+                int.from_bytes(signature_bytes[32:], "big"),
+            ),
+            canonical,
+            ECDSA(SHA256()),
+        )
+        payload = json.loads(canonical)
+        assert payload["old_pair_id"] == pair.pair_id
+        assert payload["purpose"] == "rotation"
+        assert json.loads(payload["new_pub_jwk_json"]) == request["newPubJwk"]
+        assert rotated.pair_id == "pair_rotated_002"
+        assert rotated._pair.secret == pair.secret
+
+    def test_corrupt_saved_pair_file_fails_closed(self, tmp_path, monkeypatch):
+        pair_file = tmp_path / "pairs.json"
+        pair_file.write_text("{not-json")
+        monkeypatch.setattr(BPCClient, "PAIRS_FILE", pair_file)
+        with pytest.raises(BPCError) as exc:
+            BPCClient._load_pairs_file()
+        assert exc.value.code == "pair_store_corrupt"
+
+    def test_revocation_requires_admin_credential(self, monkeypatch):
+        monkeypatch.delenv("BPC_ADMIN_TOKEN", raising=False)
+        client = BPCClient(self._make_pair())
+        with pytest.raises(BPCError) as exc:
+            client.revoke()
+        assert exc.value.code == "admin_auth_required"
+
+    def test_revocation_sends_admin_credential_and_removes_local_pair(self):
+        client = BPCClient(self._make_pair())
+        response = MagicMock()
+        response.status_code = 200
+        with patch.object(client._http, "post", return_value=response) as post, \
+             patch.object(client, "_load_pairs_file", return_value={client.pair_name: {}}), \
+             patch.object(client, "_write_pairs_file") as write:
+            client.revoke(admin_token="admin-test-token")
+        assert post.call_args.kwargs["headers"]["Authorization"] == "Bearer admin-test-token"
+        assert post.call_args.kwargs["json"] == {"pairId": client.pair_id}
+        write.assert_called_once_with({})
 
 
 # ── MCP tool tests ────────────────────────────────────────────────────────────

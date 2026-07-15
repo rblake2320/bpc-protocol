@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "bpc-client"
 version = "1.0.0"
-description = "Python client SDK for the BPC (Bound Pair Credentials) request-signing protocol — device-bound cryptographic identity for APIs"
+description = "Python client SDK for the BPC (Bound Pair Credentials) pair-authorized request-signing protocol"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "SelfConnect", email = "hello@selfconnect.ai" }]
@@ -43,3 +43,6 @@ Documentation = "https://github.com/rblake2320/bpc-protocol/tree/main/packages/b
 
 [tool.hatch.build.targets.wheel]
 packages = ["bpc_client"]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"

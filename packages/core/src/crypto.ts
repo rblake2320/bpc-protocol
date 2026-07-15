@@ -29,7 +29,17 @@ export async function generateKeypair(options: KeyGenerationCaptureOptions = {})
 }
 
 export async function computeFingerprint(jwk: JsonWebKey): Promise<string> {
-  const data = new TextEncoder().encode(JSON.stringify(jwk));
+  if (jwk.kty !== 'EC' || jwk.crv !== 'P-256' || !jwk.x || !jwk.y) {
+    throw new TypeError('BPC fingerprint requires an EC P-256 public JWK');
+  }
+  // Required-member canonicalization ignores runtime-added metadata such as
+  // ext/key_ops so Python and WebCrypto produce the same fingerprint.
+  const data = new TextEncoder().encode(JSON.stringify({
+    crv: jwk.crv,
+    kty: jwk.kty,
+    x: jwk.x,
+    y: jwk.y,
+  }));
   const hash = await crypto.subtle.digest('SHA-256', data);
   return b64url(hash).substring(0, 20);
 }

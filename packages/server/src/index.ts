@@ -25,6 +25,9 @@ export type {
 } from './agent-cache.js';
 export type {
   AuthorizationContext,
+  AuthorizationContextResolver,
+  AuthorizationResolutionInput,
+  BindSessionInput,
   PrincipalChainVerifyResult,
   PrincipalCheckpoint,
   PrincipalEventType,
@@ -70,6 +73,23 @@ export {
   authorizeReplica, validateReplicaOp, applyReplicaOp, handleReplicaIngest,
 } from './replica-receiver.js';
 export type { ReplicaApplyResult } from './replica-receiver.js';
+export {
+  DEFAULT_REPLICA_FRESHNESS_MS,
+  MemoryReplicaApplyGuard,
+  MemoryReplicaSequenceSource,
+  REPLICA_ENVELOPE_VERSION,
+  canonicalReplicaEnvelope,
+  replicaOperationDigest,
+  signReplicaEnvelope,
+  validateReplicaEnvelope,
+  verifyReplicaEnvelopeSignature,
+} from './replica-envelope.js';
+export type {
+  ReplicaApplyDisposition,
+  ReplicaApplyGuard,
+  ReplicaEnvelope,
+  ReplicaSequenceSource,
+} from './replica-envelope.js';
 export { PromotionController, assertWritable, handlePromotionCommand } from './promotion.js';
 export type { NodeRole, PromotionSnapshot, PromotionCommand } from './promotion.js';
 export { PgPairStore, PG_SCHEMA } from './pg-store.js';

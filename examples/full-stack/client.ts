@@ -2,7 +2,7 @@ import { BPCClient, prepareRegistration } from '../../packages/client-sdk/src/in
 import { generateNonce, generateId, BPC_PROTOCOL_VERSION, generateKeypair } from '../../packages/core/src/index.ts';
 
 const SERVER = 'http://localhost:3100';
-const SECRET = 'demo-secret-' + Date.now();
+const SECRET = 'Demo-secret-' + Date.now() + '!@';
 const DEVICE_NAME = 'e2e-test-client';
 
 function label(name: string, ok: boolean, detail?: string): void {
@@ -110,7 +110,10 @@ async function main(): Promise<void> {
   console.log('\n7. Testing revocation...');
   const revokeRes = await fetch(`${SERVER}/bpc/revoke`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env['BPC_ADMIN_TOKEN'] ?? 'change-me-in-production-use-32-random-bytes'}`,
+    },
     body: JSON.stringify({ pairId: regBody.pairId }),
   });
   const revokeBody = await revokeRes.json() as Record<string, unknown>;

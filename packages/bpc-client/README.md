@@ -1,8 +1,8 @@
 # bpc-client
 
-Python client SDK for the **BPC (Bound Pair Credentials)** protocol — cryptographic device-binding and per-request signing for APIs.
+Python client SDK for the **BPC (Bound Pair Credentials)** pair-key request protocol.
 
-BPC replaces static API keys with a multi-factor, per-request signing protocol. Every request is signed with an ECDSA P-256 device key, a user-chosen secret (HMAC-derived), a fresh nonce, and a timestamp. Stolen credentials are useless without the device key.
+BPC combines an ECDSA P-256 pair key, a secret-derived request HMAC, a fresh nonce, and a timestamp. This software client exports its private key for local persistence; it does not provide hardware binding or attestation.
 
 ## Install
 
@@ -16,7 +16,7 @@ pip install bpc-client
 from bpc_client import BPCClient
 
 # Register a new pair (development mode — auto-approved)
-client = BPCClient.register(base_url="https://api.example.com", name="my-app", secret="MySecret1!")
+client = BPCClient.register(base_url="https://api.example.com", name="my-app", secret="ValidPairSecret1!@")
 
 # Every request is automatically signed
 response = client.get("/api/data")
@@ -26,7 +26,7 @@ response = client.post("/api/items", json={"name": "test"})
 ## CLI
 
 ```bash
-bpc pair register --url https://api.example.com --name my-app --secret MySecret1!
+bpc pair register --url https://api.example.com --name my-app --secret ValidPairSecret1!@
 bpc pair list
 bpc status --name my-app
 bpc audit --name my-app
@@ -46,6 +46,6 @@ bpc request GET /api/data --name my-app
 ## Protocol
 
 BPC implements a 12-step server-side verification pipeline:
-device key (ECDSA P-256) + secret (HMAC-SHA-256) + nonce (UUID) + timestamp (60s window) + body hash (SHA-256) + scope enforcement.
+pair key (ECDSA P-256) + HKDF-derived HMAC verifier + nonce (UUID) + timestamp window + body hash (SHA-256) + closed coarse scope.
 
 See the [full spec](https://github.com/rblake2320/bpc-protocol/blob/main/spec/bpc-spec-v1.md).

@@ -16,6 +16,11 @@
  *     last_active BIGINT,
  *     requests INT NOT NULL DEFAULT 0,
  *     failed_sigs INT NOT NULL DEFAULT 0,
+ *     cumulative_failures DOUBLE PRECISION,
+ *     first_failure_at BIGINT,
+ *     max_requests BIGINT,
+ *     kind TEXT NOT NULL DEFAULT 'legitimate',
+ *     canary_class TEXT,
  *     expires_at BIGINT
  *   );
  *
@@ -46,6 +51,17 @@ function rowToStoredPair(row: Record<string, unknown>): StoredPair {
     lastActive: row['last_active'] != null ? Number(row['last_active']) : null,
     requests: Number(row['requests']),
     failedSigs: Number(row['failed_sigs']),
+    cumulativeFailures: row['cumulative_failures'] != null
+      ? Number(row['cumulative_failures'])
+      : undefined,
+    firstFailureAt: row['first_failure_at'] != null
+      ? Number(row['first_failure_at'])
+      : null,
+    maxRequests: row['max_requests'] != null ? Number(row['max_requests']) : undefined,
+    kind: row['kind'] != null ? row['kind'] as StoredPair['kind'] : 'legitimate',
+    canaryClass: row['canary_class'] != null
+      ? row['canary_class'] as StoredPair['canaryClass']
+      : undefined,
     expiresAt: row['expires_at'] != null ? Number(row['expires_at']) : undefined,
   };
 }
@@ -60,14 +76,23 @@ export class PgPairStore implements PairStore {
 
   async set(pair: StoredPair): Promise<void> {
     await this.pool.query(
-      `INSERT INTO bpc_pairs (id, name, scope, mode, secret_hash, pub_jwk, status, created, last_active, requests, failed_sigs, expires_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      `INSERT INTO bpc_pairs (
+         id, name, scope, mode, secret_hash, pub_jwk, status, created,
+         last_active, requests, failed_sigs, cumulative_failures,
+         first_failure_at, max_requests, kind, canary_class, expires_at
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
        ON CONFLICT (id) DO UPDATE SET
          name=$2, scope=$3, mode=$4, secret_hash=$5, pub_jwk=$6, status=$7,
-         last_active=$9, requests=$10, failed_sigs=$11, expires_at=$12`,
+         last_active=$9, requests=$10, failed_sigs=$11,
+         cumulative_failures=$12, first_failure_at=$13, max_requests=$14,
+         kind=$15, canary_class=$16, expires_at=$17`,
       [pair.id, pair.name, pair.scope, pair.mode, pair.secretHash,
        JSON.stringify(pair.pubJwk), pair.status, pair.created,
-       pair.lastActive, pair.requests, pair.failedSigs, pair.expiresAt ?? null]
+       pair.lastActive, pair.requests, pair.failedSigs,
+       pair.cumulativeFailures ?? null, pair.firstFailureAt ?? null,
+       pair.maxRequests ?? null, pair.kind ?? 'legitimate',
+       pair.canaryClass ?? null, pair.expiresAt ?? null]
     );
   }
 
@@ -89,7 +114,9 @@ export class PgPairStore implements PairStore {
 
   async setPending(token: string, registration: PairRegistration, requestedAt: number): Promise<void> {
     await this.pool.query(
-      'INSERT INTO bpc_pending (token, registration, requested_at) VALUES ($1,$2,$3) ON CONFLICT (token) DO UPDATE SET registration=$2',
+      `INSERT INTO bpc_pending (token, registration, requested_at)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (token) DO UPDATE SET registration=$2, requested_at=$3`,
       [token, JSON.stringify(registration), requestedAt]
     );
   }
@@ -121,8 +148,19 @@ CREATE TABLE IF NOT EXISTS bpc_pairs (
   last_active BIGINT,
   requests INT NOT NULL DEFAULT 0,
   failed_sigs INT NOT NULL DEFAULT 0,
+  cumulative_failures DOUBLE PRECISION,
+  first_failure_at BIGINT,
+  max_requests BIGINT,
+  kind TEXT NOT NULL DEFAULT 'legitimate',
+  canary_class TEXT,
   expires_at BIGINT
 );
+
+ALTER TABLE bpc_pairs ADD COLUMN IF NOT EXISTS cumulative_failures DOUBLE PRECISION;
+ALTER TABLE bpc_pairs ADD COLUMN IF NOT EXISTS first_failure_at BIGINT;
+ALTER TABLE bpc_pairs ADD COLUMN IF NOT EXISTS max_requests BIGINT;
+ALTER TABLE bpc_pairs ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'legitimate';
+ALTER TABLE bpc_pairs ADD COLUMN IF NOT EXISTS canary_class TEXT;
 
 CREATE TABLE IF NOT EXISTS bpc_pending (
   token TEXT PRIMARY KEY,

@@ -232,6 +232,23 @@ describe('@bpc/server — verifyBPCRequest', () => {
     expect(result.error).toBe('invalid_signature');
   });
 
+  it('does not consume a legitimate nonce when the signature is invalid', async () => {
+    const { signedData, signature, bodyHash } = await buildSignedRequest(
+      keypair.privateKey, pairId, 'GET', '/api/data', secretHash,
+    );
+    const forged = signature.slice(0, -2) + (signature.endsWith('AA') ? 'BB' : 'AA');
+
+    const rejected = await verifyBPCRequest(makeReqData({
+      pairId, signedData, signature: forged, method: 'GET', path: '/api/data', bodyHash,
+    }), registry, nonceStore, anomaly, { enableShadowMode: false, enableTarpit: false, sigWindowMs: 60_000 });
+    expect(rejected.error).toBe('invalid_signature');
+
+    const accepted = await verifyBPCRequest(makeReqData({
+      pairId, signedData, signature, method: 'GET', path: '/api/data', bodyHash,
+    }), registry, nonceStore, anomaly, { enableShadowMode: false, enableTarpit: false, sigWindowMs: 60_000 });
+    expect(accepted.ok).toBe(true);
+  });
+
   it('should reject a request with missing headers', async () => {
     const req = makeReqData({
       pairId: null,
@@ -283,6 +300,40 @@ describe('@bpc/server — verifyBPCRequest', () => {
     const result = await verifyBPCRequest(req, registry, nonceStore, anomaly);
     expect(result.ok).toBe(false);
     expect(result.error).toBe('invalid_body_hash');
+  });
+
+  it('rejects a signed payload whose pair ID differs from the authenticated header pair', async () => {
+    const { signedData, signature, bodyHash } = await buildSignedRequest(
+      keypair.privateKey, 'pair_other_identity', 'GET', '/api/data', secretHash,
+    );
+
+    const result = await verifyBPCRequest(makeReqData({
+      pairId,
+      signedData,
+      signature,
+      method: 'GET',
+      path: '/api/data',
+      bodyHash,
+    }), registry, nonceStore, anomaly);
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('pair_id_mismatch');
+  });
+
+  it('rejects a request when the transport does not provide the actual body hash', async () => {
+    const { signedData, signature } = await buildSignedRequest(
+      keypair.privateKey, pairId, 'GET', '/api/data', secretHash,
+    );
+
+    const result = await verifyBPCRequest(makeReqData({
+      pairId,
+      signedData,
+      signature,
+      method: 'GET',
+      path: '/api/data',
+      bodyHash: null,
+    }), registry, nonceStore, anomaly);
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('missing_body_hash');
   });
 
   it('should reject DELETE on a read-only scoped pair', async () => {
@@ -338,8 +389,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
     const pair = await registry.get(pairId);
     expect(pair?.status).toBe('locked');
 
-    // Next request: Shadow Mode is enabled by default, so a locked pair returns
-    // ok:true with shadow:true instead of pair_locked — attacker is deceived.
+    // Shadow metadata never converts a locked credential into an authorization success.
     const { signedData, signature, bodyHash } = await buildSignedRequest(
       keypair.privateKey, pairId, 'GET', '/api/data', secretHash,
     );
@@ -352,7 +402,8 @@ describe('@bpc/server — verifyBPCRequest', () => {
       bodyHash,
     });
     const result = await verifyBPCRequest(req, registry, nonceStore, anomaly);
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('pair_locked');
     expect(result.shadow).toBe(true);
 
     // With Shadow Mode explicitly disabled, the raw pair_locked error is returned.
@@ -561,7 +612,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
     expect(result.ok).toBe(false);
     expect(result.error).toBe('pair_locked');
 
-    // ── Assertion 2: Shadow Mode ON → deceptive ok:true + shadow:true ─────────
+    // ── Assertion 2: Shadow Mode ON remains a hard denial ────────────────────
     // Use a completely separate fresh pair so the first call's side-effects
     // (recordActivity overwriting failedSigs) do not contaminate this assertion.
     const store2 = new MemoryPairStore();
@@ -576,7 +627,8 @@ describe('@bpc/server — verifyBPCRequest', () => {
     const { signedData: sd2, signature: sig2 } = await buildSignedRequest(kp2.privateKey, raceId2, 'GET', '/api/data', sh2);
     const req2 = makeReqData({ pairId: raceId2, signedData: sd2, signature: sig2, method: 'GET', path: '/api/data' });
     const result2 = await verifyBPCRequest(req2, registry2, nonceStore2, anomaly2, { sigWindowMs: 60_000, lockoutCount: 10, enableShadowMode: true });
-    expect(result2.ok).toBe(true);
+    expect(result2.ok).toBe(false);
+    expect(result2.error).toBe('pair_locked');
     expect(result2.shadow).toBe(true);
   });
 });

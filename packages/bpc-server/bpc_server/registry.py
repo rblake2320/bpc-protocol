@@ -17,7 +17,7 @@ class PairRecord:
     scope: str          # "read" | "read-write" | "admin"
     mode: str           # "development" | "production"
     public_key_jwk: dict
-    secret_hash: str    # Argon2id hash of the user secret
+    secret_hash: str    # Base64url HKDF-derived request HMAC key (not a password hash)
     status: str = "active"  # "active" | "revoked" | "pending"
     created_at: float = field(default_factory=time.time)
     expires_at: Optional[float] = None

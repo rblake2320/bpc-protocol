@@ -1,9 +1,9 @@
 /**
  * BPC Secret Hashing and Validation
  *
- * IL4-7 hardening:
- *  - Argon2id parameters increased to NIST SP 800-63B / OWASP Level 2 for
- *    IL4-7 environments: 128 MiB memory, 4 iterations, 4 parallelism.
+ * Password-storage helper hardening:
+ *  - Argon2id parameters use 128 MiB memory, 4 iterations, and 4-way
+ *    parallelism as a project policy.
  *  - MIN_SECRET_LENGTH increased from 8 to 16 characters.
  *  - MAX_SECRET_LENGTH increased from 64 to 128 characters.
  *  - Password policy strengthened: minimum 2 special characters.
@@ -18,12 +18,11 @@ export const MIN_SECRET_LENGTH = 16;
 export const MAX_SECRET_LENGTH = 128;
 
 /**
- * Argon2id parameters for IL4-7 environments.
- * Exceeds OWASP minimum (64 MiB / t=3) and aligns with NIST SP 800-63B Level 2.
+ * Argon2id parameters for the optional password-storage helper.
  */
 const ARGON2_OPTIONS = {
   type:        argon2.argon2id,
-  memoryCost:  131072,  // 128 MiB (IL4-7 level)
+  memoryCost:  131072,  // 128 MiB project policy
   timeCost:    4,       // 4 iterations
   parallelism: 4,
 } as const;
@@ -55,7 +54,7 @@ export function validateSecret(secret: string): { valid: boolean; reason?: strin
   if (!/[A-Z]/.test(secret)) return { valid: false, reason: 'Secret must contain at least one uppercase letter' };
   if (!/[a-z]/.test(secret)) return { valid: false, reason: 'Secret must contain at least one lowercase letter' };
   if (!/[0-9]/.test(secret)) return { valid: false, reason: 'Secret must contain at least one digit' };
-  // IL4-7: require at least 2 special characters for stronger entropy.
+  // Project policy: require at least 2 special characters.
   const specialCount = (secret.match(/[^A-Za-z0-9]/g) ?? []).length;
   if (specialCount < 2) return { valid: false, reason: 'Secret must contain at least two special characters' };
   return { valid: true };

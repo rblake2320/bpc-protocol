@@ -4,6 +4,8 @@ import {
   buildPrincipalSessionProofPayload,
   createBPCServer,
   MemoryPrincipalSessionLedger,
+  MemoryNonceBackend,
+  ServerNonceStore,
   sealPrincipalCache,
   verifyFallbackAuthorization,
   type BindSessionInput,
@@ -20,13 +22,18 @@ async function bindingInput(
   const providerSessionId = overrides.providerSessionId ?? 'abc-123';
   const agentInstanceId = overrides.agentInstanceId ?? `${provider}:${providerSessionId}`;
   const policyDigest = overrides.policyDigest ?? 'policy:v1:test';
-  const challengeNonce = overrides.proof?.challengeNonce ?? 'nonce-1234567890abcdef';
+  const authorizationContext = overrides.authorizationContext ?? {};
+  const runtimeMetadata = overrides.runtimeMetadata ?? {};
+  const challengeNonce = overrides.proof?.challengeNonce ??
+    `nonce-${provider}-${providerSessionId}-1234567890abcdef`;
   const payload = buildPrincipalSessionProofPayload({
     keyFingerprint,
     provider,
     providerSessionId,
     agentInstanceId,
     policyDigest,
+    authorizationContext,
+    runtimeMetadata,
     challengeNonce,
     signedAt,
   });
@@ -48,7 +55,7 @@ async function bindingInput(
 
 describe('principal session ledger', () => {
   it('requires a fresh signed proof before binding a provider session', async () => {
-    const ledger = new MemoryPrincipalSessionLedger();
+    const ledger = new MemoryPrincipalSessionLedger(({ requested }) => requested);
     const input = await bindingInput({
       authorizationContext: { role: 'mesh-agent', scope: 'admin' },
       runtimeMetadata: { tool: 'codex', model: 'gpt-5.5' },
@@ -64,6 +71,37 @@ describe('principal session ledger', () => {
       valid: true,
       principalId: binding.principalId,
     });
+  });
+
+  it('does not grant caller-requested authorization without a server resolver', async () => {
+    const ledger = new MemoryPrincipalSessionLedger();
+    const binding = await ledger.bindSession(await bindingInput({
+      authorizationContext: { role: 'mesh-agent', scope: 'admin' },
+    }));
+    expect(binding.authorizationContext).toEqual({});
+  });
+
+  it('rejects authorization or runtime metadata changed after signing', async () => {
+    const ledger = new MemoryPrincipalSessionLedger(({ requested }) => requested);
+    const input = await bindingInput({
+      authorizationContext: { role: 'worker', scope: 'read' },
+      runtimeMetadata: { tool: 'codex', model: 'model-a' },
+    });
+    await expect(ledger.bindSession({
+      ...input,
+      authorizationContext: { role: 'worker', scope: 'admin' },
+    })).rejects.toThrow('invalid');
+    await expect(ledger.bindSession({
+      ...input,
+      runtimeMetadata: { tool: 'codex', model: 'model-b' },
+    })).rejects.toThrow('invalid');
+  });
+
+  it('rejects replay of an already accepted signed proof', async () => {
+    const ledger = new MemoryPrincipalSessionLedger();
+    const input = await bindingInput();
+    await ledger.bindSession(input);
+    await expect(ledger.bindSession(input)).rejects.toThrow('replayed');
   });
 
   it('fails closed on a stale or invalid session proof', async () => {
@@ -140,6 +178,7 @@ describe('principal session ledger', () => {
     const binding = await ledger.bindSession(await bindingInput());
     const now = Date.now();
     const sealKey = 'local-seal-key';
+    const nonceStore = new ServerNonceStore(new MemoryNonceBackend(), 60_000);
     const cache = sealPrincipalCache({
       source: 'sealed_cache',
       principalId: binding.principalId,
@@ -150,44 +189,59 @@ describe('principal session ledger', () => {
       sealKey,
     });
 
-    expect(verifyFallbackAuthorization({
+    expect((await verifyFallbackAuthorization({
       cache,
       sealKey,
       requestedPolicyDigest: binding.policyDigest,
       expectedCheckpointHash: binding.checkpointHash,
       challengeNonce: 'nonce-1234567890abcdef',
       proofVerified: true,
+      nonceStore,
       nowMs: now,
-    }).ok).toBe(true);
+    })).ok).toBe(true);
 
-    expect(verifyFallbackAuthorization({
+    expect((await verifyFallbackAuthorization({
       cache: { ...cache, policyDigest: 'tampered' },
       sealKey,
       requestedPolicyDigest: binding.policyDigest,
       expectedCheckpointHash: binding.checkpointHash,
       challengeNonce: 'nonce-1234567890abcdef',
       proofVerified: true,
+      nonceStore,
       nowMs: now,
-    }).error).toBe('cache_seal_invalid');
+    })).error).toBe('cache_seal_invalid');
 
-    expect(verifyFallbackAuthorization({
+    expect((await verifyFallbackAuthorization({
       cache,
       sealKey,
       requestedPolicyDigest: 'policy:other',
       expectedCheckpointHash: binding.checkpointHash,
       challengeNonce: 'nonce-1234567890abcdef',
       proofVerified: true,
+      nonceStore,
       nowMs: now,
-    }).error).toBe('policy_mismatch');
+    })).error).toBe('policy_mismatch');
 
-    expect(verifyFallbackAuthorization({
+    expect((await verifyFallbackAuthorization({
       cache,
       sealKey,
       requestedPolicyDigest: binding.policyDigest,
       expectedCheckpointHash: binding.checkpointHash,
       challengeNonce: 'nonce-1234567890abcdef',
       proofVerified: false,
+      nonceStore,
       nowMs: now,
-    }).error).toBe('fresh_proof_required');
+    })).error).toBe('fresh_proof_required');
+
+    expect((await verifyFallbackAuthorization({
+      cache,
+      sealKey,
+      requestedPolicyDigest: binding.policyDigest,
+      expectedCheckpointHash: binding.checkpointHash,
+      challengeNonce: 'nonce-1234567890abcdef',
+      proofVerified: true,
+      nonceStore,
+      nowMs: now,
+    })).error).toBe('nonce_replay');
   });
 });

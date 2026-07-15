@@ -550,7 +550,7 @@ textarea { min-height: 80px; resize: vertical; }
     API Keys are <em>broken.</em><br>We built something better.
   </h1>
   <p class="hero-subtitle">
-    A new access protocol where credentials are device-bound, pair-verified, user-locked, and infeasible to use without all pieces present simultaneously.
+    A pair-authorized protocol combining signed requests, secret-derived authentication, freshness checks, and server lifecycle state.
   </p>
   <div class="hero-actions">
     <a href="#demo" class="btn btn-primary btn-lg">
@@ -574,13 +574,13 @@ textarea { min-height: 80px; resize: vertical; }
     <div style="text-align:center; margin-bottom: var(--space-12);">
       <div class="section-label">Why BPC</div>
       <h2 class="section-title">Eight interlocking security layers</h2>
-      <p class="section-subtitle" style="margin-inline:auto">BPC (Layers 1–5) + TSK (Layers 6–7) + Active Defense (Layer 8). Each layer is independent. Together they create a credential that cannot be meaningfully compromised by stealing any single piece.</p>
+      <p class="section-subtitle" style="margin-inline:auto">This interactive page demonstrates named request checks. It does not establish resistance to every attack or the assurance of a deployed system.</p>
     </div>
     <div class="features-grid">
       <div class="feature-card fade-in">
         <div class="feature-icon"><i data-lucide="cpu" style="width:20px;height:20px"></i></div>
-        <div class="feature-title">Device-Bound Keys</div>
-        <p class="feature-desc">Private keys generated via Web Crypto API with non-extractable flag, preventing JavaScript extraction. For hardware-level TPM/Secure Enclave binding, use platform attestation (WebAuthn) in production.</p>
+        <div class="feature-title">Non-Exportable Pair Keys</div>
+        <p class="feature-desc">Web Crypto can block ordinary JavaScript key export. This does not prove hardware backing, attestation, or physical-device identity.</p>
       </div>
       <div class="feature-card fade-in">
         <div class="feature-icon"><i data-lucide="link-2" style="width:20px;height:20px"></i></div>
@@ -590,7 +590,7 @@ textarea { min-height: 80px; resize: vertical; }
       <div class="feature-card fade-in">
         <div class="feature-icon"><i data-lucide="lock-keyhole" style="width:20px;height:20px"></i></div>
         <div class="feature-title">User-Chosen Secret</div>
-        <p class="feature-desc">A 16–128 character code chosen by the client (2+ special characters required), mixed into every cryptographic signature. Never stored in plain form, never logged, never sent in clear text. Stored server-side as Argon2id hash.</p>
+        <p class="feature-desc">A client secret is transformed into an HKDF-derived HMAC verifier. Client-side key and secret storage remain deployment responsibilities.</p>
       </div>
       <div class="feature-card fade-in">
         <div class="feature-icon"><i data-lucide="shield-check" style="width:20px;height:20px"></i></div>
@@ -920,7 +920,7 @@ textarea { min-height: 80px; resize: vertical; }
             <div class="card" style="padding:var(--space-4);border-left:3px solid #3dd68c">
               <div style="font-size:var(--text-xs);font-weight:700;color:#3dd68c;margin-bottom:var(--space-2)">HEALTHCARE · HIPAA</div>
               <div style="font-size:var(--text-sm);font-weight:600;margin-bottom:var(--space-1)">EHR APIs, medical device auth, health data exchange</div>
-              <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6;margin-bottom:var(--space-3)">Device-bound keys eliminate shared API credentials — the most common HIPAA §164.312(d) violation. Per-request ECDSA signatures create a non-repudiable audit trail for every PHI access. Audit log satisfies §164.312(b) Technical Safeguards out of the box.</div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6;margin-bottom:var(--space-3)">Pair authentication, request integrity, and audit events may provide candidate evidence in an assessed healthcare deployment. BPC alone does not establish HIPAA compliance.</div>
               <div style="display:flex;flex-wrap:wrap;gap:6px">
                 <span style="font-size:10px;font-family:var(--font-mono);padding:2px 6px;border-radius:4px;background:var(--color-surface-offset);color:var(--color-text-muted)">HIPAA §164.312(b)</span>
                 <span style="font-size:10px;font-family:var(--font-mono);padding:2px 6px;border-radius:4px;background:var(--color-surface-offset);color:var(--color-text-muted)">HIPAA §164.312(d)</span>
@@ -930,7 +930,7 @@ textarea { min-height: 80px; resize: vertical; }
             <div class="card" style="padding:var(--space-4);border-left:3px solid var(--color-primary)">
               <div style="font-size:var(--text-xs);font-weight:700;color:var(--color-primary);margin-bottom:var(--space-2)">FINTECH · PCI-DSS · SOC 2</div>
               <div style="font-size:var(--text-sm);font-weight:600;margin-bottom:var(--space-1)">Payment gateways, open banking, card-not-present fraud</div>
-              <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6;margin-bottom:var(--space-3)">Pair registry enforces PCI-DSS Req 8.2.2 (unique IDs per system). Nonce+timestamp satisfies Req 8.3.9 (replay protection). ECDSA signatures provide non-repudiation for payment API calls. Anomaly engine feeds real-time fraud signals.</div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6;margin-bottom:var(--space-3)">The pair registry, freshness checks, and audit events are candidate evidence only. They do not independently establish PCI DSS or SOC 2 conformity.</div>
               <div style="display:flex;flex-wrap:wrap;gap:6px">
                 <span style="font-size:10px;font-family:var(--font-mono);padding:2px 6px;border-radius:4px;background:var(--color-surface-offset);color:var(--color-text-muted)">PCI-DSS Req 8.2.2</span>
                 <span style="font-size:10px;font-family:var(--font-mono);padding:2px 6px;border-radius:4px;background:var(--color-surface-offset);color:var(--color-text-muted)">PCI-DSS Req 8.3.9</span>
@@ -938,19 +938,19 @@ textarea { min-height: 80px; resize: vertical; }
               </div>
             </div>
             <div class="card" style="padding:var(--space-4);border-left:3px solid var(--color-warning)">
-              <div style="font-size:var(--text-xs);font-weight:700;color:var(--color-warning);margin-bottom:var(--space-2)">GOVERNMENT · FEDRAMP IL4/5 · NIST 800-53</div>
-              <div style="font-size:var(--text-sm);font-weight:600;margin-bottom:var(--space-1)">Federal API gateways, contractor credentials, classified data access</div>
-              <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6;margin-bottom:var(--space-3)">Device-bound keypair maps to NIST IA-3 (device identification). Nonce satisfies IA-5(1)(f) (authenticator reuse prevention). Immutable audit log covers AU-2/AU-3/AU-9. TSK positional map never transmitted — SC-28 compliance by design.</div>
+              <div style="font-size:var(--text-xs);font-weight:700;color:var(--color-warning);margin-bottom:var(--space-2)">GOVERNMENT EVALUATION · NIST SP 800-53</div>
+              <div style="font-size:var(--text-sm);font-weight:600;margin-bottom:var(--space-1)">API gateways and contractor access-control evaluation</div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6;margin-bottom:var(--space-3)">Pair authentication, replay checks, rate limits, and audit events may map to candidate implementation evidence. A deployment still needs its own authorization boundary, assessment, cryptographic-module evidence, and approval.</div>
               <div style="display:flex;flex-wrap:wrap;gap:6px">
                 <span style="font-size:10px;font-family:var(--font-mono);padding:2px 6px;border-radius:4px;background:var(--color-surface-offset);color:var(--color-text-muted)">NIST IA-3</span>
                 <span style="font-size:10px;font-family:var(--font-mono);padding:2px 6px;border-radius:4px;background:var(--color-surface-offset);color:var(--color-text-muted)">NIST AU-2/AU-9</span>
-                <span style="font-size:10px;font-family:var(--font-mono);padding:2px 6px;border-radius:4px;background:var(--color-surface-offset);color:var(--color-text-muted)">FedRAMP IL4/5</span>
+                <span style="font-size:10px;font-family:var(--font-mono);padding:2px 6px;border-radius:4px;background:var(--color-surface-offset);color:var(--color-text-muted)">Preliminary mapping only</span>
               </div>
             </div>
             <div class="card" style="padding:var(--space-4);border-left:3px solid var(--color-text-muted)">
               <div style="font-size:var(--text-xs);font-weight:700;color:var(--color-text-muted);margin-bottom:var(--space-2)">ENTERPRISE SaaS · SOC 2 · ISO 27001</div>
               <div style="font-size:var(--text-sm);font-weight:600;margin-bottom:var(--space-1)">B2B API platforms, multi-tenant SaaS, developer API programs</div>
-              <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6;margin-bottom:var(--space-3)">Scope-gated pair registry satisfies SOC 2 CC6.2/CC6.3 (logical access controls + access management). Pair revocation with atomic rollback enables timely access termination. Anomaly engine feeds CC7.2 monitoring requirements.</div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6;margin-bottom:var(--space-3)">Scope gates, revocation, and anomaly events may support an enterprise control design. Independent assessment and deployment evidence remain required.</div>
               <div style="display:flex;flex-wrap:wrap;gap:6px">
                 <span style="font-size:10px;font-family:var(--font-mono);padding:2px 6px;border-radius:4px;background:var(--color-surface-offset);color:var(--color-text-muted)">SOC 2 CC6.2</span>
                 <span style="font-size:10px;font-family:var(--font-mono);padding:2px 6px;border-radius:4px;background:var(--color-surface-offset);color:var(--color-text-muted)">SOC 2 CC7.2</span>
@@ -1020,7 +1020,7 @@ textarea { min-height: 80px; resize: vertical; }
                 <div style="padding:var(--space-2) var(--space-3);border-radius:6px;background:var(--color-surface-offset);border:1px solid var(--color-border)">
                   <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-primary)">3 · User secret (HMAC factor)</div>
                   <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">Never transmitted. Client derives <code>HMAC(secret, nonce+timestamp)</code> per request. Server stores <code>HKDF-SHA256(secret)</code> hash only and recomputes to verify.</div>
-                  <div style="font-size:10px;color:var(--color-text-faint);margin-top:4px;font-family:var(--font-mono)">SERVER: StoredPair.secretHash (HKDF hash, 256-bit) &nbsp;|&nbsp; CLIENT: user memory / vault</div>
+                  <div style="font-size:10px;color:var(--color-text-faint);margin-top:4px;font-family:var(--font-mono)">SERVER: StoredPair.secretHash (HKDF-derived request key, 256-bit) &nbsp;|&nbsp; CLIENT: user memory / vault</div>
                 </div>
               </div>
             </div>
@@ -1208,7 +1208,7 @@ textarea { min-height: 80px; resize: vertical; }
               </div>
               <div style="display:flex;gap:var(--space-3)">
                 <span style="font-family:var(--font-mono);color:var(--color-primary);min-width:36px">v1.1</span>
-                <span>TSK Layers 6–8 added. IL4/5/6/7 hardening. 3-site demo. Patent pending.</span>
+                <span>Historical combined-protocol demonstration; no compliance or authorization status claimed.</span>
               </div>
             </div>
           </div>
@@ -1296,27 +1296,25 @@ textarea { min-height: 80px; resize: vertical; }
 <section id="security">
   <div class="container">
     <div class="section-label">Threat Model</div>
-    <h2 class="section-title">Defeats every known attack vector</h2>
-    <p class="section-subtitle">Analyzed against AI-assisted adversaries with unlimited time and resources.</p>
+    <h2 class="section-title">Named threat scenarios and explicit limits</h2>
+    <p class="section-subtitle">Each row describes a bounded expected result. Endpoint or verifier compromise remains out of scope.</p>
     <div class="app-grid">
       <div class="card">
         <div class="card-title" style="margin-bottom:var(--space-4)"><i data-lucide="swords" style="width:16px;height:16px;color:var(--color-error)"></i> &nbsp;Attack scenarios vs. BPC</div>
         <table class="attack-matrix">
           <thead><tr><th>Attack</th><th>Traditional Keys</th><th>BPC</th></tr></thead>
           <tbody>
-            <tr><td>Key leaked on GitHub</td><td class="cross">❌ Full compromise</td><td class="check">✓ Useless without device + secret</td></tr>
-            <tr><td>Stolen from logs/env</td><td class="cross">❌ Instant access</td><td class="check">✓ No device sig = denied</td></tr>
-            <tr><td>npm supply-chain attack <span class="badge badge-error" style="margin-left:4px">new</span></td><td class="cross">❌ Steals and uses key</td><td class="check">✓ Stolen key can't be used from attacker device</td></tr>
+            <tr><td>Pair ID leaked</td><td class="cross">Bearer value may grant access</td><td class="check">Pair ID alone does not satisfy signature and HMAC checks</td></tr>
+            <tr><td>Signing key unavailable</td><td class="cross">Bearer value may still work</td><td class="check">Request signature verification fails</td></tr>
+            <tr><td>Compromised client process</td><td class="cross">Credential may be stolen</td><td class="cross">May invoke the key and read client-held secrets</td></tr>
             <tr><td>Replay captured request</td><td class="cross">❌ Works indefinitely</td><td class="check">✓ Nonce seen, timestamp expired</td></tr>
             <tr><td>Brute-force pair ID</td><td>N/A</td><td class="check">✓ 128-bit random; box flags probing</td></tr>
             <tr><td>Compromise client device</td><td class="cross">❌ Total loss</td><td class="check">✓ Scope-limited; anomaly detection; fast revoke</td></tr>
-            <tr><td>Social engineer approval</td><td class="cross">❌ No defense</td><td class="check">✓ Out-of-band verify; dual approval option</td></tr>
+            <tr><td>Social engineer approval</td><td class="cross">No protocol defense</td><td class="cross">Requires an external approval policy</td></tr>
             <tr><td>Guess user secret</td><td>N/A</td><td class="check">✓ Rate-limited; opaque errors; secret mixed into sig</td></tr>
             <tr><td>DoS via lockout trigger</td><td>N/A</td><td class="check">✓ No hard lock; progressive friction; per-pair throttle</td></tr>
-            <tr><td>Man-in-the-middle</td><td class="cross">❌ Key captured</td><td class="check">✓ Sig tied to canonical payload; nonce prevents reuse</td></tr>
-            <tr><td>Steal TOTP segment alone</td><td>N/A</td><td class="check">✓ TSK Layer 6: single segment useless without the other two</td></tr>
-            <tr><td>Guess TSK segment order</td><td>N/A</td><td class="check">✓ Layer 7 structural secrecy: 1-in-6 odds, each guess logged</td></tr>
-            <tr><td>Use stolen/leaked credentials <span class="badge badge-error" style="margin-left:4px">honeypot</span></td><td class="cross">❌ Attacker gets access</td><td class="check">✓ Layer 8: Ghost pair returns deceptive ok:true — attacker in shadow mode, IP flagged, tarpit engaged</td></tr>
+            <tr><td>Man-in-the-middle</td><td class="cross">Bearer may be captured</td><td class="check">Signed binding limits modification/replay; TLS is still required</td></tr>
+            <tr><td>Ghost/canary credential</td><td>N/A</td><td class="check">Hard denied and recorded with shadow metadata</td></tr>
           </tbody>
         </table>
       </div>
@@ -1324,15 +1322,13 @@ textarea { min-height: 80px; resize: vertical; }
         <div class="card-title" style="margin-bottom:var(--space-4)"><i data-lucide="layers" style="width:16px;height:16px;color:var(--color-primary)"></i> &nbsp;What an attacker needs to succeed</div>
         <div class="flow">
           <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">1</div><div><div class="flow-step-title">The pair ID</div><div class="flow-step-desc">128-bit random, unguessable. Only the registered client knows it.</div></div></div>
-          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">2</div><div><div class="flow-step-title">The private key</div><div class="flow-step-desc">Non-extractable via Web Crypto API. Physical access to the device is required for key use.</div></div></div>
-          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">3</div><div><div class="flow-step-title">The user secret</div><div class="flow-step-desc">16–128 characters chosen by the human operator (2+ special characters required). Never stored in plain form anywhere. Hashed with Argon2id server-side.</div></div></div>
-          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">4</div><div><div class="flow-step-title">A fresh nonce window</div><div class="flow-step-desc">The request must be made within ±60 seconds. Replays are mathematically impossible.</div></div></div>
-          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">5</div><div><div class="flow-step-title">All three TSK segments simultaneously</div><div class="flow-step-desc">Static (monthly), TOTP (30-second window), and HOTP (event-counter) segments must all be valid at the same instant. Compromising any single segment leaves the other two blocking access.</div></div></div>
-          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">6</div><div><div class="flow-step-title">The correct segment order (server-only secret)</div><div class="flow-step-desc">The positional mapping of TSK segments changes every session and is never revealed to the client. Even with all three segments in hand, an attacker has a 1-in-6 chance per guess — and each wrong attempt is logged.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">2</div><div><div class="flow-step-title">The private key</div><div class="flow-step-desc">The caller must be able to invoke the registered pair key; non-exportability does not stop a compromised process from using it.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">3</div><div><div class="flow-step-title">The user secret</div><div class="flow-step-desc">The request must include the expected HMAC from the separately derived verifier.</div></div></div>
+          <div class="flow-step"><div class="flow-step-num" style="background:var(--color-error-bg);color:var(--color-error)">4</div><div><div class="flow-step-title">A fresh nonce window</div><div class="flow-step-desc">The request must be within ±60 seconds, and a retained nonce cannot be accepted twice.</div></div></div>
         </div>
         <div class="status-box info" style="margin-top:var(--space-4);margin-bottom:0">
           <div class="status-box-icon"><i data-lucide="info" style="width:16px;height:16px"></i></div>
-          <div class="status-box-body"><strong>All six must be present simultaneously.</strong> No single leak, theft, or intercept is sufficient. An attacker needs physical device access + the secret + all TSK segments + knowledge of a server-only session secret — making opportunistic attacks essentially impossible.</div>
+          <div class="status-box-body"><strong>Every configured check must pass.</strong> Security also depends on endpoint integrity, protected key/secret storage, shared nonce state, TLS, and application authorization.</div>
         </div>
       </div>
     </div>
@@ -1452,7 +1448,7 @@ trackEvent('session_start');
 // ── Backend ────────────────────────────────────────────────────────────
 const SERVER      = 'http://localhost:3100';
 const BPC_VERSION = '1.0';
-const ADMIN_TOKEN = 'demo-admin-token';
+const ADMIN_TOKEN = 'demo-admin-token-change-before-use-32';
 
 // ── State ──────────────────────────────────────────────────────────────
 const state = {
@@ -2074,7 +2070,7 @@ async function runAttack() {
       // Build a legitimately signed request but with a timestamp 91 seconds in the past
       const nonce     = crypto.randomUUID();
       const oldTs     = Date.now() - 91_000;
-      const secretHash = pair.secretHash; // use stored HKDF hash
+      const secretHash = pair.secretHash; // use stored HKDF-derived request key
       const secretHmac = await hmacDerive(secretHash, nonce + String(oldTs));
       const bodyHash   = 'sha256:' + b64url(await crypto.subtle.digest('SHA-256', new Uint8Array(0)));
       const payload    = { body_hash: bodyHash, method: 'GET', nonce, pair_id: targetId,
@@ -2258,6 +2254,19 @@ function updatePairRegistry() {
 async function revokePair(id) {
   const p = state.pairs.find(x => x.id === id);
   if (!p) return;
+  const response = await fetch(`${SERVER}/bpc/revoke`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${ADMIN_TOKEN}`,
+    },
+    body: JSON.stringify({ pairId: id }),
+  });
+  if (!response.ok) {
+    log('error', `Pair "${p.name}" revocation failed: HTTP ${response.status}`);
+    toast('error', 'Revocation Failed', `Server returned HTTP ${response.status}`);
+    return;
+  }
   p.status = 'revoked';
   state.pairs = state.pairs.filter(x => x.id !== id);
   state.health.pairs = state.pairs.length;

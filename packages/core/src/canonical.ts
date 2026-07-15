@@ -1,7 +1,7 @@
 /**
  * BPC Canonical Payload Serialization
  *
- * Security hardening (IL4-7 / BPC-05 fix + BPC-07 fix):
+ * Security hardening (BPC-05 and BPC-07 fixes):
  *  - Uses Object.create(null) so that assigning to the '__proto__' key creates
  *    an own property instead of mutating the prototype chain.
  *  - Explicitly rejects '__proto__', 'constructor', 'prototype', and all

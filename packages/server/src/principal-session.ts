@@ -1,12 +1,12 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import {
-  collectRuntimeMetadata,
   computeFingerprint,
   importPublicKeyFromJwk,
   sanitizeCaptureValue,
   verifyPayload,
 } from '@bpc/core';
 import type { AIRuntimeMetadata } from '@bpc/core';
+import type { ServerNonceStore } from './nonce-store.js';
 
 export const PRINCIPAL_GENESIS_HASH = '0'.repeat(64);
 export const PRINCIPAL_BINDING_PURPOSE = 'bpc.principal.session.bind.v1';
@@ -56,6 +56,8 @@ export interface PrincipalSessionProofPayload extends Record<string, unknown> {
   provider_session_id: string;
   agent_instance_id: string;
   policy_digest: string;
+  authorization_context_hash: string;
+  runtime_metadata_hash: string;
   challenge_nonce: string;
   signed_at: number;
 }
@@ -116,7 +118,7 @@ export interface SessionBinding {
   boundAt: number;
   policyDigest: string;
   authorizationContext: AuthorizationContext;
-  runtime: AIRuntimeMetadata;
+  runtime: Partial<AIRuntimeMetadata>;
   prevHash: string;
   bindingHash: string;
   checkpointHash: string;
@@ -161,6 +163,8 @@ export interface FallbackAuthorizationInput {
   expectedCheckpointHash: string;
   challengeNonce: string;
   proofVerified: boolean;
+  /** Atomic nonce backend. Production fallback must use durable shared storage. */
+  nonceStore: ServerNonceStore;
   nowMs?: number;
 }
 
@@ -186,19 +190,48 @@ export interface PrincipalSessionLedger {
   verifyPrincipalContinuity(principalId: string): Promise<PrincipalChainVerifyResult>;
 }
 
+export interface AuthorizationResolutionInput {
+  principalId: string;
+  keyFingerprint: string;
+  policyDigest: string;
+  requested: AuthorizationContext;
+}
+
+export type AuthorizationContextResolver = (
+  input: AuthorizationResolutionInput,
+) => AuthorizationContext | Promise<AuthorizationContext>;
+
 export class MemoryPrincipalSessionLedger implements PrincipalSessionLedger {
   private principals = new Map<string, PrincipalRecord>();
   private streams = new Map<string, PrincipalStreamRecord>();
   private events = new Map<string, PrincipalStreamEvent[]>();
   private checkpoints = new Map<string, PrincipalCheckpoint[]>();
+  private consumedProofNonces = new Set<string>();
+
+  constructor(
+    private readonly resolveAuthorizationContext: AuthorizationContextResolver = () => ({}),
+  ) {}
 
   async bindSession(input: BindSessionInput): Promise<SessionBinding> {
     assertBindingInput(input);
 
     const keyFingerprint = await computeFingerprint(input.publicKeyJwk);
     await verifyPrincipalSessionProof(input, keyFingerprint);
+    const proofNonceDigest = sha256hex(input.proof.challengeNonce);
+    if (this.consumedProofNonces.has(proofNonceDigest)) {
+      throw new Error('principal session proof replayed');
+    }
+    this.consumedProofNonces.add(proofNonceDigest);
 
-    const principal = await this.upsertPrincipal(input.publicKeyJwk, keyFingerprint, input.authorizationContext);
+    const principalId = principalIdFromFingerprint(keyFingerprint);
+    const authorizationContext = await this.resolveAuthorizationContext({
+      principalId,
+      keyFingerprint,
+      policyDigest: input.policyDigest,
+      requested: input.authorizationContext ?? {},
+    });
+
+    const principal = await this.upsertPrincipal(input.publicKeyJwk, keyFingerprint, authorizationContext);
     const agentInstanceId = input.agentInstanceId ?? `${input.provider}:${input.providerSessionId}`;
     const streamId = makeStreamId(principal.principalId, input.provider, agentInstanceId);
     const stream = this.upsertStream(principal, streamId, input.provider, agentInstanceId, input.providerSessionId);
@@ -209,11 +242,11 @@ export class MemoryPrincipalSessionLedger implements PrincipalSessionLedger {
     if (!principal.activeSessionIds.includes(input.providerSessionId)) {
       principal.activeSessionIds.push(input.providerSessionId);
     }
-    if (input.authorizationContext) {
-      principal.authorizationContext = { ...principal.authorizationContext, ...input.authorizationContext };
+    if (Object.keys(authorizationContext).length > 0) {
+      principal.authorizationContext = { ...principal.authorizationContext, ...authorizationContext };
     }
 
-    const runtime = collectRuntimeMetadata(input.runtimeMetadata ?? {});
+    const runtime = sanitizeCaptureValue(input.runtimeMetadata ?? {}) as Partial<AIRuntimeMetadata>;
     const proofDigest = sha256hex(canonicalJson(input.proof));
     const payload = {
       provider: input.provider,
@@ -508,7 +541,9 @@ export function sealPrincipalCache(input: SealPrincipalCacheInput): SealedPrinci
   return { ...cache, seal: computeCacheSeal(cache, input.sealKey) };
 }
 
-export function verifyFallbackAuthorization(input: FallbackAuthorizationInput): FallbackAuthorizationResult {
+export async function verifyFallbackAuthorization(
+  input: FallbackAuthorizationInput,
+): Promise<FallbackAuthorizationResult> {
   const now = input.nowMs ?? Date.now();
   const { seal: _seal, ...cacheBody } = input.cache;
   const expectedSeal = computeCacheSeal(cacheBody, input.sealKey);
@@ -521,6 +556,9 @@ export function verifyFallbackAuthorization(input: FallbackAuthorizationInput): 
   if (!input.proofVerified) return { ok: false, error: 'fresh_proof_required' };
   if (!input.challengeNonce || input.challengeNonce.length < 16) return { ok: false, error: 'nonce_too_short' };
   if (input.cache.consumedNonceDigests.includes(sha256hex(input.challengeNonce))) {
+    return { ok: false, error: 'nonce_replay' };
+  }
+  if (await input.nonceStore.checkAndConsume(input.challengeNonce)) {
     return { ok: false, error: 'nonce_replay' };
   }
 
@@ -548,6 +586,8 @@ export async function verifyPrincipalSessionProof(input: BindSessionInput, keyFi
     providerSessionId: input.providerSessionId,
     agentInstanceId: input.agentInstanceId ?? `${input.provider}:${input.providerSessionId}`,
     policyDigest: input.policyDigest,
+    authorizationContext: input.authorizationContext ?? {},
+    runtimeMetadata: input.runtimeMetadata ?? {},
     challengeNonce: input.proof.challengeNonce,
     signedAt: input.proof.signedAt,
   });
@@ -562,6 +602,8 @@ export function buildPrincipalSessionProofPayload(input: {
   providerSessionId: string;
   agentInstanceId: string;
   policyDigest: string;
+  authorizationContext?: AuthorizationContext;
+  runtimeMetadata?: Partial<AIRuntimeMetadata>;
   challengeNonce: string;
   signedAt: number;
 }): PrincipalSessionProofPayload {
@@ -572,6 +614,8 @@ export function buildPrincipalSessionProofPayload(input: {
     provider_session_id: input.providerSessionId,
     agent_instance_id: input.agentInstanceId,
     policy_digest: input.policyDigest,
+    authorization_context_hash: sha256hex(canonicalJson(sanitizeCaptureValue(input.authorizationContext ?? {}))),
+    runtime_metadata_hash: sha256hex(canonicalJson(sanitizeCaptureValue(input.runtimeMetadata ?? {}))),
     challenge_nonce: input.challengeNonce,
     signed_at: input.signedAt,
   };

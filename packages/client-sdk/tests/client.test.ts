@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { BPCClient } from '../src/client.js';
 import {
   BPC_PROTOCOL_VERSION,
+  b64url,
   b64urlDecode,
   generateKeypair,
   hashSecret,
@@ -138,7 +139,7 @@ describe('@bpc/client-sdk -- BPCClient', () => {
     const payload = JSON.parse(signedDataJson) as Record<string, unknown>;
 
     expect(payload['purpose']).toBe('rotation');
-    // IL4-7 / BPC-05: new_pub_jwk is now serialized as a JSON string field.
+    // BPC-05: new_pub_jwk is serialized as a JSON string field.
     expect(typeof payload['new_pub_jwk_json']).toBe('string');
     const parsedJwk = JSON.parse(payload['new_pub_jwk_json'] as string) as JsonWebKey;
     expect(parsedJwk.kty).toBe('EC');
@@ -147,7 +148,9 @@ describe('@bpc/client-sdk -- BPCClient', () => {
 
 describe('prepareRegistration', () => {
   it('should produce a keypair and a registration request with secretHash', async () => {
-    const { keypair, request } = await prepareRegistration('test-device', 'my-secret', 'read', 'development');
+    const { keypair, request } = await prepareRegistration(
+      'test-device', 'ValidRegistration1!@', 'read', 'development',
+    );
 
     expect(keypair.privateKey).toBeDefined();
     expect(keypair.publicKey).toBeDefined();
@@ -161,6 +164,38 @@ describe('prepareRegistration', () => {
     expect(typeof request.secretHash).toBe('string');
     expect(request.secretHash.length).toBeGreaterThan(10);
     expect(request.pubJwk).toEqual(keypair.pubJwk);
+  });
+
+  it('hashes the exact string bytes that fetch transmits', async () => {
+    const keypair = await generateKeypair();
+    const client = new BPCClient({
+      serverUrl: 'http://localhost:3100',
+      pairId: 'pair_test',
+      keypair,
+      secret: 'TestSecret1!',
+    });
+    const body = '{ "foo":  "bar" }';
+    const headers = await client.signRequest('POST', '/api/data', body);
+    const payload = JSON.parse(
+      new TextDecoder().decode(b64urlDecode(headers['X-BPC-Signed-Data'])),
+    ) as Record<string, string>;
+    const expected = 'sha256:' + b64url(
+      await crypto.subtle.digest('SHA-256', new TextEncoder().encode(body)),
+    );
+    expect(payload['body_hash']).toBe(expected);
+  });
+
+  it('rejects FormData because its generated multipart boundary is not known before send', async () => {
+    const keypair = await generateKeypair();
+    const client = new BPCClient({
+      serverUrl: 'http://localhost:3100', pairId: 'pair_test', keypair, secret: 'TestSecret1!',
+    });
+    await expect(client.signRequest('POST', '/upload', new FormData())).rejects.toThrow('boundaries');
+  });
+
+  it('rejects a registration secret outside the project policy before key generation', async () => {
+    await expect(prepareRegistration('test-device', 'weak', 'read', 'development'))
+      .rejects.toThrow('secret rejected');
   });
 
   it('captures registration preparation as a non-secret event', async () => {

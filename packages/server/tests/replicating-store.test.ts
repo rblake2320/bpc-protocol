@@ -3,6 +3,8 @@ import { ReplicatingPairStore } from '../src/replicating-store.js';
 import type { ReplicaOp } from '../src/replicating-store.js';
 import { MemoryPairStore } from '../src/memory-store.js';
 import type { StoredPair } from '../src/types.js';
+import { MemoryReplicaSequenceSource } from '../src/replica-envelope.js';
+import type { ReplicaEnvelope } from '../src/replica-envelope.js';
 
 function pair(id: string): StoredPair {
   return {
@@ -10,8 +12,8 @@ function pair(id: string): StoredPair {
     name: `pair-${id}`,
     scope: 'read-write',
     mode: 'development',
-    secretHash: 'deadbeef',     // HKDF verifier, NOT a secret
-    pubJwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y' },
+    secretHash: 'A'.repeat(43),
+    pubJwk: { kty: 'EC', crv: 'P-256', x: 'A'.repeat(43), y: 'B'.repeat(43) },
     status: 'active',
     created: 1_700_000_000_000,
     lastActive: null,
@@ -32,6 +34,8 @@ function makeFetch(behavior: () => Response | Promise<Response>) {
 
 const OK = () => new Response('{}', { status: 200 });
 const FAIL = () => new Response('err', { status: 503 });
+const TARGET = { url: 'https://replica.test/replica', sourceId: 'primary-1', token: 't'.repeat(32) };
+const options = () => ({ sequenceSource: new MemoryReplicaSequenceSource() });
 
 describe('ReplicatingPairStore', () => {
   let primary: MemoryPairStore;
@@ -40,7 +44,7 @@ describe('ReplicatingPairStore', () => {
   it('HA-01: primary write succeeds and is authoritative before replica is touched', async () => {
     const { impl } = makeFetch(OK);
     const store = new ReplicatingPairStore(
-      primary, { url: 'https://replica.test/replica', token: 't' }, { fetchImpl: impl },
+      primary, TARGET, { ...options(), fetchImpl: impl },
     );
     await store.set(pair('a'));
     // Primary has it immediately — read path hits primary.
@@ -51,7 +55,7 @@ describe('ReplicatingPairStore', () => {
   it('mirrors set/delete to the replica with op envelopes', async () => {
     const { impl, calls } = makeFetch(OK);
     const store = new ReplicatingPairStore(
-      primary, { url: 'https://replica.test/replica', token: 'secret-tok' }, { fetchImpl: impl },
+      primary, TARGET, { ...options(), fetchImpl: impl },
     );
     await store.set(pair('a'));
     await store.delete('a');
@@ -59,15 +63,17 @@ describe('ReplicatingPairStore', () => {
 
     expect(calls.length).toBe(2);
     expect(calls[0].url).toBe('https://replica.test/replica/pair');
-    expect((calls[0].body as ReplicaOp).op).toBe('set');
-    expect((calls[1].body as ReplicaOp).op).toBe('delete');
+    expect((calls[0].body as ReplicaEnvelope).op.op).toBe('set');
+    expect((calls[1].body as ReplicaEnvelope).op.op).toBe('delete');
+    expect((calls[0].body as ReplicaEnvelope).sequence).toBe(1);
+    expect((calls[1].body as ReplicaEnvelope).sequence).toBe(2);
   });
 
   it('HA-01: replica failure NEVER fails or blocks the primary write', async () => {
     const { impl } = makeFetch(FAIL);
     const store = new ReplicatingPairStore(
-      primary, { url: 'https://replica.test/replica', token: 't' },
-      { fetchImpl: impl, backoffBaseMs: 1, backoffMaxMs: 2 },
+      primary, TARGET,
+      { ...options(), fetchImpl: impl, backoffBaseMs: 1, backoffMaxMs: 2 },
     );
     // Should resolve fine despite the replica returning 503.
     await expect(store.set(pair('a'))).resolves.toBeUndefined();
@@ -78,8 +84,8 @@ describe('ReplicatingPairStore', () => {
     let n = 0;
     const { impl, calls } = makeFetch(() => (++n < 3 ? FAIL() : OK()));
     const store = new ReplicatingPairStore(
-      primary, { url: 'https://replica.test/replica', token: 't' },
-      { fetchImpl: impl, backoffBaseMs: 1, backoffMaxMs: 2 },
+      primary, TARGET,
+      { ...options(), fetchImpl: impl, backoffBaseMs: 1, backoffMaxMs: 2 },
     );
     await store.set(pair('a'));
     const flushed = await store.flush(2000);
@@ -93,8 +99,8 @@ describe('ReplicatingPairStore', () => {
     // Replica permanently down so nothing drains.
     const { impl } = makeFetch(FAIL);
     const store = new ReplicatingPairStore(
-      primary, { url: 'https://replica.test/replica', token: 't' },
-      { fetchImpl: impl, maxQueue: 3, backoffBaseMs: 10_000, backoffMaxMs: 10_000,
+      primary, TARGET,
+      { ...options(), fetchImpl: impl, maxQueue: 3, backoffBaseMs: 10_000, backoffMaxMs: 10_000,
         onDrop: (op) => dropped.push(op) },
     );
     for (const id of ['a', 'b', 'c', 'd', 'e']) await store.set(pair(id));
@@ -107,7 +113,7 @@ describe('ReplicatingPairStore', () => {
   it('reads are served from primary, never the replica', async () => {
     const { impl, calls } = makeFetch(OK);
     const store = new ReplicatingPairStore(
-      primary, { url: 'https://replica.test/replica', token: 't' }, { fetchImpl: impl },
+      primary, TARGET, { ...options(), fetchImpl: impl },
     );
     await store.set(pair('a'));
     await store.flush();

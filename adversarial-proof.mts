@@ -208,7 +208,7 @@ console.log(`\n== ADVERSARIAL PROOF RESULTS ==`);
 console.log(`  PASSED: ${pass}`);
 console.log(`  FAILED: ${fail}`);
 if (fail === 0) {
-  console.log('\n  ALL ATTACKS BLOCKED -- PRODUCTION READY');
+  console.log('\n  ALL NAMED SCENARIOS PASSED IN THIS RUN');
 } else {
   console.log('\n  FAILURES DETECTED');
   process.exit(1);

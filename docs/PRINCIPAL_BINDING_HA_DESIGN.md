@@ -1,6 +1,6 @@
 # Principal Binding HA Design
 
-Status: design baseline for the principal/session capture branch
+Status: implemented reference primitives with production deployment gates
 
 ## Purpose
 
@@ -72,8 +72,10 @@ Minimum fields:
 }
 ```
 
-The proof payload must bind the principal credential, provider, provider session
-ID, agent instance, policy digest, challenge nonce, and proof timestamp.
+The proof payload binds the principal credential, provider, provider session ID,
+agent instance, policy digest, requested authorization-context hash, supplied
+runtime-metadata hash, challenge nonce, and proof timestamp. Effective
+authorization comes from a server-side resolver and is empty by default.
 
 ## Audit Structure
 
@@ -290,8 +292,9 @@ lease, quorum, fencing token, or equivalent single-writer guard before the
 replica accepts authoritative writes.
 
 ```text
-Option A default: guard/operator-gated promotion
-  -> split-brain-safe single-writer model
+Option A current: guard/operator-gated local promotion
+  -> prevents an unpromoted replica from accepting writes
+  -> does not fence a still-running primary
 
 Option B future: automatic quorum/lease promotion
   -> faster failover
@@ -310,10 +313,15 @@ Required Option A guarantees:
    it must not auto-clear on a transient primary health probe.
 5. The promotion gate is protocol-agnostic and must preserve the same contract
    for BPC and TSK.
+6. A global single-writer or split-brain-safety claim additionally requires an
+   external lease, quorum, fencing token, or equivalent control that can stop a
+   still-running former primary.
 
 Claim wording:
 
-> Write operations are routed exclusively to a designated primary node, and failover of write authority to a replica node requires an explicit promotion signal from an authorized guard process, such that neither the client nor the replica can unilaterally assume write authority, and promotion state persists until explicitly revoked.
+> The local replica gate rejects authoritative writes until it receives an
+> authenticated promotion command, and promotion state persists until explicitly
+> revoked. This local gate does not itself prove distributed single-writer safety.
 
 ## Phase 4 Local Agent Cache
 
@@ -391,12 +399,13 @@ Current branch implements the local primitives:
 - stream chains partitioned by principal/provider/agent instance
 - principal checkpoints committing stream heads
 - sealed fallback authorization checks that fail closed
+- fallback nonce consumption through the server nonce-store abstraction
 - DPAPI CurrentUser agent cache that throws named errors on expired, tampered,
   stale-policy, stale-permissions, and missing-cache paths
-- replication decorators and replica receivers are separate implementation
-  phases; receivers should be tier-independent ingest paths, while validation
-  and promotion enforce the selected trust tier
+- authenticated, fresh, monotonic replica envelopes with exact-retry detection
+- a local replica promotion gate that fails closed before promotion
 
 Production deployment still needs durable SCM storage, primary/replica
-promotion orchestration, witness receiver configuration, audit-lock
-persistence, and operator reconciliation workflows.
+sequence allocation, atomic replica sequence/mutation persistence, global
+fencing or lease discipline, promotion orchestration, witness receiver
+configuration, audit-lock persistence, and operator reconciliation workflows.
