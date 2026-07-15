@@ -38,9 +38,7 @@ export type PairKind = 'legitimate' | 'ghost';
  * Anomaly engine verdict states.
  *
  * State machine:
- *   clean → suspicious → shadow
- *                ↓
- *             tarpit
+ *   clean → suspicious → shadow → attack
  *
  * 'shadow' is a FIRST-CLASS STATE, not a middleware branch.
  * It is scoped to (sourceIP + pairId), NOT the pair globally.
@@ -128,10 +126,47 @@ export interface PairRegistration {
   canaryClass?: CanaryClass;
 }
 
+/**
+ * Immutable authorization snapshot captured at the moment a request is authorized.
+ *
+ * This is the ONLY source of truth for the verified scope and identity after
+ * verifyBPCRequest returns. It is created from a point-in-time copy of the
+ * StoredPair fields relevant to authorization, taken before any async work
+ * completes. Concurrent lifecycle mutations (e.g. updatePair) cannot affect
+ * fields on this snapshot.
+ *
+ * Resolves TOCTOU race: issue #6 — mutable StoredPair returned after authorization.
+ */
+export interface AuthSnapshot {
+  /** The verified pair ID. */
+  readonly pairId: string;
+  /** The scope enforced at authorization time. Will not change after capture. */
+  readonly scope: 'read' | 'read-write' | 'admin';
+  /** The pair mode at authorization time. */
+  readonly mode: 'development' | 'production';
+  /** The pair kind ('legitimate' | 'ghost') at authorization time. */
+  readonly kind: PairKind;
+  /** Canary class if kind === 'ghost', otherwise undefined. */
+  readonly canaryClass?: CanaryClass;
+  /** Unix timestamp (ms) when authorization was determined. */
+  readonly verifiedAt: number;
+}
+
 export interface BPCVerifyResult {
   ok: boolean;
   pairId?: string;
-  pair?: StoredPair;
+  /**
+   * Immutable authorization snapshot.
+   *
+   * Present only when ok === true. Contains the scope, mode, kind, and
+   * verifiedAt timestamp captured at the exact moment of authorization.
+   * This field REPLACES the former mutable `pair` field so that concurrent
+   * registry mutations cannot alter the authorization evidence after the fact.
+   *
+   * Downstream code (including the TSK bridge) MUST read scope from
+   * result.snapshot.scope, not from a registry re-fetch.
+   */
+  snapshot?: AuthSnapshot;
   error?: string;
   rateLimitRemaining?: number;
   /**
