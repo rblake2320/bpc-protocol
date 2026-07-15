@@ -96,7 +96,9 @@ export { PgPairStore, PG_SCHEMA } from './pg-store.js';
 export { RedisNonceStore } from './redis-nonce.js';
 export { RedisAnomalyStore } from './redis-anomaly.js';
 export { MemoryRateLimiter, RedisRateLimiter } from './rate-limiter.js';
-export { MemoryAuditLog, PgAuditLog, PG_AUDIT_SCHEMA } from './audit.js';
+// GENESIS_HASH exported so consumers can anchor chain verification externally
+// (store the genesis hash at startup and compare later to detect forgery or truncation).
+export { MemoryAuditLog, PgAuditLog, PG_AUDIT_SCHEMA, GENESIS_HASH } from './audit.js';
 export { handleRotation } from './rotation.js';
 export { BPC_ERRORS } from './errors.js';
 export {
