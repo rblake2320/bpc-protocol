@@ -2,6 +2,15 @@
 
 ## 2026-07-15
 
+- Re-audited closed issue #1 and found the TypeScript implementation rejected
+  wildcard scopes while the shipped Python registry still accepted arbitrary
+  strings. Request verification later denied those strings, but the documented
+  registration-time guarantee was not true across both implementations.
+- Added Python construction, registry, client-intake, and corrupt-store scope
+  validation. Python verification now reports `invalid_scope` before payload
+  cryptography for malformed stored authority. Focused Python suites pass
+  81/81 (44 client, 37 server), and Ruff is clean on the changed surface.
+
 - Post-merge validation found that the two standalone HTTP adversarial runners
   were not part of CI. Both used a secret rejected by the current policy, and
   the scope runner still called SDK methods removed during hardening.
