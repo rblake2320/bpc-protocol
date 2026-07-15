@@ -165,7 +165,11 @@ operating environment to appear in applicable CMVP evidence.
 
 ## Deployment Recommendations
 
-1. **Use Redis backends** (`RedisNonceStore`, `RedisRateLimiter`, `RedisAnomalyStore`) in production for distributed deployments.
+1. **Use `createRedisBackedNonceStore()`** for distributed TypeScript replay
+   protection. Require an explicit namespace, `noeviction`, bounded client
+   deadlines, and deny on every uncertain Redis result. Never fall back to a
+   process-local nonce store. If failover may have lost nonce writes, quarantine
+   authorization for the full derived retention interval.
 2. **Use PostgreSQL backends** (`PgPairStore`, `PgAuditLog`) for persistent, auditable storage.
 3. **Enable TLS 1.3** on all transport layers (BPC does not provide transport security).
 4. **Set `expiresAt`** on all pairs to enforce credential rotation schedules.

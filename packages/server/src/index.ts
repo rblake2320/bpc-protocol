@@ -11,7 +11,11 @@ export type { AuditLog, AuditEntry, AuditAction, AuditSeverity } from './audit.j
 export type { RateLimiter, RateLimitResult } from './rate-limiter.js';
 export type { RotationRequest, RotationResult } from './rotation.js';
 export type { PgPool } from './pg-store.js';
-export type { RedisClient } from './redis-nonce.js';
+export type {
+  RedisBackedNonceOptions,
+  RedisBackedNonceStore,
+  RedisClient,
+} from './redis-nonce.js';
 export type { RedisIncrClient } from './redis-anomaly.js';
 export type { RedisZSetClient } from './rate-limiter.js';
 export type {
@@ -64,7 +68,7 @@ export {
 export { PairRegistry } from './registry.js';
 export type { RedactedPair } from './registry.js';
 export { AnomalyEngine } from './anomaly.js';
-export { ServerNonceStore } from './nonce-store.js';
+export { NonceStoreUnavailableError, ServerNonceStore } from './nonce-store.js';
 export { verifyBPCRequest } from './middleware.js';
 export { MemoryPairStore, MemoryNonceBackend, MemoryAnomalyStore } from './memory-store.js';
 export { ReplicatingPairStore } from './replicating-store.js';
@@ -93,7 +97,13 @@ export type {
 export { PromotionController, assertWritable, handlePromotionCommand } from './promotion.js';
 export type { NodeRole, PromotionSnapshot, PromotionCommand } from './promotion.js';
 export { PgPairStore, PG_SCHEMA } from './pg-store.js';
-export { RedisNonceStore } from './redis-nonce.js';
+export {
+  DEFAULT_NONCE_SAFETY_BUFFER_MS,
+  DEFAULT_REDIS_NONCE_TIMEOUT_MS,
+  RedisNonceStore,
+  createRedisBackedNonceStore,
+  deriveNonceRetentionMs,
+} from './redis-nonce.js';
 export { RedisAnomalyStore } from './redis-anomaly.js';
 export { MemoryRateLimiter, RedisRateLimiter } from './rate-limiter.js';
 export { MemoryAuditLog, PgAuditLog, PG_AUDIT_SCHEMA } from './audit.js';
@@ -128,7 +138,15 @@ export interface BPCServerInstance {
   store: MemoryPairStore;
 }
 
-export function createBPCServer(config?: { maxPairs?: number; lockoutCount?: number; sigWindowMs?: number }): BPCServerInstance {
+export interface BPCServerFactoryConfig {
+  maxPairs?: number;
+  lockoutCount?: number;
+  sigWindowMs?: number;
+  /** Inject a distributed or deployment-specific nonce store. */
+  nonceStore?: ServerNonceStore;
+}
+
+export function createBPCServer(config?: BPCServerFactoryConfig): BPCServerInstance {
   const store = new MemoryPairStore();
   const nonceBackend = new MemoryNonceBackend();
   const anomalyStore = new MemoryAnomalyStore();
@@ -137,7 +155,10 @@ export function createBPCServer(config?: { maxPairs?: number; lockoutCount?: num
 
   return {
     registry: new PairRegistry(store, config?.maxPairs ?? 2000, config?.lockoutCount ?? 10),
-    nonceStore: new ServerNonceStore(nonceBackend, config?.sigWindowMs ? config.sigWindowMs * 2 + 10_000 : 130_000),
+    nonceStore: config?.nonceStore ?? new ServerNonceStore(
+      nonceBackend,
+      config?.sigWindowMs ? config.sigWindowMs * 2 + 10_000 : 130_000,
+    ),
     anomaly: new AnomalyEngine(anomalyStore),
     auditLog,
     principalLedger,

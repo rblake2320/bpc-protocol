@@ -42,7 +42,9 @@ npm run test:interop
 npm run test:pack
 ```
 
-Distributed replay testing uses a real Redis service:
+Distributed replay testing uses built package entry points and a real Redis
+service. It exercises two independent verifiers, a 64-request race, TTL,
+namespace isolation, disconnect, and `noeviction` OOM denial:
 
 ```powershell
 $env:BPC_TEST_REDIS_URL = "redis://127.0.0.1:6379"
@@ -81,9 +83,13 @@ Narrowly established properties include:
 - Unknown, inactive, expired, capped, or revoked pairs fail authorization.
 - Rotation is authorized by the existing pair key and preserves the prior
   scope rather than permitting scope escalation.
+- The TypeScript Redis builder derives nonce retention from the signature
+  window, requires an explicit namespace, and turns uncertain Redis state into
+  a named fail-closed denial. Redis data-loss continuity remains a deployment
+  boundary; in-memory factories are development defaults.
 - Redis and PostgreSQL backends are implemented for shared and persistent
-  state; in-memory factories are development defaults. Production claims still
-  require deployment-specific failure, recovery, and access-control evidence.
+  state. Production claims still require deployment-specific failure,
+  recovery, durability, and access-control evidence.
 
 BPC does not independently provide:
 

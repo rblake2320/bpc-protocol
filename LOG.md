@@ -2,6 +2,21 @@
 
 ## 2026-07-15
 
+- Reopened issue #2 after design review showed the atomic Redis primitive was
+  present but the claimed standalone verifier composition was incomplete.
+- Added a validated TypeScript Redis nonce builder with explicit deployment
+  namespaces, retention derived from the signature window, bounded command
+  latency, injected standalone-server wiring, and named fail-closed 503 denial
+  without memory fallback.
+- Replaced the direct-store Redis runner with built-package verification through
+  two independent BPC verifiers. Final focused evidence: 142/142 server tests;
+  188/188 Node workspace tests; 8/8 live Redis assertions including 64 signed
+  concurrent uses, disconnect, TTL, namespace isolation, and real noeviction
+  OOM; 28/28 live HTTP adversarial assertions; 81/81 Python tests; PostgreSQL,
+  cross-language, package, build, and dependency-audit gates passed.
+- Redis data-loss continuity remains explicitly parked: deployments must use
+  noeviction and quarantine after a failover whose nonce history is uncertain.
+
 - Re-audited closed issue #1 and found the TypeScript implementation rejected
   wildcard scopes while the shipped Python registry still accepted arbitrary
   strings. Request verification later denied those strings, but the documented
