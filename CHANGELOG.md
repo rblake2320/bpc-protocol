@@ -33,6 +33,9 @@ All notable changes to BPC Protocol are documented in this file.
 - Active security and protocol documentation now separates implemented test
   propositions from production, authorization, hardware, FIPS, HA, and audit
   claims.
+- The previously standalone HTTP adversarial and scope-escalation runners now
+  execute against an isolated loopback server in CI. Their fixtures target the
+  current SDK and require live denial, rotation, and evidence-counter results.
 
 ## [0.2.0] — 2026-05-18 — Security Hardening Release
 

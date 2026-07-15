@@ -47,6 +47,7 @@ jobs:
       - run: npm run build
       - run: npm run test:pack
       - run: npm test
+      - run: npm run test:adversarial
       - run: npm run test:interop
       - run: npm run test:redis
       - run: npm run test:postgres

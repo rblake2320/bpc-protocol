@@ -2,6 +2,17 @@
 
 ## 2026-07-15
 
+- Post-merge validation found that the two standalone HTTP adversarial runners
+  were not part of CI. Both used a secret rejected by the current policy, and
+  the scope runner still called SDK methods removed during hardening.
+- Repaired both runners against the current SDK, replaced static/skip results
+  with live registration and anomaly-evidence assertions, and added an
+  isolated loopback test-server orchestrator to the required CI matrix.
+- Local correction verification passed 171 Node tests, 71 Python tests, 28
+  live HTTP adversarial assertions, cross-language interoperability, npm
+  package dry-runs, full and production dependency audits, a 64-way two-client
+  Redis replay race, and PostgreSQL migration/reconnect durability.
+
 - Audited open issues, draft PR state, package builds, Node tests, Python tests,
   dependency audit, and protocol claims.
 - Added a non-mocked Redis nonce integration test and CI service contract.

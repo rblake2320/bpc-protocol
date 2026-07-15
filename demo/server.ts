@@ -38,7 +38,8 @@ import {
   FileAnomalyStore,
 } from '../packages/server/src/file-store.ts';
 
-const PORT        = 3100;
+const PORT        = Number.parseInt(process.env['BPC_PORT'] ?? '3100', 10);
+const HOST        = process.env['BPC_HOST'] ?? '127.0.0.1';
 const DEMO_DIR    = dirname(fileURLToPath(import.meta.url));
 const ADMIN_TOKEN = process.env['BPC_ADMIN_TOKEN'] ?? 'demo-admin-token-change-before-use-32';
 const EVENT_LOG   = join(DEMO_DIR, 'analytics.ndjson');
@@ -166,7 +167,14 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
         json(res, 400, { error: 'invalid_json' });
         return;
       }
-      const pairId = await registry.registerDirect(registration);
+      let pairId: string;
+      try {
+        pairId = await registry.registerDirect(registration);
+      } catch {
+        log(method, path, 'REGISTRATION DENIED');
+        json(res, 400, { error: 'invalid_registration' });
+        return;
+      }
       await auditLog.write({ action: 'register', pairId, ip, method, path });
       log(method, path, `REGISTERED pair=${pairId}`);
       json(res, 200, { pairId, status: 'approved' });
@@ -462,8 +470,8 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
 process.on('uncaughtException',  (err)    => console.error('[CRITICAL] Uncaught:', err));
 process.on('unhandledRejection', (reason) => console.error('[CRITICAL] Rejection:', reason));
 
-server.listen(PORT, () => {
-  console.log(`\nBPC Demo Server running on http://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`\nBPC Demo Server running on http://${HOST}:${PORT}`);
   console.log(`Admin token: ${ADMIN_TOKEN}`);
   console.log('');
   console.log('  POST /bpc/register            Register a pair');

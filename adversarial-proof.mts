@@ -2,7 +2,8 @@ import { prepareRegistration, BPCClient } from './packages/client-sdk/src/index.
 import { BPC_PROTOCOL_VERSION, generateKeypair } from './packages/core/src/index.ts';
 import { MemoryNonceBackend } from './packages/server/src/memory-store.ts';
 
-const SERVER = 'http://localhost:3100';
+const SERVER = process.env['BPC_TEST_SERVER_URL'] ?? 'http://127.0.0.1:3100';
+const TEST_SECRET = 'BPC-Test-Secret-2026!';
 let pass = 0, fail = 0;
 
 function result(name: string, ok: boolean, detail = '') {
@@ -12,7 +13,7 @@ function result(name: string, ok: boolean, detail = '') {
 }
 
 async function register(name: string, scope = 'read-write') {
-  const { keypair, request } = await prepareRegistration(name, 'Demo@Secret9!', scope as any, 'development');
+  const { keypair, request } = await prepareRegistration(name, TEST_SECRET, scope as any, 'development');
   const r = await fetch(`${SERVER}/bpc/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -83,25 +84,20 @@ console.log('\n== ATTACK 2: Parallel Lockout Flood (50 concurrent forged sigs) =
   const { keypair, pairId } = await register('lockout-target');
   console.log(`  Target pair: ${pairId}`);
 
-  const badSig = 'A'.repeat(88);
+  // A correctly sized P1363 value reaches cryptographic verification. An
+  // arbitrary-length string would be rejected earlier as malformed input.
+  const badSig = Buffer.alloc(64).toString('base64url');
+  const legitClient = new BPCClient({ serverUrl: SERVER, pairId, keypair, secret: TEST_SECRET });
 
-  const reqs = Array.from({ length: 50 }, (_: unknown, i: number) => {
-    const pl = {
-      pairId,
-      method: 'GET',
-      path: '/api/status',
-      nonce: `flood_nonce_${i}_${Date.now()}`,
-      timestamp: Date.now(),
-      version: BPC_PROTOCOL_VERSION,
-    };
-    const sd = btoa(JSON.stringify(pl)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  const reqs = Array.from({ length: 50 }, async () => {
+    // Generate a structurally and cryptographically bound request, then alter
+    // only its signature so the request reaches signature verification.
+    const headers = await legitClient.signRequest('GET', '/api/status');
     return fetch(`${SERVER}/api/status`, {
       method: 'GET',
       headers: {
-        'X-BPC-Pair-ID': pairId,
-        'X-BPC-Signed-Data': sd,
+        ...headers,
         'X-BPC-Signature': badSig,
-        'X-BPC-Version': BPC_PROTOCOL_VERSION,
       },
     });
   });
@@ -117,24 +113,24 @@ console.log('\n== ATTACK 2: Parallel Lockout Flood (50 concurrent forged sigs) =
   console.log('  Error distribution:', countByError);
 
   const lockedCount = countByError['pair_locked'] ?? 0;
+  const shadowDeniedCount = countByError['shadow_denied'] ?? 0;
   const invalidSigCount = countByError['invalid_signature'] ?? 0;
   // Node.js is single-threaded: all 50 concurrent requests race through the pipeline
   // before any recordActivity writes back. They all see invalid_signature, but the
   // writes queue up and lock the pair. The security guarantee: no request can succeed
   // AFTER the threshold is reached. That's verified below.
   result(
-    '50 concurrent forged sigs => all rejected (invalid_sig or pair_locked)',
-    (lockedCount + invalidSigCount) === 50,
-    `pair_locked=${lockedCount} invalid_signature=${invalidSigCount}`,
+    '50 concurrent forged sigs => all rejected before authorization',
+    (lockedCount + shadowDeniedCount + invalidSigCount) === 50,
+    `pair_locked=${lockedCount} shadow_denied=${shadowDeniedCount} invalid_signature=${invalidSigCount}`,
   );
 
   // The critical guarantee: a legitimate request now must be blocked
-  const legitClient = new BPCClient({ serverUrl: SERVER, pairId, keypair, secret: 'Demo@Secret9!' });
   const legitRes = await legitClient.fetch('/api/status');
   const legitBody = await legitRes.json() as Record<string, unknown>;
   result(
-    'Pair is locked after flood: legitimate request => 401 pair_locked',
-    legitRes.status === 401 && legitBody['error'] === 'pair_locked',
+    'Pair remains denied after flood: legitimate request => hard 401 denial',
+    legitRes.status === 401 && ['pair_locked', 'shadow_denied'].includes(String(legitBody['error'])),
     `status=${legitRes.status} error=${legitBody['error']}`,
   );
 }
@@ -172,7 +168,7 @@ console.log('\n== ATTACK 4: Scope Enforcement ==');
 {
   // read-write tries DELETE
   const { keypair: kp1, pairId: pid1 } = await register('scope-rw', 'read-write');
-  const rwClient = new BPCClient({ serverUrl: SERVER, pairId: pid1, keypair: kp1, secret: 'Demo@Secret9!' });
+  const rwClient = new BPCClient({ serverUrl: SERVER, pairId: pid1, keypair: kp1, secret: TEST_SECRET });
   const rwDel = await rwClient.fetch('/api/admin', { method: 'DELETE' });
   const rwBody = await rwDel.json() as Record<string, unknown>;
   result(
@@ -183,7 +179,7 @@ console.log('\n== ATTACK 4: Scope Enforcement ==');
 
   // read tries POST
   const { keypair: kp2, pairId: pid2 } = await register('scope-ro', 'read');
-  const roClient = new BPCClient({ serverUrl: SERVER, pairId: pid2, keypair: kp2, secret: 'Demo@Secret9!' });
+  const roClient = new BPCClient({ serverUrl: SERVER, pairId: pid2, keypair: kp2, secret: TEST_SECRET });
   const roPost = await roClient.fetch('/api/status', { method: 'POST' });
   const roBody = await roPost.json() as Record<string, unknown>;
   result(
@@ -194,10 +190,10 @@ console.log('\n== ATTACK 4: Scope Enforcement ==');
 
   // admin pair DELETE works
   const { keypair: kp3, pairId: pid3 } = await register('scope-admin', 'admin');
-  const adminClient = new BPCClient({ serverUrl: SERVER, pairId: pid3, keypair: kp3, secret: 'Demo@Secret9!' });
-  const adminDel = await adminClient.fetch('/api/admin', { method: 'DELETE' });
+  const adminClient = new BPCClient({ serverUrl: SERVER, pairId: pid3, keypair: kp3, secret: TEST_SECRET });
+  const adminDel = await adminClient.fetch('/api/user/adversarial-test', { method: 'DELETE' });
   result(
-    'admin pair => DELETE /api/admin => 200',
+    'admin pair => DELETE /api/user/adversarial-test => 200',
     adminDel.status === 200,
     `status=${adminDel.status}`,
   );
