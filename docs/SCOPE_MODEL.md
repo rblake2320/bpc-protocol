@@ -10,6 +10,10 @@ Namespaced or wildcard values such as `read:*` are deliberately rejected.
 Adding prefix or glob matching to the credential layer would make privilege
 meaning dependent on string parsing and could silently widen authority.
 
+Both the TypeScript and Python implementations validate this enum at intake.
+The Python verifier also rejects an invalid value recovered from a custom or
+corrupt registry before processing the signed payload.
+
 Fine-grained permissions belong in the governed application's policy engine.
 The application first authenticates the BPC pair, then authorizes the concrete
 resource and action. A future protocol version may add structured permissions,

@@ -351,6 +351,20 @@ class TestBPCClientConstruction:
         assert "secret" not in payload
         assert payload["secretHash"] == derive_secret_key(secret)
 
+    @pytest.mark.parametrize("scope", ["read:*", "read:quotes", "superuser", ""])
+    def test_registration_rejects_non_closed_scope_before_network(self, scope):
+        with patch("bpc_client.client.httpx.post") as post:
+            with pytest.raises(BPCError) as exc:
+                BPCClient.register(
+                    "https://api.example.com",
+                    "invalid-scope",
+                    "ValidRegistration1!@",
+                    scope=scope,
+                    save=False,
+                )
+        assert exc.value.code == "invalid_scope"
+        post.assert_not_called()
+
     def test_rotation_uses_old_key_to_bind_new_key_and_pair_id(self):
         pair = self._make_pair()
         client = BPCClient(pair)

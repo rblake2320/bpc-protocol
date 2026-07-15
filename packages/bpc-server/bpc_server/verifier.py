@@ -25,13 +25,13 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
-from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, EllipticCurvePublicKey, SECP256R1
+from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, EllipticCurvePublicKey
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.backends import default_backend
 
-from .registry import PairRecord, InMemoryPairRegistry
+from .registry import ALLOWED_SCOPES, PairRecord, InMemoryPairRegistry
 from .nonce_store import InMemoryNonceStore
 
 
@@ -140,6 +140,8 @@ class BPCVerifier:
             return BPCVerificationResult.failure("pair_revoked", "Pair has been revoked")
         if pair.expires_at and pair.expires_at < time.time():
             return BPCVerificationResult.failure("pair_expired", "Pair has expired")
+        if pair.scope not in ALLOWED_SCOPES:
+            return BPCVerificationResult.failure("invalid_scope", "Stored pair scope is invalid")
 
         # Step 4: Pair not locked out
         if pair.failed_sigs >= self.lockout_count:

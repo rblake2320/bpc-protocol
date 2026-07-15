@@ -12,15 +12,12 @@ Covers:
 """
 
 import base64
-import hashlib
 import json
 import time
-import uuid
-from unittest.mock import patch
 
 import pytest
 
-from bpc_server.verifier import BPCVerifier, BPCVerificationResult
+from bpc_server.verifier import BPCVerifier
 from bpc_server.registry import InMemoryPairRegistry, PairRecord
 from bpc_server.nonce_store import InMemoryNonceStore
 
@@ -30,7 +27,6 @@ from bpc_server.nonce_store import InMemoryNonceStore
 def make_pair_and_client():
     """Create a test pair and matching bpc_client for signing."""
     from bpc_client.crypto import derive_secret_key, generate_keypair
-    from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
 
     kp = generate_keypair()
     private_key = kp["private_key"]
@@ -98,6 +94,18 @@ class TestInMemoryPairRegistry:
         registry.increment_failed_sigs("pair_1")
         registry.reset_failed_sigs("pair_1")
         assert registry.get("pair_1").failed_sigs == 0
+
+    @pytest.mark.parametrize("scope", ["read:*", "read:quotes", "superuser", ""])
+    def test_pair_record_rejects_non_closed_scope(self, scope):
+        with pytest.raises(ValueError, match="scope"):
+            PairRecord("pair_1", "test", scope, "development", {}, "hash")
+
+    def test_register_revalidates_mutated_scope(self):
+        registry = InMemoryPairRegistry()
+        pair = PairRecord("pair_1", "test", "read", "development", {}, "hash")
+        pair.scope = "read:*"
+        with pytest.raises(ValueError, match="scope"):
+            registry.register(pair)
 
 
 # ── Nonce store tests ─────────────────────────────────────────────────────────
@@ -271,6 +279,13 @@ class TestBPCVerifier:
         result = self.verifier.verify(headers, "DELETE", "/api/items/1")
         assert result.ok is False
         assert result.error_code == "scope_denied"
+
+    def test_corrupt_stored_scope_fails_closed_before_crypto(self):
+        self.pair.scope = "read:*"
+        headers = sign_headers(self.private_key, self.pair.pair_id, self.secret, "GET", "/api/data")
+        result = self.verifier.verify(headers, "GET", "/api/data")
+        assert result.ok is False
+        assert result.error_code == "invalid_scope"
 
     def test_failed_sig_increments_counter(self):
         headers = sign_headers(self.private_key, self.pair.pair_id, self.secret, "GET", "/api/data")

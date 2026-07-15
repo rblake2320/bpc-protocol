@@ -142,7 +142,7 @@ or an authorization. There is no current DoD Cloud Computing SRG IL7.
 | | AU-9 | Hash-chained audit entries and PostgreSQL mutation-denial schema; deployment protection and external anchoring remain required |
 | | AU-12 | All verify_pass and verify_fail events logged |
 | **AC — Access Control** | AC-2 | Pair lifecycle management (active/locked/revoked/rotated/expired) |
-| | AC-3 | Scope enforcement (read/read-write/admin) per HTTP method |
+| | AC-3 | Closed scope enforcement (read/read-write/admin) at TypeScript and Python intake and per HTTP method |
 | | AC-6 | Principle of least privilege: listRedacted() strips sensitive fields |
 
 ---

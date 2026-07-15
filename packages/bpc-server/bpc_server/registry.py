@@ -9,6 +9,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Protocol
 
+ALLOWED_SCOPES = frozenset({"read", "read-write", "admin"})
+
+
+def validate_scope(scope: str) -> None:
+    if scope not in ALLOWED_SCOPES:
+        allowed = ", ".join(sorted(ALLOWED_SCOPES))
+        raise ValueError(f"scope must be one of: {allowed}")
+
 
 @dataclass
 class PairRecord:
@@ -23,6 +31,9 @@ class PairRecord:
     expires_at: Optional[float] = None
     failed_sigs: int = 0
     lockout_count: int = 10
+
+    def __post_init__(self) -> None:
+        validate_scope(self.scope)
 
 
 class PairRegistry(Protocol):
@@ -43,6 +54,7 @@ class InMemoryPairRegistry:
         return self._pairs.get(pair_id)
 
     def register(self, record: PairRecord) -> None:
+        validate_scope(record.scope)
         self._pairs[record.pair_id] = record
 
     def revoke(self, pair_id: str) -> None:

@@ -4,6 +4,9 @@ All notable changes to BPC Protocol are documented in this file.
 
 ## [Unreleased] -- 2026-07-15
 
+- Python pair construction, registry intake, client registration, and verifier
+  state now enforce the same closed `read`/`read-write`/`admin` scope contract
+  as the TypeScript implementation. Wildcard and namespaced values fail closed.
 - Authenticated HA mutation envelopes now bind source, sequence, timestamp, and
   operation; receivers reject tampering, expiry, gaps, stale resurrection, and
   same-sequence conflicts.

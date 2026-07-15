@@ -17,6 +17,8 @@ import httpx
 
 from .crypto import _b64url, derive_secret_key, generate_keypair, sign_request, validate_secret
 
+ALLOWED_SCOPES = frozenset({"read", "read-write", "admin"})
+
 
 class BPCError(Exception):
     """Base error for BPC protocol failures."""
@@ -134,6 +136,9 @@ class BPCClient:
             validate_secret(secret)
         except ValueError as exc:
             raise BPCError(str(exc), code="invalid_secret") from exc
+        if scope not in ALLOWED_SCOPES:
+            allowed = ", ".join(sorted(ALLOWED_SCOPES))
+            raise BPCError(f"scope must be one of: {allowed}", code="invalid_scope")
         kp = generate_keypair()
 
         from cryptography.hazmat.primitives.serialization import (
