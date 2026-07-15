@@ -12,7 +12,7 @@ export interface BPCPair {
   name: string;
   scope: 'read' | 'read-write' | 'admin';
   mode: 'development' | 'production';
-  secretHash: string;       // SHA-256(bpc: + secret), base64url
+  secretHash: string;       // HKDF-SHA-256-derived request HMAC key, base64url
   privateKey: CryptoKey;
   publicKey: CryptoKey;
   fingerprint: string;

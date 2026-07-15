@@ -32,15 +32,14 @@ export class BPCClient {
 
     let bodyHash: string;
     if (body != null) {
-      const bodyBytes = new TextEncoder().encode(JSON.stringify(body));
+      const bodyBytes = await exactBodyBytes(body);
       const digest = await crypto.subtle.digest('SHA-256', bodyBytes);
       bodyHash = 'sha256:' + b64url(digest);
     } else {
       bodyHash = EMPTY_BODY_HASH;
     }
 
-    // Derive secretHash the same way the server does at pairing time:
-    // server stores hashSecret(secret) = SHA256('bpc:' + secret) — HMAC key must match
+    // Derive the same domain-separated HKDF request key sent during pairing.
     const secretHash = await hashSecret(this.config.secret);
     const secretHmac = await hmacDerive(secretHash, nonce + timestamp);
 
@@ -79,8 +78,7 @@ export class BPCClient {
       throw new Error(`BPCClient: serverUrl must use HTTPS in production. Got: ${this.config.serverUrl}`);
     }
     const method = (init.method ?? 'GET').toUpperCase();
-    const body = init.body ? JSON.parse(init.body as string) : undefined;
-    const headers = await this.signRequest(method, path, body);
+    const headers = await this.signRequest(method, path, init.body ?? undefined);
     return fetch(this.config.serverUrl + path, {
       ...init,
       method,
@@ -94,7 +92,7 @@ export class BPCClient {
    */
   async rotate(newPubJwk: JsonWebKey, rotationEndpoint = '/bpc/rotate'): Promise<{ newPairId: string }> {
     const timestamp = Date.now();
-    // IL4-7 / BPC-05: canonicalize() only accepts flat (scalar) payloads.
+    // BPC-05: canonicalize() only accepts flat (scalar) payloads.
     // Serialize new_pub_jwk as a JSON string so it is a scalar field.
     const rotationPayload = {
       new_pub_jwk_json: JSON.stringify(newPubJwk),
@@ -121,4 +119,34 @@ export class BPCClient {
     const body = await res.json() as { newPairId: string };
     return body;
   }
+}
+
+async function exactBodyBytes(body: unknown): Promise<ArrayBuffer> {
+  if (typeof body === 'string') return copyBytes(new TextEncoder().encode(body));
+  if (body instanceof ArrayBuffer) return body.slice(0);
+  if (ArrayBuffer.isView(body)) {
+    return copyBytes(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+  }
+  if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+    return copyBytes(new TextEncoder().encode(body.toString()));
+  }
+  if (typeof Blob !== 'undefined' && body instanceof Blob) {
+    return body.arrayBuffer();
+  }
+  if (typeof FormData !== 'undefined' && body instanceof FormData) {
+    throw new TypeError('BPCClient: FormData wire boundaries cannot be pre-hashed deterministically');
+  }
+  if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) {
+    throw new TypeError('BPCClient: streaming request bodies require an application-supplied digest adapter');
+  }
+  if (typeof body === 'object') {
+    return copyBytes(new TextEncoder().encode(JSON.stringify(body)));
+  }
+  throw new TypeError(`BPCClient: unsupported request body type ${typeof body}`);
+}
+
+function copyBytes(view: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(view.byteLength);
+  copy.set(view);
+  return copy.buffer;
 }

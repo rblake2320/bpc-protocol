@@ -77,7 +77,7 @@ export interface StoredPair {
   name: string;
   scope: 'read' | 'read-write' | 'admin';
   mode: 'development' | 'production';
-  secretHash: string;       // SHA-256(bpc:+secret) base64url — stored at pairing
+  secretHash: string;       // HKDF-derived request HMAC key, base64url
   pubJwk: JsonWebKey;       // Registered public key
   status: 'active' | 'locked' | 'expired' | 'rotated' | 'revoked';
   created: number;
@@ -136,9 +136,9 @@ export interface BPCVerifyResult {
   rateLimitRemaining?: number;
   /**
    * Layer 8: Shadow Mode indicator.
-   * When true, the request "succeeded" but is operating in deception mode.
-   * The downstream application MUST return synthetic/honeypot data.
-   * The session token issued is tagged shadowToken:true internally.
+   * When true, the request was classified for deception handling. It remains
+   * an authorization failure (`ok` is false); any synthetic response belongs
+   * outside the authorization result.
    * NEVER expose this field to the client — it is server-internal only.
    */
   shadow?: boolean;

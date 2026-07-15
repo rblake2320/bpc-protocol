@@ -2,12 +2,45 @@
 
 All notable changes to BPC Protocol are documented in this file.
 
-## [0.2.0] — 2026-05-18 — Security Release (IL4-7 Hardening)
+## [Unreleased] -- 2026-07-15
 
-This release remediates **three critical** and **three high/medium** vulnerabilities
+- Authenticated HA mutation envelopes now bind source, sequence, timestamp, and
+  operation; receivers reject tampering, expiry, gaps, stale resurrection, and
+  same-sequence conflicts.
+- Principal session proofs bind requested authorization and runtime metadata;
+  effective authority comes from a server resolver, proof nonces are one-use,
+  and fallback verification uses an atomic nonce backend.
+- Request verification now binds pair ID, version, and mandatory full body
+  hash before atomic nonce consumption. Shadow and ghost results are hard
+  denials.
+- Python and TypeScript now share HKDF parameters, full body hashes, canonical
+  JWK fingerprints, and 64-byte P1363 ECDSA signatures. A real cross-language
+  integration command runs both directions.
+- Python registration sends the derived request key rather than the plaintext
+  secret; Python key rotation now matches the signed v1.0 rotation contract.
+- Reference revocation routes require admin authentication, and browser demos
+  invoke the server instead of changing only local state.
+- Npm publish manifests include compiled `dist` output and run prepack builds.
+- CI actions and the Redis and PostgreSQL service images are pinned to immutable
+  commits and content digests. CI now runs on the supported Node 24 LTS line.
+- The Argon2 binding and Node type definitions were updated within the selected
+  supported runtime baseline.
+- Live Redis coverage now races 64 uses through two independent clients and
+  requires exactly one first-use winner.
+- PostgreSQL persistence now retains usage caps, ghost/canary identity, and
+  cumulative failure state; a live test covers schema, pending records, CRUD,
+  legacy-schema migration, and connection-restart durability.
+- Active security and protocol documentation now separates implemented test
+  propositions from production, authorization, hardware, FIPS, HA, and audit
+  claims.
+
+## [0.2.0] — 2026-05-18 — Security Hardening Release
+
+This release remediates **two critical** and four high/medium vulnerabilities
 identified during a full penetration test, stress test, and red team assessment.
-All changes are production-ready and comply with IL4/5/6/7 requirements
-(NIST SP 800-53 High, FIPS 140-2/3, zero-trust architecture).
+Historical note corrected 2026-07-15: these changes are implementation and test
+evidence only. They do not establish production readiness, compliance, FIPS
+validation, or a DoD Impact Level authorization.
 
 ### Security Fixes
 
@@ -50,7 +83,7 @@ All changes are production-ready and comply with IL4/5/6/7 requirements
 - **`packages/server/src/rate-limiter.ts`**: Added capacity guard that evicts
   the oldest 10% of keys when the map exceeds 50,000 entries.
 
-### IL4-7 Hardening
+### Additional Security Hardening
 
 - **`packages/server/src/middleware.ts`**:
   - Added HTTP method allowlist (rejects `TRACE`, `CONNECT`, etc.).
@@ -74,10 +107,10 @@ All changes are production-ready and comply with IL4/5/6/7 requirements
 
 ### New Files
 
-- **`SECURITY.md`**: Full security policy, vulnerability history, IL4-7
+- **`SECURITY.md`**: Security policy, vulnerability history, preliminary
   compliance matrix, and deployment recommendations.
 - **`packages/server/tests/security.test.ts`**: 37 adversarial tests covering
-  all 6 CVEs and IL4-7 input validation requirements.
+  the six named findings and input-validation requirements.
 
 ### Test Results
 

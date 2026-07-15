@@ -1,9 +1,9 @@
 /**
  * BPC Audit Log — hash-chained, tamper-evident.
  *
- * IL4-7 hardening / NIST SP 800-53 Rev 5: AU-2, AU-3, AU-9, AU-10, AU-12.
+ * Candidate NIST SP 800-53 Rev 5 evidence: AU-2, AU-3, AU-9, AU-10, AU-12.
  *
- * Non-repudiation model:
+ * Tamper-evidence model:
  *  - Every entry carries a monotonic `seq`, the previous entry's `chainHash`
  *    (`prevHash`), and its own `chainHash = SHA-256(canonical(entry))`.
  *  - Any in-place modification of a historical entry changes its chainHash and
@@ -12,7 +12,7 @@
  *    persist head() = { seq, chainHash } and pass it to verifyChain({ expectedHead }).
  *    A shorter/forked chain than the anchor fails verification.
  *  - MemoryAuditLog is append-only by default (no silent eviction) so the
- *    in-memory trail is itself non-repudiable; durable storage uses PgAuditLog.
+ *    in-memory trail does not silently evict entries; durable storage uses PgAuditLog.
  *  - PgAuditLog stores the chain columns and the schema REVOKEs UPDATE/DELETE/
  *    TRUNCATE and installs triggers that hard-block mutation (defense in depth).
  */
@@ -159,8 +159,8 @@ export function verifyEntries(
 
 /**
  * In-memory append-only audit log.
- * Append-only by default (maxSize = Infinity) so the in-memory trail is itself
- * non-repudiable. A finite maxSize enables bounded memory but is then a lossy
+ * Append-only by default (maxSize = Infinity), but still process-local and
+ * unsigned. A finite maxSize enables bounded memory but is then a lossy
  * archival mode — pair it with PgAuditLog for durable, complete history.
  */
 export class MemoryAuditLog implements AuditLog {

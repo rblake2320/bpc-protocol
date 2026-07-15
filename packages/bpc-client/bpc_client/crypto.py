@@ -24,7 +24,9 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
     SECP256R1,
     generate_private_key,
 )
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import (
     Encoding,
     NoEncryption,
@@ -33,13 +35,15 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from cryptography.hazmat.backends import default_backend
 
+from .runtime_capture import emit_key_generation_capture
+
 
 def _b64url(data: bytes) -> str:
     """Base64url encode without padding."""
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def generate_keypair() -> dict:
+def generate_keypair(runtime_metadata: dict | None = None, capture_details: dict | None = None) -> dict:
     """
     Generate an ECDSA P-256 keypair.
 
@@ -67,6 +71,23 @@ def generate_keypair() -> dict:
     jwk_json = json.dumps(pub_jwk, sort_keys=True, separators=(",", ":"))
     fingerprint = _b64url(hashlib.sha256(jwk_json.encode()).digest())[:20]
 
+    emit_key_generation_capture(
+        {
+            "protocol": "bpc",
+            "packageName": "bpc-client",
+            "event": "bpc.python.keypair.generated",
+            "keyFingerprint": fingerprint,
+            "algorithm": "ECDSA P-256",
+            "extractable": True,
+            "runtime": runtime_metadata or {},
+            "details": {
+                "publicKeyType": pub_jwk["kty"],
+                "curve": pub_jwk["crv"],
+                **(capture_details or {}),
+            },
+        }
+    )
+
     return {
         "private_key": private_key,
         "public_key_jwk": pub_jwk,
@@ -76,23 +97,56 @@ def generate_keypair() -> dict:
 
 def compute_body_hash(body: Optional[bytes]) -> str:
     """
-    Compute BPC body hash: "sha256:" + base64url(SHA-256(body))[:32]
+    Compute BPC body hash: "sha256:" + base64url(SHA-256(body)).
     For empty/None body, hash the empty string.
     """
     data = body if body else b""
     digest = hashlib.sha256(data).digest()
-    return "sha256:" + _b64url(digest)[:32]
+    return "sha256:" + _b64url(digest)
+
+
+def derive_secret_key(secret: str) -> str:
+    """Derive the server-stored BPC request HMAC key (compatible with TypeScript)."""
+    if not secret:
+        raise ValueError("secret must not be empty")
+    key = HKDF(
+        algorithm=SHA256(),
+        length=32,
+        salt=b"bpc-protocol-hmac-salt-v1",
+        info=b"bpc-v1-hmac-key",
+    ).derive(secret.encode())
+    return _b64url(key)
+
+
+def validate_secret(secret: str) -> None:
+    """Enforce the reference client registration policy."""
+    if not isinstance(secret, str):
+        raise ValueError("secret must be a string")
+    if len(secret) < 16 or len(secret) > 128:
+        raise ValueError("secret must contain between 16 and 128 characters")
+    if not any(c.isupper() for c in secret):
+        raise ValueError("secret must contain an uppercase character")
+    if not any(c.islower() for c in secret):
+        raise ValueError("secret must contain a lowercase character")
+    if not any(c.isdigit() for c in secret):
+        raise ValueError("secret must contain a digit")
+    if sum(not c.isalnum() for c in secret) < 2:
+        raise ValueError("secret must contain at least two special characters")
 
 
 def derive_secret_hmac(secret: str, nonce: str, timestamp: int) -> str:
     """
-    Derive per-request HMAC: base64url(HMAC-SHA-256(secret, nonce + str(timestamp)))
+    Derive per-request HMAC using the protocol HKDF key and nonce + timestamp.
     Returns full 256-bit output (43 base64url chars).
     """
     message = (nonce + str(timestamp)).encode()
-    key = secret.encode()
+    key = _b64url_decode(derive_secret_key(secret))
     digest = hmac.new(key, message, hashlib.sha256).digest()
     return _b64url(digest)
+
+
+def _b64url_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * ((4 - len(value) % 4) % 4))
 
 
 def sign_request(
@@ -133,8 +187,11 @@ def sign_request(
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     canonical_bytes = canonical.encode()
 
-    # ECDSA-SHA-256 signature over canonical JSON
-    signature_bytes = private_key.sign(canonical_bytes, ECDSA(SHA256()))
+    # WebCrypto uses fixed-width IEEE P1363 (r || s) for ECDSA signatures.
+    # cryptography emits ASN.1 DER, so normalize to the protocol wire format.
+    der_signature = private_key.sign(canonical_bytes, ECDSA(SHA256()))
+    r, s = decode_dss_signature(der_signature)
+    signature_bytes = r.to_bytes(32, "big") + s.to_bytes(32, "big")
     signature = _b64url(signature_bytes)
 
     # Signed data = base64url(canonical JSON)

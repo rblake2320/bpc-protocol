@@ -26,7 +26,7 @@ registry.register(PairRecord(
     scope="read-write",
     mode="development",
     public_key_jwk={...},  # from bpc-client registration
-    secret_hash="argon2id_hash_here",
+    secret_hash="base64url_hkdf_request_hmac_key",
 ))
 
 app.add_middleware(BPCFastAPIMiddleware, registry=registry)
@@ -71,10 +71,10 @@ if not result.ok:
 4. Decode and parse canonical payload
 5. Protocol version check (`"1.0"`)
 6. Timestamp within ±60s window
-7. Nonce not seen before (replay prevention)
-8. Method and path match payload
-9. Body hash match (SHA-256)
-10. ECDSA-SHA-256 signature valid
-11. Scope enforcement (`read` / `read-write` / `admin`)
+7. Secret-derived HMAC and timestamp valid
+8. Method, path, pair ID, and body hash match payload
+9. ECDSA-SHA-256 signature valid
+10. Scope enforcement (`read` / `read-write` / `admin`)
+11. Atomically consume the nonce after all other checks pass
 
 See the [full spec](https://github.com/rblake2320/bpc-protocol/blob/main/spec/bpc-spec-v1.md).

@@ -1,7 +1,7 @@
 /**
  * BPC Rate Limiter
  *
- * Security hardening (IL4-7 / BPC-06 fix):
+ * Security hardening (BPC-06 fix):
  *  - Added capacity guard: evicts oldest 10% of entries when the in-memory
  *    map exceeds 50k keys, preventing unbounded memory growth under attack.
  *  - Sliding window algorithm prevents burst exploitation at window boundaries.

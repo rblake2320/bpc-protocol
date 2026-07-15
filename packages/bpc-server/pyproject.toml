@@ -40,3 +40,6 @@ Documentation = "https://github.com/rblake2320/bpc-protocol/tree/main/packages/b
 
 [tool.hatch.build.targets.wheel]
 packages = ["bpc_server"]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"

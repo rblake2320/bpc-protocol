@@ -4,8 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.2.x   | ✅ Yes (current, IL4-7 hardened) |
-| 0.1.x   | ❌ No (contains critical vulnerabilities — see below) |
+| 0.2.x   | Yes (current beta line) |
+| 0.1.x   | No (contains the vulnerabilities summarized below) |
 
 ---
 
@@ -25,9 +25,13 @@ BPC Protocol implements a **three-layer authentication model**:
 
 | Layer | Mechanism | Protects Against |
 |-------|-----------|-----------------|
-| Layer 1 | ECDSA P-256 signature over canonical payload | Request tampering, replay attacks |
+| Layer 1 | ECDSA P-256 signature over canonical payload | Request tampering and pair-key proof of possession |
 | Layer 2 | HKDF-SHA-256 derived HMAC (nonce + timestamp) | Secret-less signature forgery |
-| Layer 3 | Argon2id (128 MiB, t=4) stored secret hash | Offline brute-force if DB is compromised |
+| Optional storage helper | Argon2id (128 MiB, t=4) password hash | Reduces offline guessing risk for separately stored human-chosen secrets |
+
+The live BPC request verifier stores an HKDF-SHA-256-derived HMAC key, not an
+Argon2id password hash. The Argon2id helper is a separate API and must not be
+described as part of request signing or verification.
 
 ---
 
@@ -59,13 +63,19 @@ The following vulnerabilities were identified via penetration testing and remedi
 
 ---
 
-### BPC-03 — HIGH: Weak Secret Hashing (SHA-256 instead of HKDF)
+### BPC-03 — HIGH: Undomain-separated Request-Key Derivation
 
 **CVSSv3:** 7.4 (AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N)
 
-**Description:** `hashSecret()` in `packages/core/src/hmac.ts` used a single iteration of `SHA-256(bpc: + secret)` instead of the documented HKDF-SHA-256. This made the derived key trivially brute-forceable with GPU acceleration if the hash was exposed.
+**Description:** `hashSecret()` in `packages/core/src/hmac.ts` used a direct
+SHA-256 construction that did not match the documented, domain-separated
+request-key derivation. Direct SHA-256 and HKDF are both fast; neither is a
+password-hardening KDF.
 
-**Fix:** `hashSecret()` now uses `HKDF-SHA-256` with a fixed info label (`bpc-hmac-key-v1`) and a 256-bit output. The function throws on empty input.
+**Fix:** `hashSecret()` now uses `HKDF-SHA-256` with protocol-specific salt
+`bpc-protocol-hmac-salt-v1`, info `bpc-v1-hmac-key`, and a 256-bit output. The
+function throws on empty input. Reference registration helpers separately
+enforce the project secret policy before deriving this key.
 
 **NIST SP 800-53 controls:** SC-13, IA-5.
 
@@ -77,7 +87,10 @@ The following vulnerabilities were identified via penetration testing and remedi
 
 **Description:** The `/bpc/pairs` endpoint returned the full `StoredPair` object including `secretHash` and `pubJwk` to any unauthenticated caller, enabling offline brute-force attacks and targeted forgery.
 
-**Fix:** Added `PairRegistry.listRedacted()` which strips `secretHash`, `pubJwk`, `failedSigs`, and `expiresAt` from the response. Server implementations **must** use `listRedacted()` for any HTTP-accessible listing endpoint.
+**Fix:** Added `PairRegistry.listRedacted()` which strips `secretHash`, `pubJwk`,
+`failedSigs`, and `expiresAt`. Pair listing remains administrative metadata and
+must still require authorization; redaction is defense in depth, not a public
+access policy.
 
 **NIST SP 800-53 controls:** AC-3, AC-6.
 
@@ -107,24 +120,26 @@ The following vulnerabilities were identified via penetration testing and remedi
 
 ---
 
-## IL4/5/6/7 Compliance Summary
+## Preliminary Control Mapping
 
-BPC Protocol v0.2.0 implements the following controls required for Impact Level 4–7 environments:
+The following mappings identify candidate implementation evidence for assessor
+review. They do not establish compliance, a FIPS validation, a DoD Impact Level,
+or an authorization. There is no current DoD Cloud Computing SRG IL7.
 
 | Control Family | Control | Implementation |
 |---------------|---------|----------------|
-| **IA — Identification & Authentication** | IA-3 | ECDSA P-256 device authentication |
-| | IA-5 | HKDF-SHA-256 key derivation; Argon2id (128 MiB, t=4) storage |
+| **IA — Identification & Authentication** | IA-3 | ECDSA P-256 pair-key authentication |
+| | IA-5 | HKDF-SHA-256 request-key derivation; optional Argon2id storage helper |
 | | IA-5(1) | Secret policy: ≥16 chars, upper+lower+digit+2 special chars |
 | **SC — System & Communications Protection** | SC-8 | Canonical payload integrity (tamper-evident serialization) |
-| | SC-13 | FIPS-approved cryptography: ECDSA P-256, HMAC-SHA-256, HKDF-SHA-256, Argon2id |
+| | SC-13 | ECDSA P-256, HMAC-SHA-256, and HKDF-SHA-256 algorithm use; deployed module validation is external evidence |
 | | SC-5 | DoS protection: rate limiting with capacity guard, input size limits |
 | **SI — System & Information Integrity** | SI-10 | Input validation: method allowlist, pairId format, nonce UUID format, type validation |
 | | SI-11 | Error handling: all error paths return structured results; no unhandled exceptions |
 | | SI-3 | Prototype pollution prevention in canonical serialization |
 | **AU — Audit & Accountability** | AU-2 | Structured audit log with action, severity, pairId, IP, method, path |
 | | AU-3 | Extended audit fields: userAgent, requestId, severity |
-| | AU-9 | Audit log ring buffer (10,000 entries); PostgreSQL backend available |
+| | AU-9 | Hash-chained audit entries and PostgreSQL mutation-denial schema; deployment protection and external anchoring remain required |
 | | AU-12 | All verify_pass and verify_fail events logged |
 | **AC — Access Control** | AC-2 | Pair lifecycle management (active/locked/revoked/rotated/expired) |
 | | AC-3 | Scope enforcement (read/read-write/admin) per HTTP method |
@@ -132,24 +147,28 @@ BPC Protocol v0.2.0 implements the following controls required for Impact Level 
 
 ---
 
-## Cryptographic Primitives
+## Cryptographic Primitives Requested By The Code
 
-| Primitive | Algorithm | Key Size | Standard |
-|-----------|-----------|----------|----------|
-| Digital Signature | ECDSA P-256 | 256-bit | FIPS 186-4, NIST SP 800-186 |
-| Key Derivation (HMAC key) | HKDF-SHA-256 | 256-bit output | NIST SP 800-56C Rev 2 |
-| Message Authentication | HMAC-SHA-256 | 256-bit | FIPS 198-1 |
-| Password Hashing | Argon2id | 128 MiB, t=4, p=4 | NIST SP 800-63B |
-| Nonce Generation | UUID v4 (crypto.randomUUID) | 122-bit entropy | RFC 4122 |
+| Primitive | Algorithm | Use |
+|-----------|-----------|-----|
+| Digital signature | ECDSA P-256 via the runtime provider | Pair request signatures |
+| Key derivation | HKDF-SHA-256 via the runtime provider | Request HMAC key derivation |
+| Message authentication | HMAC-SHA-256 via the runtime provider | Nonce/timestamp secret binding |
+| Optional password hashing helper | Argon2id with project-configured parameters | Optional secret storage helper |
+| Nonce generation | `crypto.randomUUID()` | Per-request replay identifier |
 
 ---
 
-## Deployment Recommendations for IL4-7
+Algorithm selection does not make a product or deployment FIPS validated. FIPS
+140 status requires the exact cryptographic module, version, approved mode, and
+operating environment to appear in applicable CMVP evidence.
+
+## Deployment Recommendations
 
 1. **Use Redis backends** (`RedisNonceStore`, `RedisRateLimiter`, `RedisAnomalyStore`) in production for distributed deployments.
 2. **Use PostgreSQL backends** (`PgPairStore`, `PgAuditLog`) for persistent, auditable storage.
 3. **Enable TLS 1.3** on all transport layers (BPC does not provide transport security).
 4. **Set `expiresAt`** on all pairs to enforce credential rotation schedules.
-5. **Monitor `threatScore()`** from `AnomalyEngine` and alert on scores > 1000.
-6. **Restrict `/bpc/pairs`** to authenticated admin users using `listRedacted()`.
+5. **Monitor `threatScore()`** from `AnomalyEngine` and set a deployment policy within its 0-100 range; the built-in attack verdict threshold is 70.
+6. **Restrict `/bpc/pairs`** to authenticated admin users and return only `listRedacted()` data.
 7. **Use dual-track rate limiting**: separate `MemoryRateLimiter` instances for IP-based and pairId-based limits.

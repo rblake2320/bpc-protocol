@@ -2,7 +2,7 @@
   "name": "bpc-protocol",
   "version": "0.2.0",
   "private": true,
-  "description": "BPC \u2014 Bound Pair Credentials: hardware-bound, pair-verified, replay-proof API authentication protocol",
+  "description": "BPC — Bound Pair Credentials: pair-authorized, signed, replay-resistant API request protocol",
   "workspaces": [
     "packages/core",
     "packages/server",
@@ -11,14 +11,20 @@
   "scripts": {
     "build": "npm run build --workspaces",
     "test": "npm run test --workspaces",
+    "test:redis": "tsx redis-nonce-integration.mts",
+    "test:postgres": "tsx postgres-store-integration.mts",
+    "test:interop": "tsx cross-language-integration.mts",
+    "test:pack": "npm pack --dry-run --workspaces",
     "test:core": "npm run test --workspace=packages/core",
     "test:server": "npm run test --workspace=packages/server",
     "test:client": "npm run test --workspace=packages/client-sdk"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
-    "tsx": "^4.21.0",
+    "@types/node": "^24.13.3",
+    "ioredis": "^5.4.1",
+    "pg": "^8.22.0",
+    "tsx": "^4.23.1",
     "typescript": "^5.4.0",
-    "vitest": "^1.6.0"
+    "vitest": "^4.1.10"
   }
 }

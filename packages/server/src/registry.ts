@@ -1,7 +1,7 @@
 /**
  * BPC Pair Registry
  *
- * Security hardening (IL4-7):
+ * Security hardening:
  *
  *  BPC-04 FIX — Unauthenticated Pair Enumeration:
  *    Added `listRedacted()` which returns pairs with sensitive fields removed
@@ -145,10 +145,10 @@ export class PairRegistry {
    *                     the registry via the BPC-04 enumeration vector.
    *
    * When triggered, the middleware:
-   *   1. Returns ok:true with ghostAlert:true and shadow:true (deceptive success)
+   *   1. Returns a hard authorization denial carrying shadow metadata
    *   2. Logs a CRITICAL severity audit event with full forensic detail
    *   3. Auto-routes the attacker's source IP to Shadow Mode
-   *   4. The attacker believes they succeeded — the SOC is immediately alerted
+   *   4. A separate response layer may return synthetic data without granting access
    *
    * @param registration Standard PairRegistration (kind is forced to 'ghost')
    * @param canaryClass  Which leak surface this canary covers

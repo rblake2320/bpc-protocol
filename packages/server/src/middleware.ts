@@ -1,7 +1,7 @@
 /**
  * BPC Request Verification Middleware — 12-step pipeline + Layer 8 Active Defense
  *
- * IL4-7 hardening applied:
+ * Security hardening applied:
  *  - Step 0: Pre-authentication IP rate limiting via `ipRateLimiter` config field.
  *    This fires BEFORE any BPC header is read, so unauthenticated floods are
  *    throttled at the edge. Separate from the per-pair limiter (`rateLimiter`)
@@ -16,8 +16,8 @@
  *  - Global: method and path validated against allowlists before processing.
  *
  * Layer 8 Active Defense:
- *  - Ghost Pair detection: canary credentials trigger CRITICAL alert + shadow response
- *  - Shadow Mode: locked/ghost pairs return deceptive ok:true with fake session token
+ *  - Ghost Pair detection: canary credentials trigger a CRITICAL alert and hard denial
+ *  - Shadow Mode: locked/ghost pairs remain authorization failures (`ok:false`)
  *    SCOPED to sourceIP + pairId — legitimate users on different IPs are unaffected
  *  - Cryptographic Tarpit: graduated delays per source IP applied BEFORE response
  *    (suspicious=500ms, shadow=2000ms) to occupy attacker connection pools
@@ -38,7 +38,6 @@ import type { ServerNonceStore } from './nonce-store.js';
 import type { AnomalyEngine } from './anomaly.js';
 import type { RateLimiter } from './rate-limiter.js';
 import type { AuditLog } from './audit.js';
-import { randomBytes } from 'node:crypto';
 
 export interface BPCRequestData {
   pairId: string | null;
@@ -69,7 +68,7 @@ export interface BPCServerConfig {
    * Per-IP rate limiter — fires BEFORE any BPC header is read.
    * Recommended: MemoryRateLimiter(200, 60_000) for unauthenticated endpoints.
    * Separate from `rateLimiter` so IP floods cannot exhaust per-pair budgets.
-   * (IL4-7 / BPC-06 fix — NIST SP 800-53 SC-5)
+   * (BPC-06 fix; candidate NIST SP 800-53 SC-5 evidence)
    */
   ipRateLimiter?: RateLimiter;
   /**
@@ -80,7 +79,7 @@ export interface BPCServerConfig {
   auditLog?: AuditLog;            // optional — if omitted, no audit logging
   /**
    * Layer 8: Enable Shadow Mode for locked pairs.
-   * When true, locked pairs return ok:true with shadow:true instead of 'pair_locked'.
+     * When true, locked pairs are marked shadow:true while still returning ok:false.
    * Default: true (recommended for production).
    */
   enableShadowMode?: boolean;
@@ -103,24 +102,6 @@ const SCOPE_ALLOWED_METHODS: Record<string, Set<string>> = {
   'read-write': new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH']),
   'admin':      new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE']),
 };
-
-/**
- * Layer 8: Generate a structurally valid but cryptographically inert fake session token.
- * Returned to attackers in shadow/ghost mode so they believe they succeeded.
- * Tagged with shadowToken:true internally — downstream services MUST filter these.
- */
-function generateShadowToken(): string {
-  // Looks like a real JWT structure but is cryptographically meaningless
-  const header  = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-  const payload = Buffer.from(JSON.stringify({
-    sub: randomBytes(16).toString('hex'),
-    iat: Math.floor(Date.now() / 1000),
-    exp: Math.floor(Date.now() / 1000) + 3600,
-    shadowToken: true,   // INTERNAL TAG — never expose to client
-  })).toString('base64url');
-  const sig = randomBytes(32).toString('base64url');
-  return `${header}.${payload}.${sig}`;
-}
 
 export async function verifyBPCRequest(
   req: BPCRequestData,
@@ -162,7 +143,6 @@ export async function verifyBPCRequest(
   // never learn anything about the pair's actual status.
   if (shadowEnabled && pairId && anomaly.isInShadowState(pairId, sourceIp)) {
     const delayMs = tarpitEnabled ? await anomaly.applyTarpit(sourceIp, 'shadow') : 0;
-    const shadowToken = generateShadowToken();
     await config.auditLog?.write({
       action: 'shadow_mode_hit',
       pairId,
@@ -172,7 +152,7 @@ export async function verifyBPCRequest(
       severity: 'CRITICAL',
       detail: `Shadow mode active for IP ${sourceIp} on pair ${pairId}`,
     });
-    return { ok: true, pairId, shadow: true, tarpitDelayMs: delayMs };
+    return { ok: false, pairId, error: 'shadow_denied', shadow: true, tarpitDelayMs: delayMs };
   }
 
   // Step 1: Per-pair rate limit check (fires after pairId is available from headers).
@@ -231,7 +211,7 @@ export async function verifyBPCRequest(
   // (Detection happens at the end of the pipeline — see ghost check below.)
 
   // Step 5: Pair status checks
-  // Layer 8 Shadow Mode: locked pairs return deceptive ok:true instead of 'pair_locked'
+  // Shadow metadata never changes the authorization result.
   if (pair.status === 'revoked') return deny('pair_revoked');
   if (pair.status === 'locked') {
     if (shadowEnabled) {
@@ -247,7 +227,7 @@ export async function verifyBPCRequest(
         severity: 'HIGH',
         detail: `Locked pair ${req.pairId} — attacker IP ${sourceIp} routed to shadow mode`,
       });
-      return { ok: true, pairId: req.pairId, shadow: true, tarpitDelayMs: delayMs };
+      return { ok: false, pairId: req.pairId, error: 'pair_locked', shadow: true, tarpitDelayMs: delayMs };
     }
     return deny('pair_locked');
   }
@@ -261,7 +241,7 @@ export async function verifyBPCRequest(
     if (shadowEnabled) {
       await anomaly.enterShadowState(req.pairId, sourceIp, 'failedSigs_threshold');
       const delayMs = tarpitEnabled ? await anomaly.applyTarpit(sourceIp, 'shadow') : 0;
-      return { ok: true, pairId: req.pairId, shadow: true, tarpitDelayMs: delayMs };
+      return { ok: false, pairId: req.pairId, error: 'pair_locked', shadow: true, tarpitDelayMs: delayMs };
     }
     return deny('pair_locked');
   }
@@ -294,7 +274,7 @@ export async function verifyBPCRequest(
       // Should have been caught by the shadow state check above, but belt-and-suspenders
       await anomaly.enterShadowState(req.pairId, sourceIp, 'verdict_shadow');
       tarpitDelayApplied = await anomaly.applyTarpit(sourceIp, 'shadow');
-      return { ok: true, pairId: req.pairId, shadow: true, tarpitDelayMs: tarpitDelayApplied };
+      return { ok: false, pairId: req.pairId, error: 'shadow_denied', shadow: true, tarpitDelayMs: tarpitDelayApplied };
     } else if (verdict === 'attack') {
       return deny('rate_limit_exceeded');
     }
@@ -348,15 +328,17 @@ export async function verifyBPCRequest(
     return deny('timestamp_expired', true);
   }
 
-  // Step 8: Nonce not seen before
-  if (await nonceStore.checkAndConsume(rawNonce)) {
-    await anomaly.recordReplay(req.pairId);
-    return deny('replay_detected');
-  }
-
-  // Step 9: Method and path match
+  // Step 8: Method and path match. The nonce is consumed only after all
+  // cryptographic and request-binding checks pass so an invalid request cannot
+  // burn the nonce of a captured legitimate request.
   if (payload['method'] !== req.method || payload['path'] !== req.path) {
     return deny('method_path_mismatch', true);
+  }
+  if (payload['pair_id'] !== req.pairId) {
+    return deny('pair_id_mismatch', true);
+  }
+  if (payload['version'] !== BPC_PROTOCOL_VERSION) {
+    return deny('version_mismatch', true);
   }
 
   // Step 10: Scope enforcement
@@ -370,11 +352,12 @@ export async function verifyBPCRequest(
   }
 
   // Step 11: Body hash verification
-  const payloadBodyHash = payload['body_hash'] as string | undefined;
-  if (payloadBodyHash) {
-    if (!req.bodyHash) return deny('missing_body_hash', true);
-    if (payloadBodyHash !== req.bodyHash) return deny('invalid_body_hash', true);
+  const payloadBodyHash = payload['body_hash'];
+  if (typeof payloadBodyHash !== 'string' || payloadBodyHash.length === 0) {
+    return deny('missing_body_hash', true);
   }
+  if (!req.bodyHash) return deny('missing_body_hash', true);
+  if (payloadBodyHash !== req.bodyHash) return deny('invalid_body_hash', true);
 
   // Step 12: Verify ECDSA signature over canonical payload
   let valid = false;
@@ -387,6 +370,13 @@ export async function verifyBPCRequest(
 
   if (!valid) {
     return deny('invalid_signature', true);
+  }
+
+  // Atomic first-acceptance gate. Concurrent valid replays can both complete
+  // signature verification, but only one can consume the nonce.
+  if (await nonceStore.checkAndConsume(rawNonce)) {
+    await anomaly.recordReplay(req.pairId);
+    return deny('replay_detected');
   }
 
   // ── Layer 8: Ghost Pair post-verification trap ────────────────────────────
@@ -417,13 +407,11 @@ export async function verifyBPCRequest(
       }),
     });
 
-    // Return deceptive success — attacker believes they authenticated.
-    // SECURITY: ghostAlert and canaryClass are NEVER returned to the caller.
-    // The wire response is indistinguishable from a legitimate shadow-mode response.
-    // All forensic data is written exclusively to the audit log above.
+    // Hard denial: downstream code may safely authorize only on `ok === true`.
     return {
-      ok: true,
+      ok: false,
       pairId: req.pairId,
+      error: 'ghost_pair_denied',
       shadow: true,
       tarpitDelayMs: delayMs,
     };

@@ -1,5 +1,5 @@
 /**
- * BPC Full-Stack Example Server — IL4-7 Hardened
+ * BPC Full-Stack Example Server — security test fixture
  *
  * Security controls demonstrated:
  *  - Admin endpoints (/bpc/pairs, /bpc/anomaly, /bpc/audit) require
@@ -34,7 +34,8 @@ const PORT = 3100;
 // ── Admin authentication ──────────────────────────────────────────────────────
 // In production, load this from a secrets manager (Vault, AWS Secrets Manager,
 // GCP Secret Manager, etc.) — never hardcode in source.
-// For IL5-7, replace bearerToken with a verifier that validates a JWT or mTLS cert.
+// For higher-assurance deployments, replace bearerToken with a verifier that
+// validates a JWT, mTLS certificate, or another deployment-approved identity.
 const ADMIN_AUTH: AdminAuthConfig = {
   bearerToken: process.env['BPC_ADMIN_TOKEN'] ?? 'change-me-in-production-use-32-random-bytes',
 };
@@ -99,6 +100,12 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
 
     // ── Revocation endpoint ──────────────────────────────────────────────────
     if (method === 'POST' && path === '/bpc/revoke') {
+      if (!await verifyAdminRequest(
+        req.headers as Record<string, string | string[] | undefined>, ADMIN_AUTH,
+      )) {
+        json(res, 401, { error: 'unauthorized' });
+        return;
+      }
       const rawBody = await readBody(req);
       let body: { pairId?: string };
       try {
@@ -240,7 +247,7 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
   }
 });
 
-// ── Global safety net (IL4-7: process must never crash silently) ──────────────
+// ── Global safety net: process must never crash silently ─────────────────────
 process.on('uncaughtException', (err) => {
   console.error('[CRITICAL] Uncaught exception — server continuing:', err);
 });
@@ -249,7 +256,7 @@ process.on('unhandledRejection', (reason) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`BPC Full-Stack Example Server (IL4-7 Hardened) running on http://localhost:${PORT}`);
+  console.log(`BPC Full-Stack Example Server running on http://localhost:${PORT}`);
   console.log('Endpoints:');
   console.log('  POST /bpc/register                  -- Register a new pair');
   console.log('  POST /bpc/revoke                    -- Revoke a pair');

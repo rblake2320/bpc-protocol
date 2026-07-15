@@ -1,7 +1,7 @@
 /**
  * BPC Key Rotation Handler
  *
- * Security hardening (IL4-7):
+ * Security hardening:
  *
  *  BPC-02 FIX — Rotation DoS (ReferenceError: payload is not defined):
  *    `payload` is declared in the outer scope so it is accessible after the
@@ -22,7 +22,7 @@
  *  ROT-03 FIX — Audit emission:
  *    Rotation now emits chained audit events (rotate + register on success,
  *    verify_fail on bad signature) so the most security-sensitive operation is
- *    no longer invisible in the non-repudiable trail.
+ *    no longer invisible in the hash-chained audit trail.
  *
  *  ROT-04 — Public key structural validation (reject malformed/unsupported keys).
  *

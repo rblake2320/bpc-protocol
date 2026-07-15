@@ -39,7 +39,7 @@ import {
 
 const PORT         = 3101;
 const DEMO_DIR     = dirname(fileURLToPath(import.meta.url));
-const ADMIN_TOKEN  = process.env['BPC_ADMIN_TOKEN'] ?? 'demo-admin-token';
+const ADMIN_TOKEN  = process.env['BPC_ADMIN_TOKEN'] ?? 'demo-admin-token-change-before-use-32';
 const EVENT_LOG    = join(DEMO_DIR, 'analytics.ndjson');
 const SERVER_START = Date.now();
 
@@ -167,6 +167,12 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
 
     // ── Revocation ───────────────────────────────────────────────────────
     if (method === 'POST' && path === '/bpc/revoke') {
+      if (!await verifyAdminRequest(
+        req.headers as Record<string, string | string[] | undefined>, ADMIN_AUTH,
+      )) {
+        json(res, 401, { error: 'unauthorized' });
+        return;
+      }
       const rawBody = await readBody(req);
       let body: { pairId?: string };
       try {

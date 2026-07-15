@@ -1,7 +1,7 @@
 /**
  * BPC Admin Endpoint Authentication
  *
- * IL4-7 hardening — Chain-3 / BPC-04 fix:
+ * Administrative authentication hardening — Chain-3 / BPC-04 fix:
  *
  * The /bpc/pairs, /bpc/anomaly, and /bpc/audit endpoints MUST be protected
  * by authentication. This module provides:
@@ -18,10 +18,10 @@
  *
  * Usage:
  *   const adminAuth: AdminAuthConfig = {
- *     // Option A: static bearer token (suitable for IL4, internal tools)
+ *     // Option A: static bearer token for a bounded internal deployment
  *     bearerToken: process.env.BPC_ADMIN_TOKEN,
  *
- *     // Option B: custom async verifier (suitable for IL5-7, production)
+ *     // Option B: deployment-specific verifier such as JWT, mTLS, or OIDC
  *     verifier: async (req) => {
  *       const token = req.headers['authorization']?.replace('Bearer ', '');
  *       return await verifyJwt(token, process.env.JWKS_URI);
@@ -34,6 +34,8 @@
  *   }
  */
 
+import { timingSafeEqual } from 'node:crypto';
+
 /** Minimal request shape needed for admin auth — avoids coupling to Node.js http types. */
 export interface AdminRequestHeaders {
   authorization?: string;
@@ -45,7 +47,8 @@ export interface AdminAuthConfig {
    * Static bearer token.
    * The incoming `Authorization: Bearer <token>` header must match this value.
    * Use a cryptographically random token of at least 32 bytes (256 bits).
-   * Suitable for IL4 internal deployments. For IL5-7, use `verifier` instead.
+   * A static token may suit a bounded internal deployment. Higher-assurance
+   * environments should provide a deployment-specific `verifier` instead.
    */
   bearerToken?: string;
 
@@ -73,10 +76,13 @@ export async function verifyAdminRequest(
 
   // Bearer token check
   if (config.bearerToken !== undefined) {
+    const expected = Buffer.from(config.bearerToken, 'utf8');
+    if (expected.byteLength < 32) return false;
     const authHeader = headers['authorization'];
     if (typeof authHeader !== 'string') return false;
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
-    if (token !== config.bearerToken) return false;
+    const presented = Buffer.from(token, 'utf8');
+    if (presented.byteLength !== expected.byteLength || !timingSafeEqual(presented, expected)) return false;
   }
 
   // Custom verifier check
