@@ -321,12 +321,15 @@ describe('governed Redis replay composition', () => {
 
   it('rejects heterogeneous namespace horizons and preserves the longer quarantine', async () => {
     const redis = new FakeAtomicRedis();
-    redis.setContinuity('heterogeneous', 'epoch-a', '200:200');
-    const short = await createGovernedRedisBackedNonceStore(
-      redis,
-      options('heterogeneous'),
-    );
+    const fixedNow = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(fixedNow);
+    let short: Awaited<ReturnType<typeof createGovernedRedisBackedNonceStore>> | undefined;
     try {
+      redis.setContinuity('heterogeneous', 'epoch-a', '200:200');
+      short = await createGovernedRedisBackedNonceStore(
+        redis,
+        options('heterogeneous'),
+      );
       await expect(createGovernedRedisBackedNonceStore(redis, {
         namespace: 'heterogeneous',
         sigWindowMs: 500,
@@ -334,12 +337,13 @@ describe('governed Redis replay composition', () => {
         continuitySafetyAllowanceMs: 0,
         reconcileIntervalMs: 50,
       })).rejects.toBeInstanceOf(RedisContinuityConfigurationError);
-      expect(redis.quarantineTtl('heterogeneous')).toBeGreaterThanOrEqual(1_000);
+      expect(redis.quarantineTtl('heterogeneous')).toBe(1_000);
       await expect(short.nonceStore.checkAndConsume('n-heterogeneous'))
         .rejects.toBeInstanceOf(AuthorizationQuarantineError);
       expect(redis.hasNonce('heterogeneous', 'n-heterogeneous')).toBe(false);
     } finally {
-      await short.stop();
+      await short?.stop();
+      clock.mockRestore();
     }
   });
 

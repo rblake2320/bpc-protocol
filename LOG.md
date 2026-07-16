@@ -2,6 +2,13 @@
 
 ## 2026-07-16
 
+- Enterprise Actions run `29476950456` exposed two evidence defects: the
+  heterogeneous-horizon unit test measured a live countdown and intermittently
+  saw 999ms instead of the just-established 1000ms horizon, and the root npm
+  workspace runner continued into a later workspace after that failure. The
+  test now freezes `Date.now()` and asserts the exact 1000ms property; the root
+  command is an explicit `core && server && client` chain. This changes test
+  determinism and failure propagation, not the production continuity logic.
 - Corrected PR #14 after independent review found that its continuity check was
   a non-atomic local preflight, bootstrap returned before a first reconcile,
   CONFIG parsing accepted ambiguous shapes, and the interval loop could

@@ -110,3 +110,14 @@ product or security claims. Git history contains the original wording.
   use the awaited governed factory.
 - **Restore only with:** not applicable; use the governed composition rather
   than weakening its boundary.
+
+## P-012: Live wall-clock TTL as an exact unit-test boundary
+
+- **Parked:** reading a countdown from the host clock and requiring it to remain
+  at least 1000ms after awaited work.
+- **Reason:** one millisecond of legitimate scheduling produced a false failure
+  without identifying a shorter configured quarantine.
+- **Current design:** freeze the fake model's clock and assert the exact 1000ms
+  horizon; live Redis tests remain responsible for real countdown behavior.
+- **Restore only with:** a deterministic clock supplied by the test harness that
+  preserves the same exact semantic assertion.
