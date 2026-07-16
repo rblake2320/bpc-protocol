@@ -49,6 +49,85 @@ export interface RedisContinuityClient {
   set(key: string, value: string, nx: 'NX'): Promise<'OK' | null>;
 }
 
+/**
+ * The gate the verifier request path depends on: assert authorization is
+ * currently acceptable, throwing while quarantined. RedisContinuityGuard
+ * implements this; middleware only needs this narrow surface.
+ */
+export interface ContinuityGate {
+  assertAcceptable(nowMs?: number): void;
+}
+
+/** Redis surface for reading the eviction policy at startup. */
+export interface RedisConfigClient {
+  /** CONFIG GET parameter -> ['maxmemory-policy', '<value>'] or a map. */
+  config(op: 'GET', parameter: string): Promise<string[] | Record<string, string>>;
+}
+
+export class EvictionPolicyError extends Error {
+  readonly code = 'redis_eviction_policy_unsafe';
+  constructor(readonly policy: string) {
+    super(
+      `Redis maxmemory-policy is '${policy}'; BPC requires 'noeviction' so memory ` +
+      `pressure rejects writes instead of silently evicting nonce keys (issue #11/#13).`,
+    );
+    this.name = 'EvictionPolicyError';
+  }
+}
+
+/**
+ * Assert Redis will not evict keys under memory pressure. Any policy other
+ * than 'noeviction' can drop TTL'd nonce keys while the no-TTL continuity
+ * marker survives, reopening a replay window the marker cannot detect. Call
+ * this when constructing a Redis-backed verifier; it throws EvictionPolicyError
+ * on an unsafe policy and fails closed (rethrows) if the policy cannot be read.
+ */
+export async function assertNoEvictionPolicy(redis: RedisConfigClient): Promise<void> {
+  let policy: string | undefined;
+  const raw = await redis.config('GET', 'maxmemory-policy');
+  if (Array.isArray(raw)) {
+    // ioredis returns ['maxmemory-policy', '<value>']
+    const idx = raw.indexOf('maxmemory-policy');
+    policy = idx >= 0 ? raw[idx + 1] : raw[1];
+  } else if (raw && typeof raw === 'object') {
+    policy = raw['maxmemory-policy'];
+  }
+  if (typeof policy !== 'string' || policy.length === 0) {
+    throw new EvictionPolicyError('unknown');
+  }
+  if (policy !== 'noeviction') {
+    throw new EvictionPolicyError(policy);
+  }
+}
+
+/** Stop handle for a periodic reconcile loop. */
+export interface ReconcileLoopHandle {
+  stop(): void;
+}
+
+/**
+ * Start a periodic reconcile so mid-run state loss / failover is detected
+ * between requests, not only at boot. The interval MUST be shorter than the
+ * nonce acceptance horizon so a loss cannot pass unnoticed within one window.
+ * Reconcile errors are swallowed here because reconcile() itself fails closed
+ * (it quarantines on any store error); the loop must not crash the process.
+ */
+export function startContinuityReconcileLoop(
+  guard: { reconcile(): Promise<void> },
+  intervalMs: number,
+  onError?: (err: unknown) => void,
+): ReconcileLoopHandle {
+  if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) {
+    throw new RangeError('intervalMs must be a positive safe integer');
+  }
+  const timer = setInterval(() => {
+    void guard.reconcile().catch((err) => onError?.(err));
+  }, intervalMs);
+  // Do not keep the event loop alive solely for this tick.
+  (timer as { unref?: () => void }).unref?.();
+  return { stop: () => clearInterval(timer) };
+}
+
 export interface RedisContinuityOptions {
   /** Isolates the marker by deployment/environment. */
   namespace: string;
