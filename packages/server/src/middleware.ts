@@ -374,7 +374,13 @@ export async function verifyBPCRequest(
 
   // Atomic first-acceptance gate. Concurrent valid replays can both complete
   // signature verification, but only one can consume the nonce.
-  if (await nonceStore.checkAndConsume(rawNonce)) {
+  let replayDetected: boolean;
+  try {
+    replayDetected = await nonceStore.checkAndConsume(rawNonce);
+  } catch {
+    return deny('replay_store_unavailable');
+  }
+  if (replayDetected) {
     await anomaly.recordReplay(req.pairId);
     return deny('replay_detected');
   }

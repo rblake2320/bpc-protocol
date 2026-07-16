@@ -76,3 +76,17 @@ product or security claims. Git history contains the original wording.
   store. Cross-node atomicity is not implemented there.
 - **Restore only with:** a shared atomic Python backend and a two-process live
   integration test.
+
+## P-010: Lossless Redis replay continuity across failover
+
+- **Parked:** claiming that the TypeScript Redis nonce backend alone preserves
+  replay evidence through every restart, failover, eviction, or data-loss event.
+- **Reason:** atomic `SET NX PX` proves concurrent first-use ordering while the
+  keys exist. Redis persistence and replication can have deployment-specific
+  loss windows, and the package cannot detect arbitrary deletion.
+- **Current claim:** named Redis errors fail closed; deployments must use
+  `noeviction` and quarantine authorization for the full retention horizon
+  after any failover whose nonce durability is uncertain.
+- **Restore only with:** a deployment-specific durable topology, measured loss
+  bounds, restart/failover evidence, deletion detection or trusted checkpoints,
+  and adversarial recovery tests.

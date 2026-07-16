@@ -14,6 +14,21 @@ same credential must use the same atomic nonce backend. The repository now has
 a real Redis integration test and CI service rather than relying only on an
 in-memory substitute.
 
+## 2026-07-15: Bind replay retention to request acceptance
+
+A caller-selected Redis TTL can be shorter than the period in which a signed
+request remains acceptable, reopening replay after the key expires. The
+standalone builder derives retention from both sides of the signature window
+plus a safety allowance and rejects unsafe configuration before startup.
+
+## 2026-07-15: Redis uncertainty is denial, never fallback
+
+Timeout, disconnect, read-only state, OOM, and unknown Redis replies provide no
+proof that a nonce was consumed. The verifier returns a named 503 denial and
+does not fall back to local memory. Redis persistence and replication can still
+have loss windows; after an uncertain failover, deployment policy must
+quarantine authorization for the complete nonce-retention horizon.
+
 ## 2026-07-15: Separate algorithms from module validation
 
 Documentation names the algorithms the code requests. It does not claim FIPS
