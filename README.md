@@ -44,7 +44,9 @@ npm run test:pack
 
 Distributed replay testing uses built package entry points and a real Redis
 service. It exercises two independent verifiers, a 64-request race, TTL,
-namespace isolation, disconnect, and `noeviction` OOM denial:
+namespace isolation, shared continuity quarantine and recovery, an epoch swap
+between preflight and consumption, unsafe-policy rejection, disconnect, and
+`noeviction` OOM denial:
 
 ```powershell
 $env:BPC_TEST_REDIS_URL = "redis://127.0.0.1:6379"
@@ -83,10 +85,15 @@ Narrowly established properties include:
 - Unknown, inactive, expired, capped, or revoked pairs fail authorization.
 - Rotation is authorized by the existing pair key and preserves the prior
   scope rather than permitting scope escalation.
-- The TypeScript Redis builder derives nonce retention from the signature
-  window, requires an explicit namespace, and turns uncertain Redis state into
-  a named fail-closed denial. Redis data-loss continuity remains a deployment
-  boundary; in-memory factories are development defaults.
+- The governed TypeScript Redis factory derives nonce retention from the
+  signature window, requires an explicit namespace and live `noeviction`,
+  binds one shared retention/quarantine configuration, reconciles a shared
+  continuity quarantine, and validates the config and expected epoch in the
+  same Redis EVAL that consumes the nonce. Unknown state is a named fail-closed
+  denial. Uncheckpointed cold-start rollback (including a different historical
+  epoch), same-epoch rollback, asynchronous replication loss, selective
+  deletion, and runtime policy drift remain deployment boundaries; the old
+  non-continuity Redis helper requires an explicit development marker.
 - Redis and PostgreSQL backends are implemented for shared and persistent
   state. Production claims still require deployment-specific failure,
   recovery, durability, and access-control evidence.

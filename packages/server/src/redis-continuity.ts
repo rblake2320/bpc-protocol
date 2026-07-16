@@ -23,17 +23,20 @@
  * SELECTIVE eviction — a `maxmemory-policy` of `volatile-*`/`allkeys-lru`
  * can evict individual TTL'd nonce keys under memory pressure while the
  * no-TTL marker survives, silently reopening a replay window with the marker
- * still "intact". Redis MUST therefore run with `maxmemory-policy noeviction`
- * so that memory pressure rejects writes (the nonce SET then fails and the
- * existing single-command fail-closed path in redis-nonce.ts triggers)
- * rather than silently dropping nonces. Enforcing that policy from the
- * client is out of scope for the smallest fix and is tracked as follow-up.
+ * still "intact". Redis MUST therefore run with `maxmemory-policy noeviction`.
+ * createGovernedRedisBackedNonceStore() checks that policy at bootstrap and
+ * during reconciliation. Deployment ACLs must also prevent ungoverned runtime
+ * policy changes between checks.
  */
 
 export class AuthorizationQuarantineError extends Error {
   readonly code = 'authorization_quarantined';
   constructor(
-    readonly reason: 'continuity_marker_lost' | 'continuity_epoch_changed' | 'continuity_store_unavailable',
+    readonly reason:
+      | 'continuity_marker_lost'
+      | 'continuity_epoch_changed'
+      | 'continuity_config_mismatch'
+      | 'continuity_store_unavailable',
     readonly quarantinedUntilMs: number,
   ) {
     super(`Authorization quarantined (${reason}) until ${quarantinedUntilMs}`);
@@ -60,8 +63,8 @@ export interface ContinuityGate {
 
 /** Redis surface for reading the eviction policy at startup. */
 export interface RedisConfigClient {
-  /** CONFIG GET parameter -> ['maxmemory-policy', '<value>'] or a map. */
-  config(op: 'GET', parameter: string): Promise<string[] | Record<string, string>>;
+  /** Return type is unknown because ioredis deliberately types CONFIG that way. */
+  config(op: 'GET', parameter: string): Promise<unknown>;
 }
 
 export class EvictionPolicyError extends Error {
@@ -86,11 +89,19 @@ export async function assertNoEvictionPolicy(redis: RedisConfigClient): Promise<
   let policy: string | undefined;
   const raw = await redis.config('GET', 'maxmemory-policy');
   if (Array.isArray(raw)) {
-    // ioredis returns ['maxmemory-policy', '<value>']
-    const idx = raw.indexOf('maxmemory-policy');
-    policy = idx >= 0 ? raw[idx + 1] : raw[1];
+    // ioredis returns exactly ['maxmemory-policy', '<value>'] for this query.
+    if (raw.length === 2 && raw[0] === 'maxmemory-policy' && typeof raw[1] === 'string') {
+      policy = raw[1];
+    }
   } else if (raw && typeof raw === 'object') {
-    policy = raw['maxmemory-policy'];
+    const record = raw as Record<string, unknown>;
+    if (
+      Object.keys(record).length === 1
+      && Object.hasOwn(record, 'maxmemory-policy')
+      && typeof record['maxmemory-policy'] === 'string'
+    ) {
+      policy = record['maxmemory-policy'];
+    }
   }
   if (typeof policy !== 'string' || policy.length === 0) {
     throw new EvictionPolicyError('unknown');
@@ -102,7 +113,16 @@ export async function assertNoEvictionPolicy(redis: RedisConfigClient): Promise<
 
 /** Stop handle for a periodic reconcile loop. */
 export interface ReconcileLoopHandle {
-  stop(): void;
+  stop(): Promise<void>;
+}
+
+export interface ReconcileLoopOptions {
+  /** Reconcile cadence; must be shorter than the nonce retention horizon. */
+  intervalMs: number;
+  /** Complete period for which an accepted nonce remains replay-relevant. */
+  retentionMs: number;
+  /** Optional operational observer. Observer failures are contained. */
+  onError?: (err: unknown) => void;
 }
 
 /**
@@ -111,21 +131,63 @@ export interface ReconcileLoopHandle {
  * nonce acceptance horizon so a loss cannot pass unnoticed within one window.
  * Reconcile errors are swallowed here because reconcile() itself fails closed
  * (it quarantines on any store error); the loop must not crash the process.
+ * The loop serializes reconcile() promises. If an implementation returns on a
+ * client-side timeout without cancelling its underlying I/O, that external
+ * operation can settle later and must be bounded by the caller.
  */
 export function startContinuityReconcileLoop(
   guard: { reconcile(): Promise<void> },
-  intervalMs: number,
-  onError?: (err: unknown) => void,
+  options: ReconcileLoopOptions,
 ): ReconcileLoopHandle {
+  const { intervalMs, retentionMs, onError } = options;
   if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) {
     throw new RangeError('intervalMs must be a positive safe integer');
   }
-  const timer = setInterval(() => {
-    void guard.reconcile().catch((err) => onError?.(err));
-  }, intervalMs);
-  // Do not keep the event loop alive solely for this tick.
-  (timer as { unref?: () => void }).unref?.();
-  return { stop: () => clearInterval(timer) };
+  if (!Number.isSafeInteger(retentionMs) || retentionMs <= 0) {
+    throw new RangeError('retentionMs must be a positive safe integer');
+  }
+  if (intervalMs >= retentionMs) {
+    throw new RangeError('intervalMs must be shorter than retentionMs');
+  }
+
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let inFlight: Promise<void> = Promise.resolve();
+
+  const report = (err: unknown): void => {
+    try {
+      onError?.(err);
+    } catch {
+      // Observability must not turn a fail-closed reconciliation into an
+      // unhandled rejection or terminate the verifier process.
+    }
+  };
+
+  const schedule = (): void => {
+    if (stopped) return;
+    timer = setTimeout(() => {
+      if (stopped) return;
+      inFlight = (async () => {
+        try {
+          await guard.reconcile();
+        } catch (err) {
+          report(err);
+        }
+      })().finally(schedule);
+    }, intervalMs);
+    (timer as { unref?: () => void }).unref?.();
+  };
+
+  schedule();
+  return {
+    async stop(): Promise<void> {
+      if (!stopped) {
+        stopped = true;
+        if (timer !== undefined) clearTimeout(timer);
+      }
+      await inFlight;
+    },
+  };
 }
 
 export interface RedisContinuityOptions {
@@ -167,6 +229,11 @@ async function withTimeout<T>(op: Promise<T>, timeoutMs: number): Promise<T> {
   }
 }
 
+/**
+ * Low-level continuity primitive retained for compatibility and focused tests.
+ * Its preflight is not atomic with a separate nonce store. Production Redis
+ * composition must use createGovernedRedisBackedNonceStore().
+ */
 export class RedisContinuityGuard {
   private readonly markerKey: string;
   private readonly quarantineMs: number;
@@ -176,8 +243,11 @@ export class RedisContinuityGuard {
 
   /** Epoch this process trusts; null until first successful establish. */
   private trustedEpoch: string | null = null;
-  /** now() < this ⇒ authorization is quarantined (fail closed). */
-  private quarantinedUntilMs = 0;
+  /** A new guard is closed until its first successful reconciliation. */
+  private initialized = false;
+  /** now() < this => authorization is quarantined (fail closed). */
+  private quarantinedUntilMs = Number.POSITIVE_INFINITY;
+  private quarantineReason: AuthorizationQuarantineError['reason'] = 'continuity_store_unavailable';
 
   constructor(
     private readonly redis: RedisContinuityClient,
@@ -214,6 +284,7 @@ export class RedisContinuityGuard {
   private enterQuarantine(reason: AuthorizationQuarantineError['reason'], nowMs: number): void {
     const until = nowMs + this.quarantineMs;
     if (until > this.quarantinedUntilMs) this.quarantinedUntilMs = until;
+    this.quarantineReason = reason;
   }
 
   /**
@@ -229,6 +300,8 @@ export class RedisContinuityGuard {
       current = await withTimeout(this.redis.get(this.markerKey), this.commandTimeoutMs);
     } catch {
       // Unknown continuity ⇒ fail closed.
+      this.initialized = true;
+      if (!Number.isFinite(this.quarantinedUntilMs)) this.quarantinedUntilMs = 0;
       this.enterQuarantine('continuity_store_unavailable', nowMs);
       return;
     }
@@ -238,12 +311,17 @@ export class RedisContinuityGuard {
       // Claim a fresh epoch and quarantine until pre-loss nonces expire.
       const epoch = this.newEpoch();
       try {
-        await withTimeout(this.redis.set(this.markerKey, epoch, 'NX'), this.commandTimeoutMs);
+        const setResult = await withTimeout(this.redis.set(this.markerKey, epoch, 'NX'), this.commandTimeoutMs);
+        if (setResult !== 'OK' && setResult !== null) throw new Error('invalid continuity SET response');
       } catch {
+        this.initialized = true;
+        if (!Number.isFinite(this.quarantinedUntilMs)) this.quarantinedUntilMs = 0;
         this.enterQuarantine('continuity_store_unavailable', nowMs);
         return;
       }
-      this.trustedEpoch = epoch;
+      this.trustedEpoch = null;
+      this.initialized = true;
+      if (!Number.isFinite(this.quarantinedUntilMs)) this.quarantinedUntilMs = 0;
       this.enterQuarantine('continuity_marker_lost', nowMs);
       return;
     }
@@ -252,12 +330,16 @@ export class RedisContinuityGuard {
       // First reconcile of this process: adopt what is there, no quarantine —
       // the running key space is intact and this epoch is our baseline.
       this.trustedEpoch = current;
+      this.initialized = true;
+      if (!Number.isFinite(this.quarantinedUntilMs)) this.quarantinedUntilMs = 0;
       return;
     }
 
     if (current !== this.trustedEpoch) {
       // Marker changed under us: failover/restore to a different instance.
       this.trustedEpoch = current;
+      this.initialized = true;
+      if (!Number.isFinite(this.quarantinedUntilMs)) this.quarantinedUntilMs = 0;
       this.enterQuarantine('continuity_epoch_changed', nowMs);
     }
   }
@@ -267,11 +349,8 @@ export class RedisContinuityGuard {
    * nonce. Throws AuthorizationQuarantineError while quarantined.
    */
   assertAcceptable(nowMs = this.now()): void {
-    if (nowMs < this.quarantinedUntilMs) {
-      const reason = this.trustedEpoch === null
-        ? 'continuity_store_unavailable'
-        : 'continuity_marker_lost';
-      throw new AuthorizationQuarantineError(reason, this.quarantinedUntilMs);
+    if (!this.initialized || nowMs < this.quarantinedUntilMs) {
+      throw new AuthorizationQuarantineError(this.quarantineReason, this.quarantinedUntilMs);
     }
   }
 }

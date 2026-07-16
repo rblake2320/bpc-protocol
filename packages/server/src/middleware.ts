@@ -41,7 +41,7 @@ import type { ServerNonceStore } from './nonce-store.js';
 import type { AnomalyEngine } from './anomaly.js';
 import type { RateLimiter } from './rate-limiter.js';
 import type { AuditLog } from './audit.js';
-import type { ContinuityGate } from './redis-continuity.js';
+import { AuthorizationQuarantineError, type ContinuityGate } from './redis-continuity.js';
 
 export interface BPCRequestData {
   pairId: string | null;
@@ -403,7 +403,10 @@ export async function verifyBPCRequest(
   let replayDetected: boolean;
   try {
     replayDetected = await nonceStore.checkAndConsume(rawNonce);
-  } catch {
+  } catch (error) {
+    if (error instanceof AuthorizationQuarantineError) {
+      return deny('authorization_quarantined');
+    }
     return deny('replay_store_unavailable');
   }
   if (replayDetected) {

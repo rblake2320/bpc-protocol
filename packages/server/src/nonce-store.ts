@@ -1,4 +1,5 @@
 import type { NonceStoreBackend } from './store.js';
+import { AuthorizationQuarantineError } from './redis-continuity.js';
 
 export class NonceStoreUnavailableError extends Error {
   readonly code = 'replay_store_unavailable';
@@ -23,7 +24,7 @@ export class ServerNonceStore {
     try {
       return await this.backend.checkAndConsume(nonce, this.windowMs);
     } catch (error) {
-      if (error instanceof NonceStoreUnavailableError) throw error;
+      if (error instanceof NonceStoreUnavailableError || error instanceof AuthorizationQuarantineError) throw error;
       throw new NonceStoreUnavailableError(error);
     }
   }

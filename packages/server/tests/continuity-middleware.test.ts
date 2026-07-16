@@ -100,4 +100,21 @@ describe('verifyBPCRequest — continuity gate wiring (#13)', () => {
     const result = await verifyBPCRequest(makeReq(pairId, signedData, signature, bodyHash), registry, nonceStore, anomaly, { sigWindowMs: 60_000 });
     expect(result.ok).toBe(true);
   });
+
+  it('maps a quarantine raised atomically by nonce consumption to the named denial', async () => {
+    const { signedData, signature, bodyHash } = await buildSignedRequest(keypair.privateKey, pairId, secretHash);
+    const atomicQuarantineStore = new ServerNonceStore({
+      checkAndConsume: async () => {
+        throw new AuthorizationQuarantineError('continuity_epoch_changed', Date.now() + 1_000);
+      },
+    }, 120_000);
+    const result = await verifyBPCRequest(
+      makeReq(pairId, signedData, signature, bodyHash),
+      registry,
+      atomicQuarantineStore,
+      anomaly,
+      cfg(ACCEPTABLE),
+    );
+    expect(result).toMatchObject({ ok: false, error: 'authorization_quarantined' });
+  });
 });

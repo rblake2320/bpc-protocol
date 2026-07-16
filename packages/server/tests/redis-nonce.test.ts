@@ -45,6 +45,7 @@ describe('standalone Redis nonce composition', () => {
     expect(() => createRedisBackedNonceStore(new RecordingRedis(), {
       namespace,
       sigWindowMs: 60_000,
+      continuityMode: 'ungoverned-development',
     })).toThrow(RangeError);
   });
 
@@ -53,6 +54,7 @@ describe('standalone Redis nonce composition', () => {
     const configured = createRedisBackedNonceStore(redis, {
       namespace: 'prod-us1',
       sigWindowMs: 60_000,
+      continuityMode: 'ungoverned-development',
     });
 
     expect(configured.keyPrefix).toBe('bpc:prod-us1:nonce:');
@@ -69,6 +71,7 @@ describe('standalone Redis nonce composition', () => {
     const configured = createRedisBackedNonceStore(new RecordingRedis(), {
       namespace: 'standalone',
       sigWindowMs: 60_000,
+      continuityMode: 'ungoverned-development',
     });
     const server = createBPCServer({ nonceStore: configured.nonceStore });
     expect(server.nonceStore).toBe(configured.nonceStore);
@@ -81,6 +84,7 @@ describe('standalone Redis nonce composition', () => {
     const { nonceStore } = createRedisBackedNonceStore(redis, {
       namespace: 'oom-test',
       sigWindowMs: 60_000,
+      continuityMode: 'ungoverned-development',
     });
     await expect(nonceStore.checkAndConsume('nonce-b')).rejects.toBeInstanceOf(NonceStoreUnavailableError);
   });
@@ -92,6 +96,7 @@ describe('standalone Redis nonce composition', () => {
     const { nonceStore } = createRedisBackedNonceStore(redis, {
       namespace: 'timeout-test',
       sigWindowMs: 60_000,
+      continuityMode: 'ungoverned-development',
       commandTimeoutMs: 10,
     });
     await expect(nonceStore.checkAndConsume('nonce-c')).rejects.toBeInstanceOf(NonceStoreUnavailableError);
@@ -108,5 +113,12 @@ describe('standalone Redis nonce composition', () => {
   it('rejects invalid retention and timeout configuration before serving requests', () => {
     expect(() => new ServerNonceStore(new RedisNonceStore(new RecordingRedis()), 0)).toThrow(RangeError);
     expect(() => new RedisNonceStore(new RecordingRedis(), 'bpc:test:', 0)).toThrow(RangeError);
+  });
+
+  it('requires an explicit acknowledgement that the low-level helper is ungoverned', () => {
+    expect(() => createRedisBackedNonceStore(new RecordingRedis(), {
+      namespace: 'missing-ack',
+      sigWindowMs: 60_000,
+    } as never)).toThrow('continuityMode must explicitly be ungoverned-development');
   });
 });

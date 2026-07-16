@@ -81,10 +81,20 @@ export {
 export type {
   ContinuityGate,
   ReconcileLoopHandle,
+  ReconcileLoopOptions,
   RedisConfigClient,
   RedisContinuityClient,
   RedisContinuityOptions,
 } from './redis-continuity.js';
+export {
+  RedisContinuityConfigurationError,
+  createGovernedRedisBackedNonceStore,
+} from './redis-governed.js';
+export type {
+  GovernedRedisBackedNonceOptions,
+  GovernedRedisBackedNonceStore,
+  RedisAtomicClient,
+} from './redis-governed.js';
 export { verifyBPCRequest } from './middleware.js';
 export { MemoryPairStore, MemoryNonceBackend, MemoryAnomalyStore } from './memory-store.js';
 export { ReplicatingPairStore } from './replicating-store.js';
