@@ -9,10 +9,12 @@ bound to accommodate scheduling. The test freezes `Date.now()` around the
 transition and therefore asserts the exact configured 1000ms horizon.
 
 The root test entry point also runs core, server, and client workspaces through
-an explicit `&&` chain. A server failure is an immediate nonzero result and
-cannot be replaced by a later successful client process. This is an evidence
-control only; it neither changes Redis time semantics nor expands the governed
-factory's deployment claims.
+a small sequential runner. It forwards caller arguments to every workspace and
+stops immediately on the first nonzero result, improving failure locality and
+preventing later workspace output from obscuring the first failure. Dedicated
+runner tests bind both behaviors. This is an evidence control only; it neither
+changes Redis time semantics nor expands the governed factory's deployment
+claims.
 
 ## 2026-07-16: Make continuity and nonce consumption one governed operation
 

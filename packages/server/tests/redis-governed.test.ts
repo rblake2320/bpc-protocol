@@ -342,8 +342,11 @@ describe('governed Redis replay composition', () => {
         .rejects.toBeInstanceOf(AuthorizationQuarantineError);
       expect(redis.hasNonce('heterogeneous', 'n-heterogeneous')).toBe(false);
     } finally {
-      await short?.stop();
-      clock.mockRestore();
+      try {
+        await short?.stop();
+      } finally {
+        clock.mockRestore();
+      }
     }
   });
 

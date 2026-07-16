@@ -6,8 +6,10 @@ All notable changes to BPC Protocol are documented in this file.
 
 - Made the heterogeneous-horizon regression use a controlled clock and retain
   an exact 1000ms quarantine assertion; host scheduling can no longer turn the
-  assertion into a false 999ms failure. The root test command now stops on the
-  first failing workspace instead of continuing to a later workspace.
+  assertion into a false 999ms failure. Clock restoration is protected even if
+  asynchronous store cleanup fails. The root test command now forwards caller
+  arguments to every workspace and stops on the first failing workspace; named
+  runner regressions bind both behaviors.
 - Added an awaited governed Redis replay factory that verifies exact live
   `noeviction`, binds a shared namespace horizon, bootstraps shared continuity
   quarantine, and atomically checks the config and expected epoch while

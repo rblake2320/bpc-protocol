@@ -10,7 +10,7 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces",
-    "test": "npm run test:core && npm run test:server && npm run test:client",
+    "test": "node --test tests/workspace-test-runner.test.mjs && node scripts/run-workspace-tests.mjs",
     "test:redis": "tsx redis-nonce-integration.mts",
     "test:postgres": "tsx postgres-store-integration.mts",
     "test:interop": "tsx cross-language-integration.mts",

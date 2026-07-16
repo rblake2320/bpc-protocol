@@ -118,6 +118,7 @@ product or security claims. Git history contains the original wording.
 - **Reason:** one millisecond of legitimate scheduling produced a false failure
   without identifying a shorter configured quarantine.
 - **Current design:** freeze the fake model's clock and assert the exact 1000ms
-  horizon; live Redis tests remain responsible for real countdown behavior.
+  horizon, with restoration protected even if asynchronous cleanup fails; live
+  Redis tests remain responsible for real countdown behavior.
 - **Restore only with:** a deterministic clock supplied by the test harness that
   preserves the same exact semantic assertion.
