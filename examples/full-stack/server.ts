@@ -214,7 +214,7 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
       log(method, path, `PASS pair=${result.pairId}`);
 
       if (path === '/api/status') {
-        json(res, 200, { status: 'ok', pair: result.pairId, scope: result.pair?.scope, timestamp: Date.now() });
+        json(res, 200, { status: 'ok', pair: result.pairId, scope: result.snapshot?.scope, timestamp: Date.now() });
         return;
       }
 
@@ -225,8 +225,8 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
 
       // Admin-only endpoint: only 'admin' scoped pairs can DELETE
       if (path === '/api/admin' && method === 'DELETE') {
-        if (result.pair?.scope !== 'admin') {
-          log(method, path, `SCOPE VIOLATION pair=${result.pairId} scope=${result.pair?.scope}`);
+        if (result.snapshot?.scope !== 'admin') {
+          log(method, path, `SCOPE VIOLATION pair=${result.pairId} scope=${result.snapshot?.scope}`);
           json(res, 403, { error: 'scope_violation' });
           return;
         }

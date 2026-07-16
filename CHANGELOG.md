@@ -4,6 +4,13 @@ All notable changes to BPC Protocol are documented in this file.
 
 ## [Unreleased] -- 2026-07-15
 
+- Successful TypeScript verification now returns an immutable authorization
+  snapshot copied from the same point-in-time registry read used by the
+  verifier. Demo and full-stack consumers authorize from `snapshot.scope`;
+  the former live `StoredPair` result is no longer exposed.
+- Removed the unauthenticated `/health` success shortcut from the authorization
+  verifier. Health routing belongs outside `verifyBPCRequest()` and cannot
+  produce an authorization success result.
 - Python pair construction, registry intake, client registration, and verifier
   state now enforce the same closed `read`/`read-write`/`admin` scope contract
   as the TypeScript implementation. Wildcard and namespaced values fail closed.

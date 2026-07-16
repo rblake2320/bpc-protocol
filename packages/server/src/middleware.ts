@@ -106,6 +106,49 @@ const SCOPE_ALLOWED_METHODS: Record<string, Set<string>> = {
   'admin':      new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE']),
 };
 
+interface AuthorizationContext {
+  readonly pairId: string;
+  readonly scope: AuthSnapshot['scope'];
+  readonly mode: AuthSnapshot['mode'];
+  readonly kind: AuthSnapshot['kind'];
+  readonly canaryClass?: AuthSnapshot['canaryClass'];
+  readonly status: 'active' | 'locked' | 'expired' | 'rotated' | 'revoked';
+  readonly failedSigs: number;
+  readonly expiresAt?: number;
+  readonly maxRequests?: number;
+  readonly requests: number;
+  readonly secretHash: string;
+  readonly pubJwk: JsonWebKey;
+}
+
+/**
+ * Copy every value used by authorization before the verifier crosses another
+ * asynchronous boundary. MemoryPairStore intentionally returns a live object,
+ * so retaining StoredPair here would let a concurrent updatePair() change the
+ * policy inputs while the request is being verified.
+ */
+function captureAuthorizationContext(pair: import('./types.js').StoredPair): AuthorizationContext {
+  const pubJwk = Object.freeze({
+    ...pair.pubJwk,
+    key_ops: pair.pubJwk.key_ops ? Object.freeze([...pair.pubJwk.key_ops]) : undefined,
+  }) as JsonWebKey;
+
+  return Object.freeze({
+    pairId: pair.id,
+    scope: pair.scope,
+    mode: pair.mode,
+    kind: pair.kind ?? 'legitimate',
+    canaryClass: pair.canaryClass,
+    status: pair.status,
+    failedSigs: pair.failedSigs,
+    expiresAt: pair.expiresAt,
+    maxRequests: pair.maxRequests,
+    requests: pair.requests,
+    secretHash: pair.secretHash,
+    pubJwk,
+  });
+}
+
 export async function verifyBPCRequest(
   req: BPCRequestData,
   registry: PairRegistry,
@@ -153,11 +196,6 @@ export async function verifyBPCRequest(
     if (!rl.allowed) return deny('rate_limit_exceeded');
   }
 
-  // HIGH-09: Built-in health endpoint
-  if (req.method === 'GET' && req.path === '/health') {
-    return { ok: true, pairId: 'health' };
-  }
-
   // Step 1b: Method allowlist
   if (!ALLOWED_METHODS.has(req.method)) {
     return deny('invalid_method');
@@ -188,10 +226,11 @@ export async function verifyBPCRequest(
     await anomaly.recordUnknownPair();
     return deny('unknown_pair');
   }
+  const auth = captureAuthorizationContext(pair);
 
   // Step 5: Pair status
-  if (pair.status === 'revoked') return deny('pair_revoked');
-  if (pair.status === 'locked') {
+  if (auth.status === 'revoked') return deny('pair_revoked');
+  if (auth.status === 'locked') {
     if (shadowEnabled) {
       await anomaly.enterShadowState(req.pairId, sourceIp, 'pair_locked');
       const delayMs = tarpitEnabled ? await anomaly.applyTarpit(sourceIp, 'shadow') : 0;
@@ -204,11 +243,11 @@ export async function verifyBPCRequest(
     }
     return deny('pair_locked');
   }
-  if (pair.status === 'rotated') return deny('pair_rotated');
-  if (pair.status === 'expired') return deny('pair_expired');
+  if (auth.status === 'rotated') return deny('pair_rotated');
+  if (auth.status === 'expired') return deny('pair_expired');
 
   const lockoutCount = config.lockoutCount ?? 10;
-  if (pair.failedSigs >= lockoutCount) {
+  if (auth.failedSigs >= lockoutCount) {
     registry.recordActivity(req.pairId, false, sourceIp).catch(() => {});
     if (shadowEnabled) {
       await anomaly.enterShadowState(req.pairId, sourceIp, 'failedSigs_threshold');
@@ -218,15 +257,15 @@ export async function verifyBPCRequest(
     return deny('pair_locked');
   }
 
-  if (pair.expiresAt && Date.now() > pair.expiresAt) {
+  if (auth.expiresAt && Date.now() > auth.expiresAt) {
     pair.status = 'expired';
     registry.get(req.pairId).then(p => { if (p) { p.status = 'expired'; } }).catch(() => {});
     return deny('pair_expired');
   }
-  if (pair.maxRequests && pair.maxRequests > 0 && pair.requests >= pair.maxRequests) {
+  if (auth.maxRequests && auth.maxRequests > 0 && auth.requests >= auth.maxRequests) {
     return deny('pair_usage_cap_exceeded');
   }
-  if (pair.status !== 'active') return deny('pair_revoked');
+  if (auth.status !== 'active') return deny('pair_revoked');
 
   // Layer 8: Tarpit for suspicious IPs
   let tarpitDelayApplied = 0;
@@ -270,10 +309,10 @@ export async function verifyBPCRequest(
   if (!secretHmac) {
     return deny('missing_secret_hmac', true);
   }
-  if (!pair.secretHash || pair.secretHash.length === 0) {
+  if (!auth.secretHash || auth.secretHash.length === 0) {
     return deny('invalid_secret_hmac', true);
   }
-  const secretValid = await verifySecretHmac(pair.secretHash, rawNonce, rawTimestamp, secretHmac);
+  const secretValid = await verifySecretHmac(auth.secretHash, rawNonce, rawTimestamp, secretHmac);
   if (!secretValid) {
     return deny('invalid_secret_hmac', true);
   }
@@ -301,7 +340,8 @@ export async function verifyBPCRequest(
   const payloadMethod = typeof payload['method'] === 'string'
     ? payload['method'].toUpperCase()
     : '';
-  const allowedMethods = SCOPE_ALLOWED_METHODS[pair.scope] ?? SCOPE_ALLOWED_METHODS['read'];
+  const allowedMethods = SCOPE_ALLOWED_METHODS[auth.scope];
+  if (!allowedMethods) return deny('scope_violation');
   if (!allowedMethods.has(normalizedWireMethod) || !allowedMethods.has(payloadMethod)) {
     return deny('scope_violation');
   }
@@ -317,7 +357,7 @@ export async function verifyBPCRequest(
   // Step 12: Verify ECDSA signature
   let valid = false;
   try {
-    const publicKey = await importPublicKeyFromJwk(pair.pubJwk);
+    const publicKey = await importPublicKeyFromJwk(auth.pubJwk);
     valid = await verifyPayload(publicKey, payload, req.signature);
   } catch {
     valid = false;
@@ -326,6 +366,18 @@ export async function verifyBPCRequest(
     return deny('invalid_signature', true);
   }
 
+  // Freeze the result before the first await after final cryptographic
+  // verification. Values come from the immutable context used above, never
+  // from the live StoredPair object.
+  const snapshot: AuthSnapshot = Object.freeze({
+    pairId: auth.pairId,
+    scope: auth.scope,
+    mode: auth.mode,
+    kind: auth.kind,
+    canaryClass: auth.canaryClass,
+    verifiedAt: now,
+  });
+
   // Nonce consumption — only after all crypto checks pass
   if (await nonceStore.checkAndConsume(rawNonce)) {
     await anomaly.recordReplay(req.pairId);
@@ -333,33 +385,19 @@ export async function verifyBPCRequest(
   }
 
   // Layer 8: Ghost Pair post-verification trap
-  if (pair.kind === 'ghost') {
-    await anomaly.enterShadowState(req.pairId, sourceIp, `ghost_pair_hit:${pair.canaryClass}`);
+  if (auth.kind === 'ghost') {
+    await anomaly.enterShadowState(req.pairId, sourceIp, `ghost_pair_hit:${auth.canaryClass}`);
     const delayMs = tarpitEnabled ? await anomaly.applyTarpit(sourceIp, 'shadow') : 0;
     await config.auditLog?.write({
       action: 'ghost_pair_triggered', pairId: req.pairId, ip: req.ip,
       method: req.method, path: req.path, severity: 'CRITICAL',
       detail: JSON.stringify({
-        canaryClass: pair.canaryClass, sourceIp, method: req.method, path: req.path,
+        canaryClass: auth.canaryClass, sourceIp, method: req.method, path: req.path,
         timestamp: now, alert: 'CONFIRMED_BREACH — canary credential used. Attacker IP auto-routed to shadow mode.',
       }),
     });
     return { ok: false, pairId: req.pairId, error: 'ghost_pair_denied', shadow: true, tarpitDelayMs: delayMs };
   }
-
-  // All checks passed.
-  // Capture an immutable snapshot of the authorization fields NOW, before
-  // recordActivity() or any other async work that could trigger a concurrent
-  // updatePair() call. This snapshot is the source of truth for scope and
-  // identity downstream. It cannot be mutated after this point.
-  const snapshot: AuthSnapshot = Object.freeze({
-    pairId:      pair.id,
-    scope:       pair.scope,
-    mode:        pair.mode,
-    kind:        pair.kind ?? 'legitimate',
-    canaryClass: pair.canaryClass,
-    verifiedAt:  now,
-  });
 
   await registry.recordActivity(req.pairId, true);
   await config.auditLog?.write({

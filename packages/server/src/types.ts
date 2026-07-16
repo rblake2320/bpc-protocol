@@ -127,13 +127,17 @@ export interface PairRegistration {
 }
 
 /**
- * Immutable authorization snapshot captured at the moment a request is authorized.
+ * Immutable authorization snapshot returned after a request is authorized.
  *
  * This is the ONLY source of truth for the verified scope and identity after
- * verifyBPCRequest returns. It is created from a point-in-time copy of the
- * StoredPair fields relevant to authorization, taken before any async work
- * completes. Concurrent lifecycle mutations (e.g. updatePair) cannot affect
- * fields on this snapshot.
+ * verifyBPCRequest returns. Its values come from the same point-in-time registry
+ * read used by the verification pipeline. Concurrent lifecycle mutations (for
+ * example updatePair) cannot change either the in-flight authorization inputs or
+ * the fields returned on this snapshot.
+ *
+ * This does not claim that a revocation which races an already-started request
+ * cancels that request. Stores that require that stronger property need an
+ * atomic authorization/commit primitive or an authorization version fence.
  *
  * Resolves TOCTOU race: issue #6 — mutable StoredPair returned after authorization.
  */
@@ -148,7 +152,7 @@ export interface AuthSnapshot {
   readonly kind: PairKind;
   /** Canary class if kind === 'ghost', otherwise undefined. */
   readonly canaryClass?: CanaryClass;
-  /** Unix timestamp (ms) when authorization was determined. */
+  /** Unix timestamp (ms) when cryptographic verification completed. */
   readonly verifiedAt: number;
 }
 
@@ -158,8 +162,9 @@ export interface BPCVerifyResult {
   /**
    * Immutable authorization snapshot.
    *
-   * Present only when ok === true. Contains the scope, mode, kind, and
-   * verifiedAt timestamp captured at the exact moment of authorization.
+   * Present only for authenticated request success. Contains the scope, mode,
+   * and kind from the point-in-time registry read used by verification plus
+   * the cryptographic-verification completion time.
    * This field REPLACES the former mutable `pair` field so that concurrent
    * registry mutations cannot alter the authorization evidence after the fact.
    *

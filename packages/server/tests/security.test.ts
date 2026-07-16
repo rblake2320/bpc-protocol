@@ -766,8 +766,13 @@ describe('End-to-End: Hardened Protocol Happy Path', () => {
 
     expect(result.ok).toBe(true);
     expect(result.pairId).toBe(pairId);
-    expect(result.pair?.name).toBe('production-client');
-    expect(result.pair?.scope).toBe('read-write');
+    expect(result.snapshot).toEqual(expect.objectContaining({
+      pairId,
+      scope: 'read-write',
+      mode: 'production',
+      kind: 'legitimate',
+    }));
+    expect(Object.isFrozen(result.snapshot)).toBe(true);
   });
 
   it('dual-track rate limiters work together without interfering', async () => {

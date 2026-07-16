@@ -2,6 +2,19 @@
 
 ## 2026-07-15
 
+- Corrected PR #8 beyond its two stale assertions: copied all authorization
+  inputs away from the live pair before later awaits, froze the public snapshot
+  before nonce-store activity, and added a deterministic concurrent scope
+  mutation regression. The snapshot retains the scope used by verification
+  while the registry independently changes.
+- Migrated demo and full-stack consumers from `result.pair.scope` to
+  `result.snapshot.scope`. The required adversarial runner exposed this real
+  composition dependency when the admin scenario failed after the mutable pair
+  was removed.
+- Removed the `/health` verifier shortcut that returned `ok: true` without BPC
+  credentials. A regression now requires missing credentials on that path to
+  fail with `missing_headers`; service health must be routed outside the
+  authorization verifier.
 - Re-audited closed issue #1 and found the TypeScript implementation rejected
   wildcard scopes while the shipped Python registry still accepted arbitrary
   strings. Request verification later denied those strings, but the documented
