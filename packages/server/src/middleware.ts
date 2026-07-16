@@ -41,6 +41,7 @@ import type { ServerNonceStore } from './nonce-store.js';
 import type { AnomalyEngine } from './anomaly.js';
 import type { RateLimiter } from './rate-limiter.js';
 import type { AuditLog } from './audit.js';
+import { AuthorizationQuarantineError, type ContinuityGate } from './redis-continuity.js';
 
 export interface BPCRequestData {
   pairId: string | null;
@@ -92,6 +93,14 @@ export interface BPCServerConfig {
    * Default: true (recommended for production).
    */
   enableTarpit?: boolean;
+  /**
+   * Issue #11/#13: continuity gate. When provided, authorization fails closed
+   * (deny 'authorization_quarantined') while Redis nonce-state continuity is
+   * uncertain — after state loss, ambiguous failover, or an unreachable marker
+   * store. Checked immediately before the nonce is consumed. Optional and
+   * non-breaking: verifiers without a continuity guard behave as before.
+   */
+  continuityGuard?: ContinuityGate;
 }
 
 const DEFAULT_SERVER_CONFIG: BPCServerConfig = {
@@ -378,12 +387,26 @@ export async function verifyBPCRequest(
     verifiedAt: now,
   });
 
+  // Issue #11/#13: refuse to consume a nonce while continuity is uncertain.
+  // If the marker store lost state / failed over, checkAndConsume could accept
+  // an already-used nonce; the guard fails closed here instead.
+  if (config.continuityGuard) {
+    try {
+      config.continuityGuard.assertAcceptable();
+    } catch {
+      return deny('authorization_quarantined');
+    }
+  }
+
   // Atomic first-acceptance gate. Concurrent valid replays can both complete
   // signature verification, but only one can consume the nonce.
   let replayDetected: boolean;
   try {
     replayDetected = await nonceStore.checkAndConsume(rawNonce);
-  } catch {
+  } catch (error) {
+    if (error instanceof AuthorizationQuarantineError) {
+      return deny('authorization_quarantined');
+    }
     return deny('replay_store_unavailable');
   }
   if (replayDetected) {

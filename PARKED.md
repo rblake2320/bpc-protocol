@@ -81,12 +81,32 @@ product or security claims. Git history contains the original wording.
 
 - **Parked:** claiming that the TypeScript Redis nonce backend alone preserves
   replay evidence through every restart, failover, eviction, or data-loss event.
-- **Reason:** atomic `SET NX PX` proves concurrent first-use ordering while the
-  keys exist. Redis persistence and replication can have deployment-specific
-  loss windows, and the package cannot detect arbitrary deletion.
-- **Current claim:** named Redis errors fail closed; deployments must use
-  `noeviction` and quarantine authorization for the full retention horizon
-  after any failover whose nonce durability is uncertain.
+- **Reason:** the governed Lua operation proves expected-epoch validation and
+  concurrent first-use ordering on the Redis instance that executes it. Redis
+  persistence and asynchronous replication can still have deployment-specific
+  loss windows. A restored internally consistent snapshot with the same epoch,
+  privileged selective nonce deletion, or policy drift between CONFIG checks
+  is not detected by that operation. One client's CONFIG response also does
+  not attest the configuration of every Redis Cluster member.
+- **Current claim:** the awaited TypeScript governed factory verifies live
+  `noeviction`, binds one namespace horizon, shares an epoch/quarantine across
+  verifiers, denies a missing marker or an epoch change relative to the running
+  process/trusted checkpoint, and atomically combines those checks with nonce
+  consumption. Uncertain state and Redis failures produce named fail-closed
+  results. A cold process without a trusted expected epoch can adopt any
+  existing epoch and cannot attest that snapshot's freshness.
 - **Restore only with:** a deployment-specific durable topology, measured loss
   bounds, restart/failover evidence, deletion detection or trusted checkpoints,
-  and adversarial recovery tests.
+  immutable/monitored policy, and adversarial recovery tests.
+
+## P-011: Ungoverned Redis helper as production composition
+
+- **Parked:** describing `createRedisBackedNonceStore()` or raw `SET NX PX` as
+  sufficient production replay continuity.
+- **Reason:** the helper has no shared epoch, no quarantine, and no atomic
+  continuity comparison. State loss can make an already-used nonce look fresh.
+- **Current claim:** it is an isolated test/development primitive and requires
+  `continuityMode: 'ungoverned-development'`. Production TypeScript consumers
+  use the awaited governed factory.
+- **Restore only with:** not applicable; use the governed composition rather
+  than weakening its boundary.

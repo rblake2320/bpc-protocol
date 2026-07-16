@@ -1,5 +1,40 @@
 # Design Decisions
 
+## 2026-07-16: Make continuity and nonce consumption one governed operation
+
+A local continuity preflight followed by an awaited nonce command has a
+time-of-check/time-of-use gap: Redis can lose or swap state between the two.
+Production composition now uses one Redis Lua operation to compare the
+process's expected epoch, enforce one shared horizon configuration and
+quarantine, and consume the nonce. All keys use one Redis Cluster hash slot so
+the operation remains valid in a clustered deployment. A mismatched verifier
+fails startup and extends, never shortens, the existing quarantine.
+
+The factory is asynchronous because serving before live policy validation and
+initial reconciliation is a fail-open startup race. An empty namespace is not
+assumed trustworthy; it establishes quarantine before the epoch and waits the
+complete replay horizon. Two independently starting verifiers therefore make
+the same authorization decision.
+
+The periodic reconciler wrapper is serialized and its stop operation is
+awaitable. Shutdown closes the local gate before draining the active wrapper,
+preventing its result from reopening authorization. JavaScript cannot cancel an
+ioredis command that has already timed out; such a command can settle later and
+mutate Redis safety state, but it cannot authorize the request already denied or
+reopen the stopped local gate. Operational observers are not part of the
+security decision and cannot crash the loop.
+
+The low-level `SET NX PX` builder remains only with an explicit
+`ungoverned-development` acknowledgement. Retaining it avoids unnecessary API
+removal while preventing documentation or call sites from silently treating
+atomic nonce insertion as restart/failover continuity.
+
+This design deliberately does not call Redis replication strongly consistent.
+Uncheckpointed cold restore, same-epoch rollback, asynchronous failover loss,
+selective administrative deletion, and configuration drift between checks
+require external checkpoints, deployment ACLs, durable topology evidence, and
+recovery exercises.
+
 ## 2026-07-15: Return authorization evidence, not a live registry object
 
 Consumers need the pair identity and coarse scope that the verifier actually

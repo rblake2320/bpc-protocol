@@ -1,5 +1,45 @@
 # Change Log
 
+## 2026-07-16
+
+- Corrected PR #14 after independent review found that its continuity check was
+  a non-atomic local preflight, bootstrap returned before a first reconcile,
+  CONFIG parsing accepted ambiguous shapes, and the interval loop could
+  overlap or outlive shutdown.
+- Added the awaited `createGovernedRedisBackedNonceStore()` production factory.
+  It requires exact live `maxmemory-policy noeviction`, bootstraps a shared
+  horizon configuration, epoch, and quarantine, places all governed keys in
+  one Redis Cluster hash slot, and checks the config/expected epoch/quarantine
+  in the same Lua EVAL that consumes the nonce. A heterogeneous verifier cannot
+  join the namespace or shorten its quarantine.
+- A fresh or missing continuity namespace now quarantines every verifier for
+  the full derived replay horizon plus allowance. Epoch change, malformed
+  shared state, timeout, disconnect, unknown response, and reconcile failure
+  deny without memory fallback. `authorization_quarantined` and
+  `replay_store_unavailable` are distinct named 503 results.
+- Replaced the overlapping interval with a serialized self-scheduling wrapper.
+  The cadence must be shorter than nonce retention; observer failures are
+  contained; asynchronous idempotent shutdown closes authorization first and
+  drains the active wrapper. An ioredis command that already timed out cannot be
+  cancelled by JavaScript and may settle later; this boundary is documented and
+  a regression proves a late nonce write cannot authorize the denied caller.
+- Kept `createRedisBackedNonceStore()` only as an explicitly acknowledged
+  `ungoverned-development` helper so existing test adapters remain available
+  without being mistaken for production continuity evidence.
+- Added stateful adversarial unit coverage and expanded the actual Redis runner.
+  Local evidence: 249/249 Node workspace tests, 81/81 Python tests, 22/22 live
+  governed Redis assertions, 28/28 live HTTP adversarial assertions, build,
+  cross-language interop, npm package dry-runs, and production dependency audit
+  all passed. PostgreSQL was not listening locally. GitHub Actions then passed
+  both Node gates (including the real PostgreSQL integration) and both Python
+  gates for implementation commit `2b3ebf5` in runs `29475725228` and
+  `29475727870`.
+- Preserved the bounded claim: one Redis EVAL closes the preflight/consume
+  interleaving on the executing instance. It does not prove same-epoch snapshot
+  freshness, uncheckpointed cold-restore identity, asynchronous replication
+  durability, prevention of privileged selective deletion, cancellable Redis
+  commands, or immutable runtime Redis policy.
+
 ## 2026-07-15
 
 - Corrected PR #8 beyond its two stale assertions: copied all authorization

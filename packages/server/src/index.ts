@@ -73,9 +73,28 @@ export {
   AuthorizationQuarantineError,
   DEFAULT_CONTINUITY_SAFETY_ALLOWANCE_MS,
   DEFAULT_CONTINUITY_TIMEOUT_MS,
+  EvictionPolicyError,
   RedisContinuityGuard,
+  assertNoEvictionPolicy,
+  startContinuityReconcileLoop,
 } from './redis-continuity.js';
-export type { RedisContinuityClient, RedisContinuityOptions } from './redis-continuity.js';
+export type {
+  ContinuityGate,
+  ReconcileLoopHandle,
+  ReconcileLoopOptions,
+  RedisConfigClient,
+  RedisContinuityClient,
+  RedisContinuityOptions,
+} from './redis-continuity.js';
+export {
+  RedisContinuityConfigurationError,
+  createGovernedRedisBackedNonceStore,
+} from './redis-governed.js';
+export type {
+  GovernedRedisBackedNonceOptions,
+  GovernedRedisBackedNonceStore,
+  RedisAtomicClient,
+} from './redis-governed.js';
 export { verifyBPCRequest } from './middleware.js';
 export { MemoryPairStore, MemoryNonceBackend, MemoryAnomalyStore } from './memory-store.js';
 export { ReplicatingPairStore } from './replicating-store.js';

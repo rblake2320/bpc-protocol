@@ -50,6 +50,11 @@ function makeGuard(redis: RedisContinuityClient, clock: { t: number }, epochs?: 
 }
 
 describe('RedisContinuityGuard', () => {
+  it('fails closed before its first reconciliation', () => {
+    const guard = makeGuard(new FakeMarkerRedis(), { t: 1_000 });
+    expect(() => guard.assertAcceptable()).toThrow(AuthorizationQuarantineError);
+  });
+
   it('first reconcile with a fresh empty store quarantines (marker was absent)', async () => {
     const redis = new FakeMarkerRedis();
     const clock = { t: 1_000 };

@@ -2,7 +2,22 @@
 
 All notable changes to BPC Protocol are documented in this file.
 
-## [Unreleased] -- 2026-07-15
+## [Unreleased] -- 2026-07-16
+
+- Added an awaited governed Redis replay factory that verifies exact live
+  `noeviction`, binds a shared namespace horizon, bootstraps shared continuity
+  quarantine, and atomically checks the config and expected epoch while
+  consuming each nonce in one same-slot Lua EVAL.
+- Fresh, missing, changed, malformed, timed-out, or unavailable continuity
+  state now produces named fail-closed denials across independent verifiers.
+  Reconciliation wrappers are serialized, shorter than nonce retention,
+  observer-safe, and drained by asynchronous idempotent shutdown. Timed-out
+  underlying ioredis commands are not cancellable; late settlement remains
+  fail closed and is covered by a named regression.
+- The legacy Redis nonce builder now requires the explicit
+  `ungoverned-development` marker. Active documentation and live integration
+  use only the governed production composition and preserve rollback,
+  replication, administrative-deletion, and policy-drift boundaries.
 
 - Successful TypeScript verification now returns an immutable authorization
   snapshot copied from the same point-in-time registry read used by the
