@@ -30,7 +30,10 @@
   Local evidence: 249/249 Node workspace tests, 81/81 Python tests, 22/22 live
   governed Redis assertions, 28/28 live HTTP adversarial assertions, build,
   cross-language interop, npm package dry-runs, and production dependency audit
-  all passed. PostgreSQL was not listening locally and remains a hosted-CI gate.
+  all passed. PostgreSQL was not listening locally. GitHub Actions then passed
+  both Node gates (including the real PostgreSQL integration) and both Python
+  gates for implementation commit `2b3ebf5` in runs `29475725228` and
+  `29475727870`.
 - Preserved the bounded claim: one Redis EVAL closes the preflight/consume
   interleaving on the executing instance. It does not prove same-epoch snapshot
   freshness, uncheckpointed cold-restore identity, asynchronous replication
