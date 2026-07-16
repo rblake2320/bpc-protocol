@@ -69,6 +69,13 @@ export { PairRegistry } from './registry.js';
 export type { RedactedPair } from './registry.js';
 export { AnomalyEngine } from './anomaly.js';
 export { NonceStoreUnavailableError, ServerNonceStore } from './nonce-store.js';
+export {
+  AuthorizationQuarantineError,
+  DEFAULT_CONTINUITY_SAFETY_ALLOWANCE_MS,
+  DEFAULT_CONTINUITY_TIMEOUT_MS,
+  RedisContinuityGuard,
+} from './redis-continuity.js';
+export type { RedisContinuityClient, RedisContinuityOptions } from './redis-continuity.js';
 export { verifyBPCRequest } from './middleware.js';
 export { MemoryPairStore, MemoryNonceBackend, MemoryAnomalyStore } from './memory-store.js';
 export { ReplicatingPairStore } from './replicating-store.js';
