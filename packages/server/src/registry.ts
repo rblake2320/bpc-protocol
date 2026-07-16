@@ -13,6 +13,16 @@
  *    - secretHash minimum length enforced (43 chars = 256-bit HKDF output).
  *    - Pair name length, scope, and mode validated.
  *
+ *  REG-01 FIX — updatePair() mutable reference leak:
+ *    updatePair() now returns structuredClone(pair) instead of the live
+ *    reference that was written to the store. Callers can no longer
+ *    mutate the stored record by mutating the returned object.
+ *
+ *  REG-02 FIX — ipFailureTracker unbounded memory:
+ *    evictStaleIpEntries() removes entries whose window has expired.
+ *    Called lazily on every recordActivity() so stale entries are
+ *    reclaimed without a background timer or unbounded accumulation.
+ *
  *  NIST SP 800-53 Rev 5 controls: AC-2, AC-3, IA-5, SI-10.
  */
 
@@ -55,6 +65,9 @@ export class PairRegistry {
    * when the SAME IP accumulates >= lockoutCount failures within the window.
    * An attacker from a different IP cannot lock a victim's pair.
    * Key: `${pairId}:${ip}`, Value: { count, windowStart }.
+   *
+   * REG-02 FIX: entries are lazily evicted once their window expires so the
+   * map cannot grow without bound under a large volume of unique source IPs.
    */
   private ipFailureTracker = new Map<string, { count: number; windowStart: number }>();
   private readonly IP_FAILURE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
@@ -63,6 +76,22 @@ export class PairRegistry {
     this.store = store;
     this.maxPairs = maxPairs;
     this.lockoutCount = lockoutCount;
+  }
+
+  /**
+   * REG-02: Evict ipFailureTracker entries whose window has expired.
+   * Called at the start of every recordActivity() so the map never grows
+   * without bound. O(n) over unique (pairId:ip) pairs seen since last
+   * successful auth for that pair — acceptable for a server-side registry
+   * where pairs are long-lived and IPs recycle within the window.
+   */
+  private evictStaleIpEntries(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.ipFailureTracker) {
+      if (now - entry.windowStart > this.IP_FAILURE_WINDOW_MS) {
+        this.ipFailureTracker.delete(key);
+      }
+    }
   }
 
   /**
@@ -255,9 +284,15 @@ export class PairRegistry {
    * eventually crossing the lockout threshold. They cannot probe indefinitely
    * by staying just below the per-window limit.
    *
+   * REG-02: Stale ipFailureTracker entries are lazily evicted at the start
+   * of every call to prevent unbounded memory growth.
+   *
    * On success: resets all failure counters and clears all IP failure entries.
    */
   async recordActivity(pairId: string, success: boolean, ip?: string): Promise<void> {
+    // REG-02: Evict stale entries before doing anything else.
+    this.evictStaleIpEntries();
+
     const pair = await this.store.get(pairId);
     if (!pair) return;
     pair.requests++;
@@ -355,7 +390,8 @@ export class PairRegistry {
    *   - maxRequests: Set or clear the usage cap (positive integer, or undefined)
    *   - name:        Rename the pair label
    *
-   * Returns the updated pair, or undefined if the pairId does not exist.
+   * Returns a safe copy of the updated pair (REG-01 fix: not the live
+   * mutable reference). Returns undefined if the pairId does not exist.
    */
   async updatePair(
     pairId: string,
@@ -373,6 +409,8 @@ export class PairRegistry {
     if ('maxRequests' in updates) pair.maxRequests = updates.maxRequests;
     if (updates.name !== undefined) pair.name = updates.name;
     await this.store.set(pair);
-    return pair;
+    // REG-01 FIX: return a deep copy so callers cannot mutate the stored record
+    // by mutating the returned object.
+    return structuredClone(pair);
   }
 }
