@@ -145,6 +145,14 @@ or an authorization. There is no current DoD Cloud Computing SRG IL7.
 | | AC-3 | Closed scope enforcement (read/read-write/admin) at TypeScript and Python intake and per HTTP method |
 | | AC-6 | Principle of least privilege: listRedacted() strips sensitive fields |
 
+TypeScript callers must authorize from `result.snapshot` only after checking
+`result.ok === true`. The snapshot is frozen and is derived from the same
+point-in-time registry read used by request verification. The verifier does not
+serve an unauthenticated health exception; health routes belong outside the
+authorization middleware. A revocation that races a request already in flight
+requires a deployment-specific authorization version fence if cancellation of
+that request is required.
+
 ---
 
 ## Cryptographic Primitives Requested By The Code

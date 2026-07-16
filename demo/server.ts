@@ -391,10 +391,10 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
         return;
       }
 
-      log(method, path, `PASS pair=${result.pairId} scope=${result.pair?.scope}`);
+      log(method, path, `PASS pair=${result.pairId} scope=${result.snapshot?.scope}`);
 
       if (path === '/api/status') {
-        json(res, 200, { ok: true, pair: result.pairId, scope: result.pair?.scope, ts: Date.now() });
+        json(res, 200, { ok: true, pair: result.pairId, scope: result.snapshot?.scope, ts: Date.now() });
         return;
       }
       if (path === '/api/users') {
@@ -414,7 +414,7 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
         return;
       }
       if (path.startsWith('/api/user/') && method === 'DELETE') {
-        if (!['read-write', 'admin'].includes(result.pair?.scope ?? '')) {
+        if (!['read-write', 'admin'].includes(result.snapshot?.scope ?? '')) {
           json(res, 403, { error: 'scope_violation' });
           return;
         }
@@ -422,7 +422,7 @@ const server = createServer({ maxHeaderSize: 8 * 1024 * 1024 }, async (req: Inco
         return;
       }
       if (path === '/api/admin/config' && method === 'PUT') {
-        if (result.pair?.scope !== 'admin') {
+        if (result.snapshot?.scope !== 'admin') {
           json(res, 403, { error: 'scope_violation' });
           return;
         }

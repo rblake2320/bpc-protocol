@@ -38,9 +38,7 @@ export type PairKind = 'legitimate' | 'ghost';
  * Anomaly engine verdict states.
  *
  * State machine:
- *   clean → suspicious → shadow
- *                ↓
- *             tarpit
+ *   clean → suspicious → shadow → attack
  *
  * 'shadow' is a FIRST-CLASS STATE, not a middleware branch.
  * It is scoped to (sourceIP + pairId), NOT the pair globally.
@@ -128,10 +126,52 @@ export interface PairRegistration {
   canaryClass?: CanaryClass;
 }
 
+/**
+ * Immutable authorization snapshot returned after a request is authorized.
+ *
+ * This is the ONLY source of truth for the verified scope and identity after
+ * verifyBPCRequest returns. Its values come from the same point-in-time registry
+ * read used by the verification pipeline. Concurrent lifecycle mutations (for
+ * example updatePair) cannot change either the in-flight authorization inputs or
+ * the fields returned on this snapshot.
+ *
+ * This does not claim that a revocation which races an already-started request
+ * cancels that request. Stores that require that stronger property need an
+ * atomic authorization/commit primitive or an authorization version fence.
+ *
+ * Resolves TOCTOU race: issue #6 — mutable StoredPair returned after authorization.
+ */
+export interface AuthSnapshot {
+  /** The verified pair ID. */
+  readonly pairId: string;
+  /** The scope enforced at authorization time. Will not change after capture. */
+  readonly scope: 'read' | 'read-write' | 'admin';
+  /** The pair mode at authorization time. */
+  readonly mode: 'development' | 'production';
+  /** The pair kind ('legitimate' | 'ghost') at authorization time. */
+  readonly kind: PairKind;
+  /** Canary class if kind === 'ghost', otherwise undefined. */
+  readonly canaryClass?: CanaryClass;
+  /** Unix timestamp (ms) when cryptographic verification completed. */
+  readonly verifiedAt: number;
+}
+
 export interface BPCVerifyResult {
   ok: boolean;
   pairId?: string;
-  pair?: StoredPair;
+  /**
+   * Immutable authorization snapshot.
+   *
+   * Present only for authenticated request success. Contains the scope, mode,
+   * and kind from the point-in-time registry read used by verification plus
+   * the cryptographic-verification completion time.
+   * This field REPLACES the former mutable `pair` field so that concurrent
+   * registry mutations cannot alter the authorization evidence after the fact.
+   *
+   * Downstream code (including the TSK bridge) MUST read scope from
+   * result.snapshot.scope, not from a registry re-fetch.
+   */
+  snapshot?: AuthSnapshot;
   error?: string;
   rateLimitRemaining?: number;
   /**

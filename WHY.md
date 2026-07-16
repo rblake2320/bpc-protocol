@@ -1,5 +1,19 @@
 # Design Decisions
 
+## 2026-07-15: Return authorization evidence, not a live registry object
+
+Consumers need the pair identity and coarse scope that the verifier actually
+used. Returning a mutable `StoredPair` let concurrent lifecycle updates alter
+those values after verification. The verifier now copies its authorization
+context at the registry-read boundary, uses that copy throughout verification,
+and returns a frozen snapshot. This bounds the established property to
+in-flight evidence consistency; cancelling requests that already raced a later
+revocation would require a store-level authorization version fence.
+
+Health checks are transport/service operations, not authenticated principals.
+They must be routed outside `verifyBPCRequest()` so they cannot yield `ok: true`
+without a verified snapshot.
+
 ## 2026-07-15: Keep credential scopes closed
 
 BPC authenticates a pair and enforces a small HTTP-method ceiling. It does not

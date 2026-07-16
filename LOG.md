@@ -2,6 +2,19 @@
 
 ## 2026-07-15
 
+- Corrected PR #8 beyond its two stale assertions: copied all authorization
+  inputs away from the live pair before later awaits, froze the public snapshot
+  before nonce-store activity, and added a deterministic concurrent scope
+  mutation regression. The snapshot retains the scope used by verification
+  while the registry independently changes.
+- Migrated demo and full-stack consumers from `result.pair.scope` to
+  `result.snapshot.scope`. The required adversarial runner exposed this real
+  composition dependency when the admin scenario failed after the mutable pair
+  was removed.
+- Removed the `/health` verifier shortcut that returned `ok: true` without BPC
+  credentials. A regression now requires missing credentials on that path to
+  fail with `missing_headers`; service health must be routed outside the
+  authorization verifier.
 - Reopened issue #2 after design review showed the atomic Redis primitive was
   present but the claimed standalone verifier composition was incomplete.
 - Added a validated TypeScript Redis nonce builder with explicit deployment

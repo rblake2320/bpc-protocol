@@ -113,7 +113,99 @@ describe('@bpc/server — verifyBPCRequest', () => {
     const result = await verifyBPCRequest(req, registry, nonceStore, anomaly);
     expect(result.ok).toBe(true);
     expect(result.pairId).toBe(pairId);
-    expect(result.pair?.name).toBe('test-client');
+    expect(result.snapshot).toEqual(expect.objectContaining({
+      pairId,
+      scope: 'read-write',
+      mode: 'development',
+      kind: 'legitimate',
+    }));
+    expect(Object.isFrozen(result.snapshot)).toBe(true);
+    expect('pair' in result).toBe(false);
+  });
+
+  it('returns the authorization values actually used when scope mutates concurrently', async () => {
+    let signalNonceCheck!: () => void;
+    let releaseNonceCheck!: () => void;
+    const nonceCheckStarted = new Promise<void>((resolve) => { signalNonceCheck = resolve; });
+    const nonceCheckRelease = new Promise<void>((resolve) => { releaseNonceCheck = resolve; });
+    const blockingNonceStore = new ServerNonceStore({
+      async checkAndConsume() {
+        signalNonceCheck();
+        await nonceCheckRelease;
+        return false;
+      },
+    }, 120_000);
+    const { signedData, signature, bodyHash } = await buildSignedRequest(
+      keypair.privateKey, pairId, 'GET', '/api/data', secretHash,
+    );
+
+    const verification = verifyBPCRequest(makeReqData({
+      pairId,
+      signedData,
+      signature,
+      method: 'GET',
+      path: '/api/data',
+      bodyHash,
+    }), registry, blockingNonceStore, anomaly);
+
+    await nonceCheckStarted;
+    await registry.updatePair(pairId, { scope: 'admin', name: 'mutated-after-authorization' });
+    releaseNonceCheck();
+
+    const result = await verification;
+    expect(result.ok).toBe(true);
+    expect(result.snapshot?.scope).toBe('read-write');
+    expect(Object.isFrozen(result.snapshot)).toBe(true);
+    expect(() => {
+      (result.snapshot as unknown as { scope: string }).scope = 'admin';
+    }).toThrow(TypeError);
+    expect((await registry.get(pairId))?.scope).toBe('admin');
+  });
+
+  it('does not authorize a method enabled only by a concurrent scope escalation', async () => {
+    let signalPolicyPause!: () => void;
+    let releasePolicyPause!: () => void;
+    const policyPaused = new Promise<void>((resolve) => { signalPolicyPause = resolve; });
+    const policyRelease = new Promise<void>((resolve) => { releasePolicyPause = resolve; });
+    anomaly.getVerdict = async () => {
+      signalPolicyPause();
+      await policyRelease;
+      return 'clean';
+    };
+    const { signedData, signature, bodyHash } = await buildSignedRequest(
+      keypair.privateKey, pairId, 'DELETE', '/api/admin', secretHash,
+    );
+
+    const verification = verifyBPCRequest(makeReqData({
+      pairId,
+      signedData,
+      signature,
+      method: 'DELETE',
+      path: '/api/admin',
+      bodyHash,
+      ip: '127.0.0.1',
+    }), registry, nonceStore, anomaly);
+
+    await policyPaused;
+    await registry.updatePair(pairId, { scope: 'admin' });
+    releasePolicyPause();
+
+    const result = await verification;
+    expect(result).toEqual({ ok: false, error: 'scope_violation' });
+    expect((await registry.get(pairId))?.scope).toBe('admin');
+  });
+
+  it('does not turn the health path into an unauthenticated authorization result', async () => {
+    const result = await verifyBPCRequest(makeReqData({
+      pairId: null,
+      signedData: null,
+      signature: null,
+      method: 'GET',
+      path: '/health',
+    }), registry, nonceStore, anomaly);
+
+    expect(result).toEqual({ ok: false, error: 'missing_headers' });
+    expect(result.snapshot).toBeUndefined();
   });
 
   it('should reject a replayed request (same nonce)', async () => {
