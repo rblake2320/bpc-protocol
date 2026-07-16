@@ -37,6 +37,12 @@ All notable changes to BPC Protocol are documented in this file.
   supported runtime baseline.
 - Live Redis coverage now races 64 uses through two independent clients and
   requires exactly one first-use winner.
+- Standalone TypeScript Redis replay composition now requires an explicit
+  namespace, derives nonce retention from the signature window, bounds command
+  latency, and returns a named fail-closed denial on Redis uncertainty.
+- Live Redis coverage now sends fully signed requests through two independent
+  BPC verifiers and exercises disconnect and real `noeviction` OOM behavior
+  using built package entry points.
 - PostgreSQL persistence now retains usage caps, ghost/canary identity, and
   cumulative failure state; a live test covers schema, pending records, CRUD,
   legacy-schema migration, and connection-restart durability.
