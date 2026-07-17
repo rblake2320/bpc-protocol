@@ -1,0 +1,305 @@
+{
+  "contractVersion": "1",
+  "digestDomain": "selfconnect/ha-outbox/v1",
+  "framing": "sha256 over concat u32be(utf8len(f))||utf8(f) for [domain,version,streamId,sourceEpoch,decimal(sequence>=1),decimal(fenceToken),JCS(mutation)]",
+  "canonicalization": "RFC8785 JCS / RFC7493 I-JSON; safe-int; UTF-16 key order; reject lone-surrogate/symbol-key/accessor/non-enumerable/array-extra-prop; per-string<=65536 total<=1048576; incremental byte budget",
+  "positive": [
+    {
+      "name": "bpc-pair-set",
+      "streamId": "bpc:pair:default/v1",
+      "sourceEpoch": "e1",
+      "sequence": 1,
+      "fenceToken": "7",
+      "mutation": {
+        "op": "set",
+        "pairId": "p1",
+        "scope": "read"
+      },
+      "expectedDigest": "e628d73ef09d114e52ce93fb034ddf5951a97a44b6069c32c304c2fbcf3c9d5a"
+    },
+    {
+      "name": "bpc-pair-delete",
+      "streamId": "bpc:pair:default/v1",
+      "sourceEpoch": "e1",
+      "sequence": 2,
+      "fenceToken": "7",
+      "mutation": {
+        "op": "delete",
+        "pairId": "p1"
+      },
+      "expectedDigest": "b5deea8d41e7d3e242d5d488d55923d8b1c5e3f7df5c1896cbb4a8de0681d106"
+    },
+    {
+      "name": "tsk-tumbler-advance",
+      "streamId": "tsk:tumbler:default/v1",
+      "sourceEpoch": "e7",
+      "sequence": 42,
+      "fenceToken": "128",
+      "mutation": {
+        "op": "advance",
+        "tumblerId": "t1",
+        "counter": 100
+      },
+      "expectedDigest": "29f5bade59a228e0c89b4ccaa9bfe5f1e1f09a65313f9b17789d41aabeff94ab"
+    },
+    {
+      "name": "unicode-nesting",
+      "streamId": "s/v1",
+      "sourceEpoch": "e1",
+      "sequence": 3,
+      "fenceToken": "0",
+      "mutation": {
+        "b": 2,
+        "a": 1,
+        "nested": {
+          "y": [
+            1,
+            2,
+            3
+          ],
+          "x": "é☃"
+        }
+      },
+      "expectedDigest": "8e754cf11371fcbc5feadae57280cdfa74c90036de974d4a811a37111a0d44f7"
+    }
+  ],
+  "tamper": [
+    {
+      "name": "tamper-scope",
+      "base": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 4,
+        "fenceToken": "5",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "tampered": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 4,
+        "fenceToken": "5",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "admin"
+        }
+      },
+      "baseDigest": "40a287e7ef1a625a4ab6e84e286320889a671694629baaf0d6ebe0e9f7008748",
+      "tamperedDigest": "b21e5327edde1799971caea0510d4e1bc04a6cda7f6184b94498a18790e7c324"
+    },
+    {
+      "name": "tamper-seq",
+      "base": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 4,
+        "fenceToken": "5",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "tampered": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 5,
+        "fenceToken": "5",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "baseDigest": "40a287e7ef1a625a4ab6e84e286320889a671694629baaf0d6ebe0e9f7008748",
+      "tamperedDigest": "a63a8472131b37e56aa7ab1601c1c5b433f26c362ca941371f37122e2141b56e"
+    },
+    {
+      "name": "tamper-epoch",
+      "base": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 4,
+        "fenceToken": "5",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "tampered": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e2",
+        "sequence": 4,
+        "fenceToken": "5",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "baseDigest": "40a287e7ef1a625a4ab6e84e286320889a671694629baaf0d6ebe0e9f7008748",
+      "tamperedDigest": "724e1c21311f31475445124ffcac9d71208c6405f3e4b2577bd67e211baaf078"
+    },
+    {
+      "name": "tamper-stream",
+      "base": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 4,
+        "fenceToken": "5",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "tampered": {
+        "streamId": "other/v1",
+        "sourceEpoch": "e1",
+        "sequence": 4,
+        "fenceToken": "5",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "baseDigest": "40a287e7ef1a625a4ab6e84e286320889a671694629baaf0d6ebe0e9f7008748",
+      "tamperedDigest": "f7cdeda93aa63eee92223bf17785dbc4a475956af39c6f935357814d0f28eb8f"
+    },
+    {
+      "name": "tamper-fence",
+      "base": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 4,
+        "fenceToken": "5",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "tampered": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 4,
+        "fenceToken": "6",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "baseDigest": "40a287e7ef1a625a4ab6e84e286320889a671694629baaf0d6ebe0e9f7008748",
+      "tamperedDigest": "09e42f23fefce0f4e572259661e691d6dccbc1780bee2ceee0426ab2d2489665"
+    }
+  ],
+  "reject": [
+    {
+      "name": "undefined",
+      "mustReject": true,
+      "threw": true,
+      "error": "undefined"
+    },
+    {
+      "name": "float",
+      "mustReject": true,
+      "threw": true,
+      "error": "nonint"
+    },
+    {
+      "name": "bigint",
+      "mustReject": true,
+      "threw": true,
+      "error": "bigint"
+    },
+    {
+      "name": "date",
+      "mustReject": true,
+      "threw": true,
+      "error": "nonplain"
+    },
+    {
+      "name": "sparse",
+      "mustReject": true,
+      "threw": true,
+      "error": "arr-sparse"
+    },
+    {
+      "name": "array-extra-prop",
+      "mustReject": true,
+      "threw": true,
+      "error": "arr-nonindex"
+    },
+    {
+      "name": "getter-prop",
+      "mustReject": true,
+      "threw": true,
+      "error": "accessor"
+    },
+    {
+      "name": "lone-surrogate",
+      "mustReject": true,
+      "threw": true,
+      "error": "lone-hi"
+    },
+    {
+      "name": "bad-fence-leading-zero",
+      "mustReject": true,
+      "threw": true,
+      "error": "fence"
+    },
+    {
+      "name": "seq0-mutation",
+      "mustReject": true,
+      "threw": true,
+      "error": "seq"
+    },
+    {
+      "name": "oversized-string",
+      "mustReject": true,
+      "threw": true,
+      "error": "str-bytes"
+    }
+  ],
+  "loneSurrogate": {
+    "rejected": true,
+    "replacementCharDigest": "32d6c95d3e4b11ff919653493f08b48738ed27f9e8c37fb48a787a566571f0b7"
+  },
+  "framingNonCollision": {
+    "digestA": "56e55b6541a4d9fd15564b08d529553043e52228dd9a0885304b45f52ec558fd",
+    "digestB": "5d2f310bd95a9844627bc7de6dc11cf90e780531a2381fbbabf25f3609f889d8",
+    "mustDiffer": true
+  },
+  "keyOrderInvariant": {
+    "digestA": "33cd06f3051ccfaf5c39cc65869a293bc22b0e17476a98e593444a82abab9993",
+    "digestB": "33cd06f3051ccfaf5c39cc65869a293bc22b0e17476a98e593444a82abab9993",
+    "mustEqual": true
+  },
+  "epochTransition": {
+    "streamId": "s/v1",
+    "fromEpoch": "e1",
+    "fromEpochIndex": 0,
+    "toEpoch": "e2",
+    "toEpochIndex": 1,
+    "snapshotSequence": 42,
+    "snapshotDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "fenceToken": "9",
+    "expectedDigest": "e94b52c2176189091e9445e479e60c099fdce4d719414bb43540907baac3a943"
+  },
+  "streamHead": {
+    "streamId": "tsk:tumbler:default/v1",
+    "sequence": 42,
+    "prevHeadDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "opDigest": "29f5bade59a228e0c89b4ccaa9bfe5f1e1f09a65313f9b17789d41aabeff94ab",
+    "keyId": "key-1",
+    "alg": "ed25519",
+    "expectedDigest": "0f9453f364c94dac4d8a1decd314871b9b268534f952f1bbac728b51e9fbabb3"
+  }
+}
