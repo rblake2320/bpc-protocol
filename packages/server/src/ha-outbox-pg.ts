@@ -17,13 +17,17 @@
  * so it cannot silently skip). Issue #16 stays OPEN until the two-node
  * PostgreSQL(+Redis) failover/split-brain drill passes with recorded RPO/RTO.
  *
- * STARTUP CONTRACT: callers MUST invoke `assertSchemaReady(db, schema)` at
- * startup (full manifest attestation + version, in the pinned schema) before
- * constructing/using these classes, and pass the SAME `schema` to every
- * constructor. Direct construction does NOT itself attest — there is no
- * constructor-level unforgeable readiness token in this slice (a possible
- * hardening), so a caller that skips the startup gate can operate against an
- * un-attested schema. This is a documented boundary, not a silent gap; #16 open.
+ * STARTUP CONTRACT: callers obtain a `SchemaReadyToken` from
+ * `assertSchemaReady(db, schema)` (or provision/adopt) — a full manifest
+ * attestation + version check in the pinned schema, minting an UNFORGEABLE
+ * capability bound to that exact transactor + schema. Every mechanism constructor
+ * REQUIRES the token, so an object cannot be built (and cannot operate) without a
+ * verified, identity-bound readiness proof; there is no direct unsafe
+ * construction. The receiver OWNS its transactor (verifyAndApplyDelivered), and a
+ * bound tx carries its transactor+schema identity, so a token/tx for one database
+ * can never be used to apply against another. PRIVILEGE SEPARATION: the token
+ * proves STARTUP state; the runtime identity MUST NOT hold DDL rights, else the
+ * attested structure could be mutated under it. #16 stays OPEN.
  */
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
@@ -70,15 +74,33 @@ export interface PgTransactor {
   transaction<T>(fn: (exec: PgExecutor) => Promise<T>): Promise<T>;
 }
 
-// The opaque DurableTx carries no public members; the real executor is held in
-// a module-private WeakMap so it never leaks into the contract type and cannot
-// be reached by callers holding only the branded handle.
-const TX_EXECUTOR = new WeakMap<object, PgExecutor>();
+// The opaque DurableTx carries no public members; its executor AND the identity
+// of the transactor+schema that produced it are held in a module-private WeakMap.
+// A bound tx can therefore only be minted from inside a transactor-owning method
+// (the class calls `this.db.transaction`, so the recorded `db` is the REAL one
+// that produced the executor). There is no public minter, so a caller cannot wrap
+// a foreign executor and feed it to another object bound to a different db.
+interface BoundTxState { exec: PgExecutor; db: PgTransactor; schema: string }
+const TX_STATE = new WeakMap<object, BoundTxState>();
+
+function boundStateOf(tx: PgTx): BoundTxState {
+  const st = TX_STATE.get(tx as unknown as object);
+  if (!st) throw new ContractValidationError('DurableTx not bound to a PostgreSQL transaction (forged or foreign tx)');
+  return st;
+}
 
 function execOf(tx: PgTx): PgExecutor {
-  const e = TX_EXECUTOR.get(tx as unknown as object);
-  if (!e) throw new ContractValidationError('DurableTx not bound to a PostgreSQL transaction (forged or foreign tx)');
-  return e;
+  return boundStateOf(tx).exec;
+}
+
+/** Mint a `DurableTx<PgBackend>` bound to a live executor AND the identity of the
+ *  transactor+schema that produced it. INTERNAL — only transactor-owning methods
+ *  (withOutboxTx / the receiver's own tx) may mint, so the recorded db is the one
+ *  that actually produced `exec`. */
+function mintBoundTx(exec: PgExecutor, db: PgTransactor, schema: string): PgTx {
+  const tx = Object.freeze({}) as unknown as PgTx;
+  TX_STATE.set(tx as unknown as object, { exec, db, schema });
+  return tx;
 }
 
 /** Constant-time equality for two 64-hex digests (equal length by construction). */
@@ -137,16 +159,6 @@ async function pinSchema(exec: PgExecutor, schema: string): Promise<void> {
 async function enterCriticalTx(exec: PgExecutor, schema: string): Promise<void> {
   await assertSerializable(exec);
   await pinSchema(exec, schema);
-}
-
-/** Mint a `DurableTx<PgBackend>` bound to a live executor. The backend is the
- *  trusted minter of tx handles (the contract's brand is unforgeable by outside
- *  callers); a caller running its own `db.transaction` uses this to obtain a
- *  handle for `appendInTx` / `verifyAndApplyInTx`. */
-export function createBoundTx(exec: PgExecutor): PgTx {
-  const tx = Object.freeze({}) as unknown as PgTx;
-  TX_EXECUTOR.set(tx as unknown as object, exec);
-  return tx;
 }
 
 /** Schema version this build provisions/expects. Bump on any DDL change;
@@ -503,7 +515,7 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
   async withOutboxTx<T>(fn: (tx: PgTx, exec: PgExecutor) => Promise<T>): Promise<T> {
     return this.db.transaction(async (exec) => {
       await enterCriticalTx(exec, this.schema);
-      return fn(createBoundTx(exec), exec);
+      return fn(mintBoundTx(exec, this.db, this.schema), exec);
     });
   }
 
@@ -797,18 +809,32 @@ export class PgReceiverCheckpoint<Clean> implements ReceiverCheckpoint<Clean, Pg
   readonly epochAuthorizer: EpochTransitionAuthorizer;
   private readonly schema: string;
   constructor(
+    /** (R9) the receiver OWNS its transactor; the readiness token must be bound to
+     *  it. verifyAndApplyDelivered opens the tx here, so a foreign executor can
+     *  never be injected. */
+    private readonly db: PgTransactor,
     private readonly streamId: string,
     sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'assertSanitized'>,
     private readonly applier: MutationApplier<Clean>,
-    /** (R8) schema-readiness capability. The receiver runs inside the caller's
-     *  bound tx (no own transactor), so only the token brand + schema bind here;
-     *  the per-tx schema pin in verifyAndApplyInTx is the operational enforcement. */
     ready: SchemaReadyToken,
     epochAuthorizer: EpochTransitionAuthorizer = { async authorizeTransition() { throw new ContractValidationError('epoch transition not authorized in this slice'); } },
-  ) { this.schema = requireReady(ready); this.sanitizer = sanitizer; this.epochAuthorizer = epochAuthorizer; }
+  ) { this.schema = requireReady(ready, db); this.sanitizer = sanitizer; this.epochAuthorizer = epochAuthorizer; }
+
+  /** (R9) The safe public entry: opens the receiver's OWN serializable tx on its
+   *  OWN (token-bound) transactor and applies. No external tx/executor can be
+   *  injected, so a record can never be applied against a foreign database. */
+  async verifyAndApplyDelivered(record: OutboxRecord<Clean>): Promise<ReceiverDecision> {
+    return this.db.transaction((exec) => this.verifyAndApplyInTx(mintBoundTx(exec, this.db, this.schema), record));
+  }
 
   async verifyAndApplyInTx(tx: PgTx, record: OutboxRecord<Clean>): Promise<ReceiverDecision> {
-    const exec = execOf(tx);
+    // (R9/HIGH) reject BEFORE any query: the tx must be bound to THIS receiver's
+    // exact transactor + schema. A tx minted for another db (or a forged handle)
+    // cannot be used to apply here, closing the A-token / B-executor gap.
+    const st = boundStateOf(tx);
+    if (st.db !== this.db) throw new ContractValidationError('receiver tx is bound to a different transactor than this receiver');
+    if (st.schema !== this.schema) throw new ContractValidationError('receiver tx schema does not match this receiver');
+    const exec = st.exec;
     await enterCriticalTx(exec, this.schema);
     if (record.streamId !== this.streamId) throw new ContractValidationError('streamId mismatch for this receiver');
     assertHeaderConformant(record);

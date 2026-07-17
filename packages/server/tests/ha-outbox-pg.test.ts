@@ -18,7 +18,6 @@ import {
   PgReceiverCheckpoint,
   assertSchemaVersionOnly,
   __unsafeMintReadyTokenForTests,
-  createBoundTx,
   type AckReceipt,
   type AckReceiptVerifier,
   type MutationApplier,
@@ -175,8 +174,8 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
   });
 
   // ── receiver ──
-  const rcvFor = (sid: string) => new PgReceiverCheckpoint<Clean>(sid, sanitizer, applier, tok(db));
-  const apply = (rcv: PgReceiverCheckpoint<Clean>, rec: OutboxRecord<Clean>) => db.transaction((e) => rcv.verifyAndApplyInTx(createBoundTx(e), rec));
+  const rcvFor = (sid: string) => new PgReceiverCheckpoint<Clean>(db, sid, sanitizer, applier, tok(db));
+  const apply = (rcv: PgReceiverCheckpoint<Clean>, rec: OutboxRecord<Clean>) => rcv.verifyAndApplyDelivered(rec);
   const mk = (sid: string, seq: number, m: Clean, fence = '0'): OutboxRecord<Clean> => ({ contractVersion: '1', streamId: sid, sourceEpoch: 'e1', sequence: seq, fenceToken: fence, opDigest: dig(sid, 'e1', seq, fence, m), mutation: m as SanitizedMutation<Clean> });
 
   it('#1 tampered payload with preserved opDigest is reject-fork', async () => {

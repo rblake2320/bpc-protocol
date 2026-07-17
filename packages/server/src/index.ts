@@ -165,7 +165,6 @@ export {
   adoptCurrentSchemaVersion,
   assertSchemaReady,
   attestSchema,
-  createBoundTx,
   provisionSchemaVersion,
   schemaManifest,
 } from './ha-outbox-pg.js';

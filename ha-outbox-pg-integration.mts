@@ -37,7 +37,6 @@ import {
   attestSchema,
   canonicalOpDigest,
   ContractValidationError,
-  createBoundTx,
   provisionSchemaVersion,
   schemaManifest,
 } from './packages/server/src/index.ts';
@@ -148,10 +147,10 @@ const unacked = async (sid: string) => Number((await pool.query('SELECT count(*)
  *  serializable tx and returns a signed receipt carrying the receiver decision.
  *  Every decision is recorded (with the sequence, in real delivery order). */
 function receiverTransport(streamId: string, decisions: Array<{ seq: number; decision: ReceiverDecision }>): OutboxTransport {
-  const receiver = new PgReceiverCheckpoint<Clean>(streamId, sanitizer, applierRecording, READY);
+  const receiver = new PgReceiverCheckpoint<Clean>(serial, streamId, sanitizer, applierRecording, READY);
   return {
     async deliverAndAwaitAck(record) {
-      const decision = await serial.transaction((e) => receiver.verifyAndApplyInTx(createBoundTx(e), record as OutboxRecord<Clean>));
+      const decision = await receiver.verifyAndApplyDelivered(record as OutboxRecord<Clean>);
       decisions.push({ seq: record.sequence, decision });
       return receiptFor(record, decision);
     },
@@ -220,13 +219,13 @@ async function main(): Promise<void> {
     const ob = mkOutbox(serial, sid);
     for (let i = 0; i < N; i++) await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'p' + i }, fenceToken: 0n }));
     const decisions: Array<{ seq: number; decision: ReceiverDecision }> = [];
-    const receiver = new PgReceiverCheckpoint<Clean>(sid, sanitizer, applierRecording, READY);
+    const receiver = new PgReceiverCheckpoint<Clean>(serial, sid, sanitizer, applierRecording, READY);
     let deliveredByA = 0;
     // Publisher A: short lease, stops (throws) after delivering 4
     const transportA: OutboxTransport = { async deliverAndAwaitAck(record) {
       if (deliveredByA >= 4) throw new Error('publisher A stopped');
       deliveredByA++;
-      const d = await serial.transaction((e) => receiver.verifyAndApplyInTx(createBoundTx(e), record as OutboxRecord<Clean>));
+      const d = await receiver.verifyAndApplyDelivered(record as OutboxRecord<Clean>);
       decisions.push({ seq: record.sequence, decision: d });
       return receiptFor(record, d);
     } };
@@ -279,11 +278,11 @@ async function main(): Promise<void> {
     await pool.query('UPDATE ha_outbox_source_checkpoint SET sequence=500 WHERE stream_id=$1', [sid]);
     const dig = (seq: number, m: Clean) => canonicalOpDigest<Clean>({ streamId: sid, sourceEpoch: 'e1', sequence: seq, fenceToken: '0', mutation: m as SanitizedMutation<Clean> });
     const rec = (seq: number, m: Clean): OutboxRecord<Clean> => ({ contractVersion: '1', streamId: sid, sourceEpoch: 'e1', sequence: seq, fenceToken: '0', opDigest: dig(seq, m), mutation: m as SanitizedMutation<Clean> });
-    const applyWith = (rcv: PgReceiverCheckpoint<Clean>, r: OutboxRecord<Clean>) => serial.transaction((e) => rcv.verifyAndApplyInTx(createBoundTx(e), r));
-    const r1 = new PgReceiverCheckpoint<Clean>(sid, sanitizer, applierRecording, READY);
+    const applyWith = (rcv: PgReceiverCheckpoint<Clean>, r: OutboxRecord<Clean>) => rcv.verifyAndApplyDelivered(r);
+    const r1 = new PgReceiverCheckpoint<Clean>(serial, sid, sanitizer, applierRecording, READY);
     assert.equal(await applyWith(r1, rec(1, { pairId: 'a' })), 'applied');
     assert.equal(await applyWith(r1, rec(2, { pairId: 'b' })), 'applied');
-    const r2 = new PgReceiverCheckpoint<Clean>(sid, sanitizer, applierRecording, READY); // restart
+    const r2 = new PgReceiverCheckpoint<Clean>(serial, sid, sanitizer, applierRecording, READY); // restart
     assert.equal(await applyWith(r2, rec(1, { pairId: 'a' })), 'duplicate-ok');
     assert.equal(await applyWith(r2, rec(1, { pairId: 'FORK' })), 'reject-fork');
     assert.equal(Number((await pool.query('SELECT sequence FROM ha_outbox_receiver_checkpoint WHERE stream_id=$1', [sid])).rows[0].sequence), 2);
@@ -373,6 +372,29 @@ async function main(): Promise<void> {
     assert.ok(t2 > t1);
   });
 
+  await check('(R9/HIGH) a receiver cannot apply against a foreign-db tx (reject BEFORE any query)', async () => {
+    const sid = 'sc:r9/v1'; await provision(sid);
+    // receiverA is bound to `serial` (READY)
+    const receiverA = new PgReceiverCheckpoint<Clean>(serial, sid, sanitizer, applierRecording, READY);
+    // a token minted for `serial` cannot even CONSTRUCT a receiver on another transactor
+    const serialB = new RealPg('SERIALIZABLE');
+    assert.throws(() => new PgReceiverCheckpoint<Clean>(serialB, sid, sanitizer, applierRecording, READY), /different PgTransactor/);
+    // and a bound tx produced by dbB cannot be fed to receiverA — rejected before any query runs
+    const readyB = await assertSchemaReady(serialB, SCHEMA); // same physical DB, distinct transactor identity
+    const outboxB = new PgDurableOutbox<Raw, Clean>(serialB, readyB, { streamId: sid, sanitizer, maxPendingRows: 100, backpressure: 'quarantine' });
+    const dig = canonicalOpDigest<Clean>({ streamId: sid, sourceEpoch: 'e1', sequence: 1, fenceToken: '0', mutation: { pairId: 'x' } as SanitizedMutation<Clean> });
+    const rec: OutboxRecord<Clean> = { contractVersion: '1', streamId: sid, sourceEpoch: 'e1', sequence: 1, fenceToken: '0', opDigest: dig, mutation: { pairId: 'x' } as SanitizedMutation<Clean> };
+    let sawForeignTx = false;
+    await assert.rejects(
+      () => outboxB.withOutboxTx((txB) => { sawForeignTx = true; return receiverA.verifyAndApplyInTx(txB, rec); }),
+      /bound to a different transactor/,
+      'a foreign-db tx must be rejected by the receiver before any apply',
+    );
+    assert.equal(sawForeignTx, true);
+    // nothing was applied
+    assert.equal(Number((await pool.query('SELECT sequence FROM ha_outbox_receiver_checkpoint WHERE stream_id=$1', [sid])).rows[0].sequence), 0);
+  });
+
   await check('(R5) DDL never auto-bumps meta; only attested migration advances', async () => {
     await pool.query('UPDATE ha_outbox_meta SET schema_version = 1 WHERE id = 1');
     await applyDDL();
@@ -452,10 +474,10 @@ async function main(): Promise<void> {
     const sid = 'sc:steal/v1'; await provision(sid); const N = 8;
     const ob = mkOutbox(serial, sid);
     for (let i = 0; i < N; i++) await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'p' + i }, fenceToken: 0n }));
-    const receiver = new PgReceiverCheckpoint<Clean>(sid, sanitizer, applierRecording, READY);
+    const receiver = new PgReceiverCheckpoint<Clean>(serial, sid, sanitizer, applierRecording, READY);
     const slow: OutboxTransport = { async deliverAndAwaitAck(record) {
       await new Promise((r) => setTimeout(r, 120)); // slow delivery > lease -> lease can be stolen mid-flight
-      const d = await serial.transaction((e) => receiver.verifyAndApplyInTx(createBoundTx(e), record as OutboxRecord<Clean>));
+      const d = await receiver.verifyAndApplyDelivered(record as OutboxRecord<Clean>);
       return receiptFor(record, d);
     } };
     const mkPub = () => new PgDurablePublisher<Clean>(serial, sid, slow, 'quarantine', sanitizer, verifier, READY, { leaseMs: 100 }); // short lease
