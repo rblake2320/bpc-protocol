@@ -16,7 +16,8 @@ import {
   PgDurablePublisher,
   PgPromotionFence,
   PgReceiverCheckpoint,
-  assertSchemaVersion,
+  assertSchemaVersionOnly,
+  __unsafeMintReadyTokenForTests,
   createBoundTx,
   type AckReceipt,
   type AckReceiptVerifier,
@@ -117,6 +118,7 @@ const sanitizer: MutationSanitizer<Raw, Clean> = {
 const applied: string[] = [];
 const applier: MutationApplier<Clean> = { async applyInTx(_e, r) { applied.push(`${r.sequence}:${(r.mutation as Clean).pairId}`); } };
 const SID = 'bpc:pair:default/v1';
+const tok = (d: MemoryPg) => __unsafeMintReadyTokenForTests(d, 'public');
 const RECEIVER_ID = 'receiver-A', KEY_ID = 'k1';
 // Signature binds keyId + record digest + DECISION, so a swapped decision fails verify.
 const sign = (r: OutboxRecord<unknown>, decision: ReceiverDecision) => `${KEY_ID}:${r.opDigest}:${decision}`;
@@ -133,12 +135,12 @@ const dig = (streamId: string, sourceEpoch: string, sequence: number, fenceToken
 describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC)', () => {
   let db: MemoryPg; let outbox: PgDurableOutbox<Raw, Clean>;
   beforeEach(() => { db = new MemoryPg(); db.provision(SID, 'e1'); applied.length = 0;
-    outbox = new PgDurableOutbox(db, { streamId: SID, sanitizer, schema: 'public', maxPendingRows: 100, backpressure: 'fail-authoritative-mutation' }); });
+    outbox = new PgDurableOutbox(db, tok(db), { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'fail-authoritative-mutation' }); });
 
   it('schema version gate passes at current version, fails on drift', async () => {
-    await assertSchemaVersion(db);
+    await assertSchemaVersionOnly(db, 'public');
     db.state.version = HA_OUTBOX_SCHEMA_VERSION + 1;
-    await expect(assertSchemaVersion(db)).rejects.toThrow(/schema version mismatch/);
+    await expect(assertSchemaVersionOnly(db, 'public')).rejects.toThrow(/schema version mismatch/);
   });
 
   it('append allocates seq>=1, binds fence, sanitizes; atomic', async () => {
@@ -158,7 +160,7 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
     await expect(outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'p1' }, fenceToken: 0n }))).rejects.toBeInstanceOf(ContractValidationError);
   });
   it('backpressure fails closed, never sheds', async () => {
-    const ob = new PgDurableOutbox(db, { streamId: SID, sanitizer, schema: 'public', maxPendingRows: 3, backpressure: 'fail-authoritative-mutation' });
+    const ob = new PgDurableOutbox(db, tok(db), { streamId: SID, sanitizer, maxPendingRows: 3, backpressure: 'fail-authoritative-mutation' });
     for (let i = 0; i < 3; i++) await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'p' + i }, fenceToken: 0n }));
     await expect(ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'p4' }, fenceToken: 0n }))).rejects.toBeInstanceOf(OutboxBackpressureError);
     expect(db.rowCount(SID)).toBe(3);
@@ -173,7 +175,7 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
   });
 
   // ── receiver ──
-  const rcvFor = (sid: string) => new PgReceiverCheckpoint<Clean>(sid, sanitizer, applier, 'public');
+  const rcvFor = (sid: string) => new PgReceiverCheckpoint<Clean>(sid, sanitizer, applier, tok(db));
   const apply = (rcv: PgReceiverCheckpoint<Clean>, rec: OutboxRecord<Clean>) => db.transaction((e) => rcv.verifyAndApplyInTx(createBoundTx(e), rec));
   const mk = (sid: string, seq: number, m: Clean, fence = '0'): OutboxRecord<Clean> => ({ contractVersion: '1', streamId: sid, sourceEpoch: 'e1', sequence: seq, fenceToken: fence, opDigest: dig(sid, 'e1', seq, fence, m), mutation: m as SanitizedMutation<Clean> });
 
@@ -213,7 +215,7 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
   });
 
   // ── publisher: per-stream ordered lease + signed-decision ACK (H1/H2 logic) ──
-  const pubFor = (t: OutboxTransport, v: AckReceiptVerifier = verifier) => new PgDurablePublisher<Clean>(db, SID, t, 'quarantine', sanitizer, v, 'public', { leaseMs: 30_000 });
+  const pubFor = (t: OutboxTransport, v: AckReceiptVerifier = verifier) => new PgDurablePublisher<Clean>(db, SID, t, 'quarantine', sanitizer, v, tok(db), { leaseMs: 30_000 });
   const seed = async (n: number) => { for (let i = 0; i < n; i++) await outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'p' + i }, fenceToken: 0n })); };
 
   it('(H1) delivers lowest-first and ACKs each on applied/duplicate-ok', async () => {
@@ -228,9 +230,9 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
     await seed(3);
     for (const decision of ['reject-gap', 'reject-fence'] as ReceiverDecision[]) {
       const fresh = new MemoryPg(); fresh.provision(SID, 'e1');
-      const ob = new PgDurableOutbox(fresh, { streamId: SID, sanitizer, schema: 'public', maxPendingRows: 100, backpressure: 'quarantine' });
+      const ob = new PgDurableOutbox(fresh, tok(fresh), { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'quarantine' });
       for (let i = 0; i < 3; i++) await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'p' + i }, fenceToken: 0n }));
-      const pub = new PgDurablePublisher<Clean>(fresh, SID, { async deliverAndAwaitAck(r) { return receiptFor(r, decision); } }, 'quarantine', sanitizer, verifier, 'public', { leaseMs: 30_000 });
+      const pub = new PgDurablePublisher<Clean>(fresh, SID, { async deliverAndAwaitAck(r) { return receiptFor(r, decision); } }, 'quarantine', sanitizer, verifier, tok(fresh), { leaseMs: 30_000 });
       const res = await pub.drainOnce();
       expect(res.acked).toBe(0); expect(res.retriable).toBe(true); expect(res.published).toBe(1); // stopped after the first
       expect(fresh.rowsOf(SID).every((r) => r.acked_at === null && r.quarantined_at === null)).toBe(true);
@@ -299,7 +301,7 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
     await expect(apply(rcv, mk('r6/v1', 1, { pairId: 'p1' }))).rejects.toBeInstanceOf(ContractValidationError);
   });
   it('promotion fence is monotonic + persisted', async () => {
-    const fence = new PgPromotionFence(db, 'public');
+    const fence = new PgPromotionFence(db, tok(db));
     const t1 = await fence.acquire('f/v1'); const t2 = await fence.acquire('f/v1');
     expect(t2).toBeGreaterThan(t1); expect(await fence.current('f/v1')).toBe(t2);
   });

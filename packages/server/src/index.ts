@@ -162,11 +162,10 @@ export {
   PgDurablePublisher,
   PgPromotionFence,
   PgReceiverCheckpoint,
+  adoptCurrentSchemaVersion,
   assertSchemaReady,
-  assertSchemaVersion,
   attestSchema,
   createBoundTx,
-  migrateSchemaToCurrent,
   provisionSchemaVersion,
   schemaManifest,
 } from './ha-outbox-pg.js';
@@ -182,6 +181,7 @@ export type {
   PgPublisherOptions,
   PgTransactor,
   PgTx,
+  SchemaReadyToken,
 } from './ha-outbox-pg.js';
 export {
   RedisContinuityConfigurationError,

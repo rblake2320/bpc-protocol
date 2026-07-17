@@ -251,17 +251,19 @@ const HA_OUTBOX_TABLES = [
 ] as const;
 
 /**
- * (R5/R6/HIGH) Pinned manifest of the EXACT expected schema in the CURRENT
- * schema: every table's columns (ordinal position, name, type, nullability,
- * default), every PK/CHECK/unique/FK constraint definition, and every index
- * definition. Computed over a known-good v2 provisioning and constant-time
- * compared at attestation. Any deviation — a missing/altered/reordered column, a
- * weakened/removed CHECK, a wrong PK, a missing/wrong partial index, or
- * same-named objects in a different schema — changes the digest and fails closed.
- * PostgreSQL-major-version specific (catalog rendering): a supported-PG bump
- * requires recomputing this via schemaManifest().
+ * (R5/R6/R8/HIGH) Pinned manifest of the EXACT expected schema in the CURRENT
+ * schema: every table's columns (ordinal, name, type, nullability, default),
+ * every PK/CHECK/unique/FK constraint, every index definition, each table's
+ * relkind/persistence and RLS posture (relrowsecurity/relforcerowsecurity), every
+ * NON-internal trigger (def + enabled state), and every RLS policy (cmd, roles,
+ * USING/WITH CHECK). Constant-time compared at attestation; ANY deviation — a
+ * missing/altered/reordered column, a weakened/removed CHECK, a wrong PK, a
+ * missing/wrong index, a table turned into a view/unlogged, an added trigger or
+ * RLS policy, or same-named objects in a different schema — changes the digest
+ * and fails closed. PostgreSQL-major-version specific (catalog rendering): a
+ * supported-PG bump requires recomputing this via schemaManifest().
  */
-export const HA_OUTBOX_SCHEMA_MANIFEST = 'e2a09fd85eee5d7524c5112f189c1b1b6809047a0b1a0be594f5fb0e2b43b62e';
+export const HA_OUTBOX_SCHEMA_MANIFEST = 'ded9abb5f0c381115754bcbd676a12e27d2f8c3b5456465e76d394c00e893de3';
 
 /** Canonical fingerprint of the live schema in `current_schema()`. Deterministic
  *  (no oids/timestamps); identical normalization to the pinned manifest. */
@@ -282,11 +284,38 @@ export async function schemaManifest(exec: PgExecutor): Promise<string> {
     `SELECT tablename AS t, indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema() AND tablename = ANY($1)`,
     [tables],
   )).rows;
+  // (R8) relation kind/persistence + row-level-security posture per table.
+  const rel = (await exec.query(
+    `SELECT rel.relname AS t, rel.relkind, rel.relpersistence, rel.relrowsecurity, rel.relforcerowsecurity
+     FROM pg_class rel JOIN pg_namespace n ON n.oid = rel.relnamespace
+     WHERE n.nspname = current_schema() AND rel.relname = ANY($1)`,
+    [tables],
+  )).rows;
+  // (R8) all NON-internal triggers (definition + enabled state).
+  const trig = (await exec.query(
+    `SELECT rel.relname AS t, tg.tgname, tg.tgenabled, pg_get_triggerdef(tg.oid) AS def
+     FROM pg_trigger tg JOIN pg_class rel ON rel.oid = tg.tgrelid JOIN pg_namespace n ON n.oid = rel.relnamespace
+     WHERE n.nspname = current_schema() AND rel.relname = ANY($1) AND NOT tg.tgisinternal`,
+    [tables],
+  )).rows;
+  // (R8) RLS policies: cmd, roles, USING/WITH CHECK expressions.
+  const pol = (await exec.query(
+    `SELECT rel.relname AS t, p.polname, p.polcmd,
+            coalesce((SELECT string_agg(rolname, ',' ORDER BY rolname) FROM pg_roles WHERE oid = ANY(p.polroles)), '') AS roles,
+            coalesce(pg_get_expr(p.polqual, p.polrelid), '') AS qual,
+            coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '') AS withcheck
+     FROM pg_policy p JOIN pg_class rel ON rel.oid = p.polrelid JOIN pg_namespace n ON n.oid = rel.relnamespace
+     WHERE n.nspname = current_schema() AND rel.relname = ANY($1)`,
+    [tables],
+  )).rows;
   const stripSchema = (s: string) => s.replace(/ ON \w+\./, ' ON ');
   const parts: string[] = [];
   for (const r of cols) parts.push(`COL|${r.table_name}|${r.ordinal_position}|${r.column_name}|${r.udt_name}|${r.is_nullable}|${r.cd}`);
   for (const r of cons) parts.push(`CON|${r.t}|${r.contype}|${r.def}`);
   for (const r of idx) parts.push(`IDX|${r.t}|${r.indexname}|${stripSchema(String(r.indexdef))}`);
+  for (const r of rel) parts.push(`REL|${r.t}|${r.relkind}|${r.relpersistence}|${r.relrowsecurity}|${r.relforcerowsecurity}`);
+  for (const r of trig) parts.push(`TRG|${r.t}|${r.tgname}|${r.tgenabled}|${stripSchema(String(r.def))}`);
+  for (const r of pol) parts.push(`POL|${r.t}|${r.polname}|${r.polcmd}|${r.roles}|${r.qual}|${r.withcheck}`);
   parts.sort();
   return createHash('sha256').update(parts.join('\n'), 'utf8').digest('hex');
 }
@@ -300,28 +329,64 @@ export async function attestSchema(exec: PgExecutor): Promise<void> {
   }
 }
 
-/** (MED) Fail closed unless the meta VERSION matches this build. This is the
- *  version-only check; it does NOT detect post-provision structural drift — use
- *  `assertSchemaReady` for the full runtime readiness gate. */
-export async function assertSchemaVersion(db: PgTransactor): Promise<void> {
-  const rows = (await db.transaction((exec) => exec.query('SELECT schema_version FROM ha_outbox_meta WHERE id = 1'))).rows;
-  if (!rows.length) throw new ContractValidationError('ha_outbox schema is not provisioned (no meta row)');
-  const found = safeSeq(rows[0].schema_version, 'schema_version');
-  if (found !== HA_OUTBOX_SCHEMA_VERSION) throw new ContractValidationError(`ha_outbox schema version mismatch: db=${found} expected=${HA_OUTBOX_SCHEMA_VERSION}`);
+/**
+ * (R8/HIGH) UNFORGEABLE schema-readiness capability. It is only minted by
+ * `assertSchemaReady`/`provisionSchemaVersion`/`adoptCurrentSchemaVersion` after a
+ * full in-tx attestation, and is bound to the exact `PgTransactor` identity, the
+ * pinned `schema`, and the attested manifest+version digest. Constructors REQUIRE
+ * one and reject a token minted for a different transactor or schema — so a
+ * mechanism object cannot be built (and therefore cannot operate) without a
+ * verified, identity-bound readiness proof. The type is opaque; its state lives
+ * in a module-private WeakMap and cannot be reached or forged by callers.
+ *
+ * PRIVILEGE-SEPARATION NOTE: the token establishes readiness at STARTUP. It does
+ * NOT (and cannot) prevent a role holding DDL privilege from mutating the schema
+ * afterwards. Preserving readiness at runtime is a database privilege-separation
+ * responsibility: the runtime identity MUST NOT hold DDL/migration rights, so the
+ * attested structure cannot be altered under it. #16 stays OPEN.
+ */
+const READY_BRAND = Symbol('ha_outbox_schema_ready');
+export interface SchemaReadyToken { readonly [READY_BRAND]: true }
+interface ReadyState { db: PgTransactor; schema: string; manifest: string; version: number }
+const READY_STATE = new WeakMap<object, ReadyState>();
+
+function mintReadyToken(state: ReadyState): SchemaReadyToken {
+  const token = Object.freeze({ [READY_BRAND]: true as const });
+  READY_STATE.set(token, state);
+  return token as SchemaReadyToken;
+}
+
+/** Validate a readiness token (brand + optional transactor identity) and return
+ *  its bound schema. Throws on a forged/foreign token or a db/schema mismatch. */
+function requireReady(token: SchemaReadyToken, db?: PgTransactor, expectSchema?: string): string {
+  const st = READY_STATE.get(token as unknown as object);
+  if (!st) throw new ContractValidationError('invalid schema-readiness capability (forged or foreign token)');
+  if (db !== undefined && st.db !== db) throw new ContractValidationError('schema-readiness token is bound to a different PgTransactor');
+  if (expectSchema !== undefined && st.schema !== expectSchema) throw new ContractValidationError('schema-readiness token schema mismatch');
+  if (st.manifest !== HA_OUTBOX_SCHEMA_MANIFEST || st.version !== HA_OUTBOX_SCHEMA_VERSION) throw new ContractValidationError('schema-readiness token attests a different manifest/version');
+  return st.schema;
 }
 
 /**
- * (R6/HIGH2) The RUNTIME READINESS GATE — the single public assertion callers
- * use before operating. In ONE serializable tx it performs BOTH a full manifest
- * attestation (catches post-provision structural drift: an ALTER/DROP of a
- * CHECK/index/table that left meta untouched) AND the version check. A schema
- * that was validly stamped v2 and later mutated fails here even though
- * assertSchemaVersion alone would pass.
+ * TEST-ONLY factory: mint a readiness token WITHOUT a live attestation, for
+ * hermetic unit tests that use an in-memory fake transactor. Never use in
+ * production — it bypasses the attestation the real gate performs.
  */
-export async function assertSchemaReady(db: PgTransactor, schema: string): Promise<void> {
+export function __unsafeMintReadyTokenForTests(db: PgTransactor, schema: string): SchemaReadyToken {
+  assertSchemaIdentifier(schema);
+  return mintReadyToken({ db, schema, manifest: HA_OUTBOX_SCHEMA_MANIFEST, version: HA_OUTBOX_SCHEMA_VERSION });
+}
+
+/**
+ * @internal @deprecated — version-only check. Callers MUST NOT use this as a
+ * readiness gate: it does NOT detect structural drift (an ALTER/DROP that left
+ * meta untouched). Use `assertSchemaReady`. Retained (unexported from the package
+ * index) only to demonstrate the weaker-gate bypass in tests. Requires the pinned
+ * schema so it reads the intended authority.
+ */
+export async function assertSchemaVersionOnly(db: PgTransactor, schema: string): Promise<void> {
   await db.transaction(async (exec) => {
     await enterCriticalTx(exec, schema);
-    await attestSchema(exec);
     const rows = (await exec.query('SELECT schema_version FROM ha_outbox_meta WHERE id = 1')).rows;
     if (!rows.length) throw new ContractValidationError('ha_outbox schema is not provisioned (no meta row)');
     const found = safeSeq(rows[0].schema_version, 'schema_version');
@@ -329,15 +394,38 @@ export async function assertSchemaReady(db: PgTransactor, schema: string): Promi
   });
 }
 
+/** Inline version-check helper (assumes the tx already entered/pinned). */
+async function assertVersionInTx(exec: PgExecutor): Promise<void> {
+  const rows = (await exec.query('SELECT schema_version FROM ha_outbox_meta WHERE id = 1')).rows;
+  if (!rows.length) throw new ContractValidationError('ha_outbox schema is not provisioned (no meta row)');
+  const found = safeSeq(rows[0].schema_version, 'schema_version');
+  if (found !== HA_OUTBOX_SCHEMA_VERSION) throw new ContractValidationError(`ha_outbox schema version mismatch: db=${found} expected=${HA_OUTBOX_SCHEMA_VERSION}`);
+}
+
+/**
+ * (R6/R8/HIGH) The RUNTIME READINESS GATE. In ONE serializable tx, in the pinned
+ * schema, it runs the FULL manifest attestation (catches post-provision drift)
+ * AND the version check, then MINTS an unforgeable `SchemaReadyToken` bound to
+ * this transactor + schema + attested manifest/version. Constructors require the
+ * token, so a mechanism object cannot be built without this proof.
+ */
+export async function assertSchemaReady(db: PgTransactor, schema: string): Promise<SchemaReadyToken> {
+  await db.transaction(async (exec) => {
+    await enterCriticalTx(exec, schema);
+    await attestSchema(exec);
+    await assertVersionInTx(exec);
+  });
+  return mintReadyToken({ db, schema, manifest: HA_OUTBOX_SCHEMA_MANIFEST, version: HA_OUTBOX_SCHEMA_VERSION });
+}
+
 /**
  * (R5/R7/HIGH2) FRESH provisioning in the PINNED schema: attest the fully-fresh
  * catalog, then stamp the current version with a PLAIN insert whose effect is
- * asserted (affectedOne). An existing meta row at exactly the current version is
- * an explicit idempotent no-op; ANY other existing row (a future marker, a lower
- * version, or multiple authority rows) is REJECTED — fresh provisioning never
- * silently succeeds against a non-fresh database. Ends by asserting readiness.
+ * asserted. An existing meta row at exactly the current version is an explicit
+ * idempotent no-op; ANY other existing row (future/lower/multiple) is REJECTED.
+ * Returns a readiness token on success.
  */
-export async function provisionSchemaVersion(db: PgTransactor, schema: string): Promise<void> {
+export async function provisionSchemaVersion(db: PgTransactor, schema: string): Promise<SchemaReadyToken> {
   await db.transaction(async (exec) => {
     await enterCriticalTx(exec, schema);
     await attestSchema(exec);
@@ -345,51 +433,48 @@ export async function provisionSchemaVersion(db: PgTransactor, schema: string): 
     if (rows.length > 1) throw new ContractValidationError('multiple schema-version authority rows');
     if (rows.length === 1) {
       const cur = safeSeq(rows[0].schema_version, 'schema_version');
-      if (cur === HA_OUTBOX_SCHEMA_VERSION) return; // idempotent: already provisioned at current
+      if (cur === HA_OUTBOX_SCHEMA_VERSION) return; // idempotent
       throw new ContractValidationError(`fresh provisioning refused: meta already at version ${cur}`);
     }
     const res = await exec.query(`INSERT INTO ha_outbox_meta (id, schema_version) VALUES (1, ${HA_OUTBOX_SCHEMA_VERSION})`);
     affectedOne(res, 'fresh schema provision');
   });
+  return mintReadyToken({ db, schema, manifest: HA_OUTBOX_SCHEMA_MANIFEST, version: HA_OUTBOX_SCHEMA_VERSION });
 }
 
 /**
- * (R4/R5/R6/R7/HIGH) EXPLICIT version advance in the PINNED schema — the ONLY
- * path that may bump an existing meta row. Runs a FULL catalog attestation in the
- * SAME serializable tx, then advances FORWARD-ONLY: it reads the current version
- * under lock and only stamps when meta is absent OR at a lower supported version.
- * A version already at current is a no-op; a FUTURE version (> this build — e.g.
- * a semantic-only revision or a pre-staged marker sharing this catalog) is
- * REFUSED, never silently downgraded. A malformed/partial/foreign-schema layout
- * fails attestation, so the version can never race ahead of the real structure.
+ * (R4/R5/R6/R7/R8) ADOPT the current schema version for an install whose catalog
+ * ALREADY EXACTLY matches this build's manifest (renamed from migrateSchemaToCurrent:
+ * it does NOT migrate an old DDL layout — it attests the exact current structure
+ * and adopts the version). The ONLY path that may bump an existing meta row, and
+ * FORWARD-ONLY: already-current is a no-op; a FUTURE version is REFUSED (never
+ * downgraded); a malformed/partial/foreign layout fails attestation. (Real
+ * structural migrations between versions are a separate, future concern.)
+ * Returns a readiness token on success.
  */
-export async function migrateSchemaToCurrent(db: PgTransactor, schema: string): Promise<void> {
+export async function adoptCurrentSchemaVersion(db: PgTransactor, schema: string): Promise<SchemaReadyToken> {
   await db.transaction(async (exec) => {
     await enterCriticalTx(exec, schema);
     await attestSchema(exec);
-    // read current authority under lock (meta PK + id=1 CHECK guarantee <= 1 row;
-    // still assert it defensively so multiple/foreign authority rows fail closed).
     const rows = (await exec.query('SELECT schema_version FROM ha_outbox_meta FOR UPDATE')).rows;
     if (rows.length > 1) throw new ContractValidationError('multiple schema-version authority rows');
     if (rows.length === 1) {
       const cur = safeSeq(rows[0].schema_version, 'schema_version');
-      if (cur === HA_OUTBOX_SCHEMA_VERSION) return; // already current — no-op
+      if (cur === HA_OUTBOX_SCHEMA_VERSION) return; // no-op
       if (cur > HA_OUTBOX_SCHEMA_VERSION) throw new ContractValidationError(`refusing to downgrade schema version ${cur} -> ${HA_OUTBOX_SCHEMA_VERSION}`);
     }
     const res = await exec.query(
       `INSERT INTO ha_outbox_meta (id, schema_version) VALUES (1, ${HA_OUTBOX_SCHEMA_VERSION})
        ON CONFLICT (id) DO UPDATE SET schema_version = EXCLUDED.schema_version`,
     );
-    affectedOne(res, 'schema version advance');
+    affectedOne(res, 'schema version adopt');
   });
+  return mintReadyToken({ db, schema, manifest: HA_OUTBOX_SCHEMA_MANIFEST, version: HA_OUTBOX_SCHEMA_VERSION });
 }
 
 export interface PgOutboxOptions<Raw, Clean> {
   streamId: string;
   sanitizer: MutationSanitizer<Raw, Clean>;
-  /** (R7) the configured schema this outbox is pinned to — every critical tx
-   *  SET LOCAL search_paths to it and asserts current_schema() matches. */
-  schema: string;
   /** Max unpublished/unacked rows before admission fails closed. */
   maxPendingRows: number;
   /** Backpressure policy surfaced to the publisher contract. */
@@ -405,12 +490,11 @@ export interface PgOutboxOptions<Raw, Clean> {
 export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, PgBackend> {
   readonly sanitizer: MutationSanitizer<Raw, Clean>;
   private readonly schema: string;
-  constructor(private readonly db: PgTransactor, private readonly opts: PgOutboxOptions<Raw, Clean>) {
+  constructor(private readonly db: PgTransactor, ready: SchemaReadyToken, private readonly opts: PgOutboxOptions<Raw, Clean>) {
     if (!Number.isSafeInteger(opts.maxPendingRows) || opts.maxPendingRows <= 0) {
       throw new ContractValidationError('maxPendingRows must be a positive safe integer');
     }
-    assertSchemaIdentifier(opts.schema);
-    this.schema = opts.schema;
+    this.schema = requireReady(ready, db); // (R8) reject a forged/foreign-db token
     this.sanitizer = opts.sanitizer;
   }
 
@@ -562,13 +646,12 @@ export class PgDurablePublisher<Clean> {
     private readonly sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'assertSanitized'>,
     /** (HIGH2) verifier for the receiver's signed decision receipt — REQUIRED. */
     private readonly ackVerifier: AckReceiptVerifier,
-    /** (R7) the configured schema this publisher is pinned to. */
-    schema: string,
+    /** (R8) the schema-readiness capability bound to this db + schema. */
+    ready: SchemaReadyToken,
     opts: PgPublisherOptions = { leaseMs: 30_000 },
   ) {
     if (!Number.isSafeInteger(opts.leaseMs) || opts.leaseMs <= 0) throw new ContractValidationError('leaseMs must be a positive safe integer');
-    assertSchemaIdentifier(schema);
-    this.schema = schema;
+    this.schema = requireReady(ready, db);
     this.leaseMs = opts.leaseMs;
   }
 
@@ -717,10 +800,12 @@ export class PgReceiverCheckpoint<Clean> implements ReceiverCheckpoint<Clean, Pg
     private readonly streamId: string,
     sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'assertSanitized'>,
     private readonly applier: MutationApplier<Clean>,
-    /** (R7) the configured schema this receiver is pinned to. */
-    schema: string,
+    /** (R8) schema-readiness capability. The receiver runs inside the caller's
+     *  bound tx (no own transactor), so only the token brand + schema bind here;
+     *  the per-tx schema pin in verifyAndApplyInTx is the operational enforcement. */
+    ready: SchemaReadyToken,
     epochAuthorizer: EpochTransitionAuthorizer = { async authorizeTransition() { throw new ContractValidationError('epoch transition not authorized in this slice'); } },
-  ) { assertSchemaIdentifier(schema); this.schema = schema; this.sanitizer = sanitizer; this.epochAuthorizer = epochAuthorizer; }
+  ) { this.schema = requireReady(ready); this.sanitizer = sanitizer; this.epochAuthorizer = epochAuthorizer; }
 
   async verifyAndApplyInTx(tx: PgTx, record: OutboxRecord<Clean>): Promise<ReceiverDecision> {
     const exec = execOf(tx);
@@ -780,7 +865,7 @@ export class PgReceiverCheckpoint<Clean> implements ReceiverCheckpoint<Clean, Pg
 /** Persisted, monotonic promotion fence backed by the fence table. */
 export class PgPromotionFence implements PromotionFence {
   private readonly schema: string;
-  constructor(private readonly db: PgTransactor, schema: string) { assertSchemaIdentifier(schema); this.schema = schema; }
+  constructor(private readonly db: PgTransactor, ready: SchemaReadyToken) { this.schema = requireReady(ready, db); }
   async acquire(streamId: string): Promise<FenceToken> {
     return this.db.transaction(async (exec) => {
       await enterCriticalTx(exec, this.schema);
