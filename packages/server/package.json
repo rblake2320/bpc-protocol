@@ -18,7 +18,8 @@
   "scripts": {
     "build": "tsc",
     "prepack": "npm run build",
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck:contract": "tsc --noEmit -p tsconfig.contract-typecheck.json"
   },
   "dependencies": {
     "@bpc/core": "^0.2.0"

@@ -219,12 +219,15 @@ function assertFenceToken(t: string): void {
  * different token. Length-prefixing removes separator-collision ambiguity. The
  * mutation MUST already be secret-stripped.
  */
-export function canonicalOpDigest(input: {
+export function canonicalOpDigest<Clean>(input: {
   streamId: string;
   sourceEpoch: string;
   sequence: number;
   fenceToken: string;
-  mutation: unknown;
+  /** (1) MUST be a sanitizer-produced SanitizedMutation<Clean>. A raw payload
+   *  (e.g. one carrying a secret field) is a compile-time type error, so
+   *  sanitize-before-digest is structurally enforced, not merely tested. */
+  mutation: SanitizedMutation<Clean>;
 }): string {
   assertId(input.streamId, 'streamId');
   assertNoLoneSurrogate(input.streamId);
@@ -306,8 +309,9 @@ export function assertHeaderConformant(h: OutboxRecordHeader): void {
   assertNoLoneSurrogate(h.streamId);
   assertId(h.sourceEpoch, 'sourceEpoch');
   assertNoLoneSurrogate(h.sourceEpoch);
-  if (!Number.isSafeInteger(h.sequence) || h.sequence < 0) {
-    throw new ContractValidationError('sequence must be a non-negative safe integer');
+  // (2) OutboxRecord is mutation-only → sequence >= 1 (0 is the typed genesis).
+  if (!Number.isSafeInteger(h.sequence) || h.sequence < 1) {
+    throw new ContractValidationError('mutation record sequence must be a safe integer >= 1 (0 is genesis)');
   }
   assertFenceToken(h.fenceToken);
   if (!HEX64.test(h.opDigest)) throw new ContractValidationError('opDigest must be 64 lowercase hex');
@@ -350,7 +354,8 @@ export function epochTransitionDigest(input: {
   assertId(input.toEpoch, 'toEpoch'); assertNoLoneSurrogate(input.toEpoch);
   if (input.fromEpoch === input.toEpoch) throw new ContractValidationError('epoch transition fromEpoch must differ from toEpoch');
   if (!Number.isSafeInteger(input.fromEpochIndex) || input.fromEpochIndex < 0) throw new ContractValidationError('fromEpochIndex must be a non-negative safe integer');
-  if (!Number.isSafeInteger(input.toEpochIndex) || input.toEpochIndex <= input.fromEpochIndex) throw new ContractValidationError('toEpochIndex must be strictly greater than fromEpochIndex (forward-only)');
+  // (6) no skipped indices: the new epoch index is exactly the current + 1.
+  if (input.toEpochIndex !== input.fromEpochIndex + 1) throw new ContractValidationError('toEpochIndex must be exactly fromEpochIndex + 1 (no skipped epochs)');
   if (!Number.isSafeInteger(input.snapshotSequence) || input.snapshotSequence < 0) throw new ContractValidationError('snapshotSequence must be a non-negative safe integer');
   if (!HEX64.test(input.snapshotDigest)) throw new ContractValidationError('snapshotDigest must be 64 lowercase hex');
   assertFenceToken(input.fenceToken);
@@ -365,13 +370,35 @@ export function epochTransitionDigest(input: {
   return h.digest('hex');
 }
 
+/** (4) Exported conformant validator: recomputes and requires the exact
+ *  transitionDigest and re-runs every structural check. A receiver MUST call
+ *  this before applying a transition. */
+export function assertEpochTransitionConformant(r: EpochTransitionRecord): void {
+  if (r.contractVersion !== HA_OUTBOX_CONTRACT_VERSION) throw new ContractValidationError('epoch transition contractVersion must be 1');
+  const expect = epochTransitionDigest(r); // re-runs all field validations
+  if (r.transitionDigest !== expect) throw new ContractValidationError('epoch transitionDigest mismatch');
+}
+
+/** (4) Injected authority that decides whether an epoch transition is
+ *  authorized (governed boundary / signed capability). MUST throw if the
+ *  decision cannot be made so callers fail closed. `authorized` is thus a
+ *  structural hook, not prose. */
+export interface EpochTransitionAuthorizer {
+  authorizeTransition(record: EpochTransitionRecord): Promise<boolean>;
+}
+
 // ── (5)(7) Backend-bound transaction handle (NO default brand) ────────────────
-/** Opaque transaction handle parameterized by a REQUIRED backend brand so a tx
- *  obtained from backend A does not typecheck for backend B. Each backend
- *  declares its own unique invariant brand type; callers cannot forge one and
- *  cannot omit it (no `= unknown` default). */
+/** (5) Module-private brand symbol: because it is NOT exported, external code
+ *  cannot name the key and therefore cannot construct a conforming `DurableTx`
+ *  object literal — a real unforgeable capability, not just structural typing. */
+declare const DURABLE_TX_BRAND: unique symbol;
+
+/** Opaque, backend-bound, UNFORGEABLE transaction handle. Parameterized by a
+ *  REQUIRED backend brand so a tx from backend A does not typecheck for backend
+ *  B; keyed by a module-private symbol so callers cannot fabricate one. Obtained
+ *  only from the backend's `withTransaction`. */
 export interface DurableTx<TBackend> {
-  readonly __backend: TBackend;
+  readonly [DURABLE_TX_BRAND]: TBackend;
 }
 
 /** (4) Monotonic fencing token. Persisted + stale-rejected by the authoritative
@@ -441,6 +468,7 @@ export type ReceiverDecision =
  */
 export interface ReceiverCheckpoint<Clean, TBackend> {
   readonly sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'assertSanitized'>;
+  readonly epochAuthorizer: EpochTransitionAuthorizer;
   verifyAndApplyInTx(tx: DurableTx<TBackend>, record: OutboxRecord<Clean>): Promise<ReceiverDecision>;
   /**
    * (9) Authorized, forward-only epoch transition, atomic under the fence.
@@ -483,11 +511,12 @@ export interface SignedStreamHead {
 }
 
 /** (3) Verifier policy: resolves keyId→material under an allowed alg and
- *  verifies the detached signature over `headDigest`. MUST reject unknown
- *  keyId/alg and any invalid signature; MUST throw (not return true) if the
- *  policy/key store is unavailable so callers fail closed. */
+ *  verifies the detached signature over `headDigest`. Fail-closed by TYPE: it
+ *  returns `void` on success and MUST THROW on an unknown keyId/alg, an invalid
+ *  signature, or an unavailable key store — there is no boolean a caller could
+ *  accidentally ignore. */
 export interface StreamHeadVerifier {
-  verify(head: SignedStreamHead): Promise<boolean>;
+  verify(head: SignedStreamHead): Promise<void>;
 }
 
 /** (3) Assert a head binds EXACTLY to a record and is internally consistent
@@ -524,6 +553,7 @@ export type HotpMutationSanitizer = MutationSanitizer<TskHotpMutation, TskHotpMu
 export interface TskReceiverCheckpoint<TBackend> {
   readonly sanitizer: Pick<HotpMutationSanitizer, 'assertSanitized'>;
   readonly headVerifier: StreamHeadVerifier;
+  readonly epochAuthorizer: EpochTransitionAuthorizer;
   verifyAndApplyTumblerInTx(
     tx: DurableTx<TBackend>,
     record: OutboxRecord<TskHotpMutation>,
@@ -538,8 +568,8 @@ export function streamHeadDigest(input: {
   streamId: string; sequence: number; prevHeadDigest: string; opDigest: string; keyId: string; alg: StreamHeadAlg;
 }): string {
   assertId(input.streamId, 'streamId'); assertNoLoneSurrogate(input.streamId);
-  if (!Number.isSafeInteger(input.sequence) || input.sequence < 0) {
-    throw new ContractValidationError('sequence must be a non-negative safe integer');
+  if (!Number.isSafeInteger(input.sequence) || input.sequence < 1) {
+    throw new ContractValidationError('mutation stream-head sequence must be a safe integer >= 1');
   }
   if (!HEX64.test(input.prevHeadDigest)) throw new ContractValidationError('prevHeadDigest must be 64 lowercase hex');
   if (!HEX64.test(input.opDigest)) throw new ContractValidationError('opDigest must be 64 lowercase hex');

@@ -99,8 +99,11 @@ describe('HA outbox contract v1 (RFC8785/7493, final-review hardened)', () => {
     expect(() => fenceTokenToDecimal(-1n)).toThrow(ContractValidationError);
   });
 
-  // (10) Executable sanitize-before-digest / apply ordering fixture.
-  it('(10) sanitize strips the secret BEFORE digest; digesting raw-with-secret differs; receiver rejects unsanitized', () => {
+  // (10) sanitize-before-digest is enforced at COMPILE TIME (see
+  // ha-outbox-contract.typecheck.ts — canonicalOpDigest accepts only
+  // SanitizedMutation<Clean>; a raw payload is a type error). This runtime test
+  // covers the receiver side: assertSanitized rejects an unsanitized record.
+  it('(10) sanitizer strips the secret and the receiver rejects unsanitized input', () => {
     interface Raw { pairId: string; secret: string }
     interface Clean { pairId: string }
     const sanitizer: MutationSanitizer<Raw, Clean> = {
@@ -114,11 +117,11 @@ describe('HA outbox contract v1 (RFC8785/7493, final-review hardened)', () => {
     };
     const raw: Raw = { pairId: 'p1', secret: 'TOP' };
     const clean = sanitizer.sanitize(raw);
-    const base = { streamId: 's/v1', sourceEpoch: 'e1', sequence: 1, fenceToken: '1' };
-    const digRaw = canonicalOpDigest({ ...base, mutation: raw as unknown });
-    const digClean = canonicalOpDigest({ ...base, mutation: clean });
-    expect(digRaw).not.toBe(digClean); // secret changes the digest → must sanitize first
-    expect(() => sanitizer.assertSanitized(raw)).toThrow(ContractValidationError); // receiver rejects unsanitized
+    expect('secret' in (clean as object)).toBe(false);
+    // digesting the sanitized value works
+    expect(typeof canonicalOpDigest({ streamId: 's/v1', sourceEpoch: 'e1', sequence: 1, fenceToken: '1', mutation: clean })).toBe('string');
+    // receiver-side runtime guard rejects a record that was never sanitized
+    expect(() => sanitizer.assertSanitized(raw)).toThrow(ContractValidationError);
     expect(() => sanitizer.assertSanitized(clean)).not.toThrow();
   });
 });
