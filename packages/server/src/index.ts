@@ -134,6 +134,27 @@ export type {
   TskReceiverCheckpoint,
 } from './ha-outbox-contract.js';
 export {
+  CheckpointConflictError,
+  CheckpointInconsistentError,
+  CheckpointUnavailableError,
+  ContinuityValidationError,
+  MalformedCasError,
+  NotAuthorizedError,
+  RedisAheadError,
+  RollbackCheckpointGuard,
+  RollbackDetectedError,
+  SequenceExhaustedError,
+  WitnessMissingError,
+} from './rollback-checkpoint.js';
+export type {
+  CheckpointState,
+  MonotonicCheckpoint,
+  RedisSequenceView,
+  RollbackCheckpointOptions,
+  ProvisioningAuthorizer,
+  RollbackVerdict,
+} from './rollback-checkpoint.js';
+export {
   RedisContinuityConfigurationError,
   createGovernedRedisBackedNonceStore,
 } from './redis-governed.js';
