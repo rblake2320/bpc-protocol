@@ -89,18 +89,40 @@ function boundStateOf(tx: PgTx): BoundTxState {
   return st;
 }
 
-function execOf(tx: PgTx): PgExecutor {
-  return boundStateOf(tx).exec;
+/** (R9/R10/HIGH) Return the executor of a bound tx ONLY if it was produced by
+ *  THIS object's exact transactor + schema. Any object that accepts a
+ *  caller-supplied tx MUST use this (never bare execOf) so a tx minted for a
+ *  different db/schema can never drive an operation here — validated BEFORE any
+ *  query. */
+function execOfBound(tx: PgTx, db: PgTransactor, schema: string): PgExecutor {
+  const st = boundStateOf(tx);
+  if (st.db !== db) throw new ContractValidationError('DurableTx is bound to a different transactor than this object');
+  if (st.schema !== schema) throw new ContractValidationError('DurableTx is bound to a different schema than this object');
+  return st.exec;
 }
 
-/** Mint a `DurableTx<PgBackend>` bound to a live executor AND the identity of the
- *  transactor+schema that produced it. INTERNAL — only transactor-owning methods
- *  (withOutboxTx / the receiver's own tx) may mint, so the recorded db is the one
- *  that actually produced `exec`. */
-function mintBoundTx(exec: PgExecutor, db: PgTransactor, schema: string): PgTx {
+/**
+ * (R10/HIGH) Mint a bound `DurableTx` that is ACTIVE only for the duration of
+ * `body`, then REVOKED in `finally` — whether body returns, throws, or the tx
+ * commits/rolls back. A handle retained past this scope is absent from TX_STATE,
+ * so any later `appendInTx`/receiver call with it is rejected before any query
+ * (a stale handle can never drive an operation on a released/reused pooled
+ * connection). This is the ONLY minter; only transactor-owning methods call it,
+ * so the recorded db is the one that actually produced `exec`.
+ */
+async function withBoundTx<T>(
+  exec: PgExecutor,
+  db: PgTransactor,
+  schema: string,
+  body: (tx: PgTx) => Promise<T>,
+): Promise<T> {
   const tx = Object.freeze({}) as unknown as PgTx;
   TX_STATE.set(tx as unknown as object, { exec, db, schema });
-  return tx;
+  try {
+    return await body(tx);
+  } finally {
+    TX_STATE.delete(tx as unknown as object); // revoke — no use after this scope
+  }
 }
 
 /** Constant-time equality for two 64-hex digests (equal length by construction). */
@@ -515,7 +537,7 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
   async withOutboxTx<T>(fn: (tx: PgTx, exec: PgExecutor) => Promise<T>): Promise<T> {
     return this.db.transaction(async (exec) => {
       await enterCriticalTx(exec, this.schema);
-      return fn(mintBoundTx(exec, this.db, this.schema), exec);
+      return withBoundTx(exec, this.db, this.schema, (tx) => fn(tx, exec));
     });
   }
 
@@ -523,7 +545,8 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
     tx: PgTx,
     input: { streamId: string; rawMutation: Raw; fenceToken: FenceToken },
   ): Promise<OutboxRecordHeader> {
-    const exec = execOf(tx);
+    // (R9/R10/HIGH) reject a foreign / stale tx BEFORE any query or mutation.
+    const exec = execOfBound(tx, this.db, this.schema);
     const streamId = input.streamId;
     if (streamId !== this.opts.streamId) throw new ContractValidationError('streamId mismatch for this outbox');
     const fenceDecimal = fenceTokenToDecimal(input.fenceToken);
@@ -824,17 +847,15 @@ export class PgReceiverCheckpoint<Clean> implements ReceiverCheckpoint<Clean, Pg
    *  OWN (token-bound) transactor and applies. No external tx/executor can be
    *  injected, so a record can never be applied against a foreign database. */
   async verifyAndApplyDelivered(record: OutboxRecord<Clean>): Promise<ReceiverDecision> {
-    return this.db.transaction((exec) => this.verifyAndApplyInTx(mintBoundTx(exec, this.db, this.schema), record));
+    return this.db.transaction((exec) => withBoundTx(exec, this.db, this.schema, (tx) => this.verifyAndApplyInTx(tx, record)));
   }
 
   async verifyAndApplyInTx(tx: PgTx, record: OutboxRecord<Clean>): Promise<ReceiverDecision> {
-    // (R9/HIGH) reject BEFORE any query: the tx must be bound to THIS receiver's
-    // exact transactor + schema. A tx minted for another db (or a forged handle)
-    // cannot be used to apply here, closing the A-token / B-executor gap.
-    const st = boundStateOf(tx);
-    if (st.db !== this.db) throw new ContractValidationError('receiver tx is bound to a different transactor than this receiver');
-    if (st.schema !== this.schema) throw new ContractValidationError('receiver tx schema does not match this receiver');
-    const exec = st.exec;
+    // (R9/R10/HIGH) reject BEFORE any query: the tx must be bound to THIS
+    // receiver's exact transactor + schema AND still be active (not a handle
+    // retained past its transaction). A foreign-db, wrong-schema, or stale tx is
+    // rejected up front, closing the A-token/B-executor and use-after-tx gaps.
+    const exec = execOfBound(tx, this.db, this.schema);
     await enterCriticalTx(exec, this.schema);
     if (record.streamId !== this.streamId) throw new ContractValidationError('streamId mismatch for this receiver');
     assertHeaderConformant(record);

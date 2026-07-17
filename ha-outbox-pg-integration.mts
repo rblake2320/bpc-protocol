@@ -131,6 +131,7 @@ async function applyDDL(): Promise<void> {
 async function resetSchema(): Promise<void> {
   await pool.query('DROP SCHEMA IF EXISTS shadow CASCADE');
   await pool.query('DROP SCHEMA IF EXISTS evil CASCADE');
+  await pool.query('DROP SCHEMA IF EXISTS alt CASCADE');
   await pool.query('DROP TABLE IF EXISTS ha_outbox_rows, ha_outbox_applied, ha_outbox_fence, ha_outbox_source_checkpoint, ha_outbox_receiver_checkpoint, ha_outbox_publisher_lease, ha_outbox_quarantine, ha_outbox_meta CASCADE');
   await pool.query('DROP FUNCTION IF EXISTS ha_noop() CASCADE');
   await applyDDL();
@@ -393,6 +394,41 @@ async function main(): Promise<void> {
     assert.equal(sawForeignTx, true);
     // nothing was applied
     assert.equal(Number((await pool.query('SELECT sequence FROM ha_outbox_receiver_checkpoint WHERE stream_id=$1', [sid])).rows[0].sequence), 0);
+  });
+
+  await check('(R10/HIGH) appendInTx + receiver reject foreign-db, wrong-schema, and retained (post commit/rollback) tx before any query', async () => {
+    const sid = 'sc:r10/v1'; await provision(sid);
+    const outbox = mkOutbox(serial, sid); // bound to (serial, public)
+    const appendInput = { streamId: sid, rawMutation: { pairId: 'x' }, fenceToken: 0n };
+    // (a) foreign transactor: a tx produced by dbB fed to outboxA -> reject before any query
+    const serialB = new RealPg('SERIALIZABLE');
+    const readyB = await assertSchemaReady(serialB, SCHEMA);
+    const outboxB = new PgDurableOutbox<Raw, Clean>(serialB, readyB, { streamId: sid, sanitizer, maxPendingRows: 100, backpressure: 'quarantine' });
+    await assert.rejects(() => outboxB.withOutboxTx((txB) => outbox.appendInTx(txB, appendInput)), /different transactor/);
+    // (b) same db, DIFFERENT schema: provision the HA schema in `alt`, feed its tx to the public outbox
+    const c = await pool.connect();
+    await c.query('CREATE SCHEMA alt'); await c.query('SET search_path=alt');
+    for (const s of HA_OUTBOX_PG_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await c.query(s);
+    await c.query('RESET search_path'); // do NOT leak a session search_path back into the pool
+    c.release();
+    const readyAlt = await provisionSchemaVersion(serial, 'alt'); // attest + stamp the alt schema, mint its token
+    const outboxAlt = new PgDurableOutbox<Raw, Clean>(serial, readyAlt, { streamId: sid, sanitizer, maxPendingRows: 100, backpressure: 'quarantine' });
+    await assert.rejects(() => outboxAlt.withOutboxTx((txAlt) => outbox.appendInTx(txAlt, appendInput)), /different schema/);
+    // (c) retained AFTER COMMIT: a handle kept past a successful tx is revoked
+    let retained: any;
+    await outbox.withOutboxTx(async (tx) => { retained = tx; return outbox.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'ok1' }, fenceToken: 0n }); });
+    await assert.rejects(() => outbox.appendInTx(retained, appendInput), /not bound to a PostgreSQL transaction|forged or foreign/);
+    // (d) retained AFTER ROLLBACK: a handle kept from a failed tx is revoked
+    let retained2: any;
+    await assert.rejects(() => outbox.withOutboxTx(async (tx) => { retained2 = tx; throw new Error('boom'); }), /boom/);
+    await assert.rejects(() => outbox.appendInTx(retained2, appendInput), /not bound to a PostgreSQL transaction|forged or foreign/);
+    // (e) the receiver rejects a retained tx too (before any apply)
+    const rcv = new PgReceiverCheckpoint<Clean>(serial, sid, sanitizer, applierRecording, READY);
+    const dig = canonicalOpDigest<Clean>({ streamId: sid, sourceEpoch: 'e1', sequence: 1, fenceToken: '0', mutation: { pairId: 'x' } as SanitizedMutation<Clean> });
+    const rec: OutboxRecord<Clean> = { contractVersion: '1', streamId: sid, sourceEpoch: 'e1', sequence: 1, fenceToken: '0', opDigest: dig, mutation: { pairId: 'x' } as SanitizedMutation<Clean> };
+    await assert.rejects(() => rcv.verifyAndApplyInTx(retained, rec), /not bound to a PostgreSQL transaction|forged or foreign/);
+    // sanity: only the one legitimately-committed row exists; no foreign/stale op landed
+    assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM ha_outbox_rows WHERE stream_id=$1', [sid])).rows[0].n), 1);
   });
 
   await check('(R5) DDL never auto-bumps meta; only attested migration advances', async () => {
