@@ -90,14 +90,21 @@ export {
   CheckpointConflictError,
   CheckpointInconsistentError,
   CheckpointUnavailableError,
+  ContinuityValidationError,
+  MalformedCasError,
+  NotAuthorizedError,
+  RedisAheadError,
   RollbackCheckpointGuard,
   RollbackDetectedError,
+  SequenceExhaustedError,
+  WitnessMissingError,
 } from './rollback-checkpoint.js';
 export type {
   CheckpointState,
   MonotonicCheckpoint,
   RedisSequenceView,
   RollbackCheckpointOptions,
+  RollbackVerdict,
 } from './rollback-checkpoint.js';
 export {
   RedisContinuityConfigurationError,

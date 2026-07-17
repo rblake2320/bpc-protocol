@@ -1,192 +1,222 @@
 /**
- * Same-epoch rollback detection via an independent monotonic checkpoint — #15.
+ * Same-epoch rollback DETECTION + fenced RESERVATION primitive — #15.
  *
- * The continuity guard (redis-continuity.ts) detects a MISSING marker (total
- * state loss) or a CHANGED epoch (failover/restore to another instance). It
- * cannot detect a *same-epoch rollback*: a Redis snapshot/AOF or replica
- * restored to an older internally-consistent state that STILL carries the
- * expected epoch but is missing nonce keys consumed after that snapshot. The
- * epoch is unchanged, so the marker check passes, and a replay from the lost
- * interval can be accepted.
+ * SCOPE (narrowed per review, HIGH3): this is a pre-authorization detection +
+ * reservation primitive, NOT an atomic coupling to nonce consumption. It does
+ * two things against an INDEPENDENT authoritative monotonic witness (a fenced
+ * PostgreSQL row on a different failure domain than Redis):
  *
- * This module binds each accepted authorization to a monotonic sequence held
- * in an INDEPENDENT authoritative boundary (e.g. a fenced PostgreSQL row) on a
- * different failure domain than Redis. The sequence only ever advances. A
- * rollback reverts Redis's mirror of the sequence to an older value while the
- * external witness retains the higher value, so the disagreement is detectable:
- * the verifier fails closed whenever the external checkpoint is unavailable,
- * lower than Redis expects, inconsistent with Redis's epoch, or cannot be
- * advanced atomically (fencing conflict).
+ *   - `check(redis)`  — pure, side-effect-free rollback detection.
+ *   - `reserve(redis)`— verify then fenced-advance the witness by one, returning
+ *                       the reserved sequence the caller then mirrors into Redis.
  *
- * ┌── STATE TRANSITION THAT ADVANCES THE CHECKPOINT ───────────────────────────┐
- * │ Exactly one: a successful authorization that is about to consume a nonce.  │
- * │ Order per accept: (1) read external checkpoint C, (2) read Redis mirror R, │
- * │ (3) fail closed on any disagreement, (4) advance external C via fenced CAS,│
- * │ (5) mirror the new sequence into Redis. A crash between 4 and 5 leaves the  │
- * │ external ahead of Redis on restart -> detected as rollback -> fail closed   │
- * │ (safe: refuse, never double-accept).                                        │
- * └────────────────────────────────────────────────────────────────────────────┘
+ * `reserve` is a RESERVATION: the witness advances first, the caller commits to
+ * Redis after. A crash/duplicate/Redis-failure between reserve and commit leaves
+ * the witness AHEAD of Redis, which `check` reports as `rollback` (redis behind)
+ * and callers MUST treat as fail-closed. There is deliberately NO claim that one
+ * reservation equals one consumed nonce; wiring an atomic reserve→consume→commit
+ * →reconcile protocol is out of scope and part of closing #15.
  *
- * RPO: any nonzero RPO (acknowledged writes that can be lost on failover) means
- * replay uncertainty for that interval and MUST be covered by quarantine for at
- * least the full nonce acceptance horizon — see redis-continuity.ts.
+ * STEADY STATE (HIGH1): Redis's mirrored sequence MUST EQUAL the witness for the
+ * current epoch. `redis < witness` = same-epoch rollback (restored older
+ * snapshot). `redis > witness` = the witness lost acknowledged writes (or Redis
+ * has un-witnessed writes) — ALSO an anomaly; both fail closed. Changing epoch
+ * is a SEPARATE governed transition (`provision`), never silent acceptance.
  *
- * SCOPE / RESIDUAL: this is the *mechanism*. Per issue #15 it is a production
- * topology/durability control and is NOT closed by unit tests of an in-memory
- * fake. Closing #15 requires the adversarial drill on real Redis + PostgreSQL
- * (snapshot -> accept -> restore-older -> prove replay denial; primary/replica
- * failover with lost acked writes; checkpoint outage/stale/split-brain; verifier
- * restart survival) with recorded versions, persistence settings, and RPO/RTO.
- * Until then, describe the guard as detecting missing/changed epoch + bounded
- * quarantine only — do not claim protection against every rollback.
+ * PROVISIONING (HIGH2): the genesis witness row is created ONLY by an explicit,
+ * authorized `provision(...)` call. A missing witness row during `check`/
+ * `reserve` is fail-closed (`WitnessMissingError`) — there is NO silent
+ * re-anchor to whatever Redis currently claims (that would let a deleted trust
+ * row + a Redis rollback bypass the anchor).
+ *
+ * ISSUE #15 STAYS OPEN — a production topology control; unit tests of an
+ * in-memory fake cannot close it. See docs/SAME_EPOCH_ROLLBACK.md. No runtime
+ * durability/HA claim is made here.
  */
 
+// ── Errors (all fail closed) ─────────────────────────────────────────────────
 export class RollbackDetectedError extends Error {
   readonly code = 'continuity_rollback_detected';
   constructor(readonly redisSequence: number, readonly witnessSequence: number) {
-    super(
-      `Same-epoch rollback detected: Redis sequence ${redisSequence} is behind ` +
-      `the independent witness ${witnessSequence} — Redis was restored to an ` +
-      `older state; failing closed.`,
-    );
+    super(`Same-epoch rollback: Redis sequence ${redisSequence} is behind the witness ${witnessSequence} — failing closed.`);
     this.name = 'RollbackDetectedError';
   }
 }
-
-export class CheckpointUnavailableError extends Error {
-  readonly code = 'continuity_checkpoint_unavailable';
-  constructor(cause?: unknown) {
-    super('Independent continuity checkpoint is unavailable — failing closed', { cause });
-    this.name = 'CheckpointUnavailableError';
+export class RedisAheadError extends Error {
+  readonly code = 'continuity_redis_ahead';
+  constructor(readonly redisSequence: number, readonly witnessSequence: number) {
+    super(`Redis sequence ${redisSequence} is AHEAD of the authoritative witness ${witnessSequence} — the witness lost writes or Redis has un-witnessed writes; failing closed.`);
+    this.name = 'RedisAheadError';
   }
 }
-
+export class WitnessMissingError extends Error {
+  readonly code = 'continuity_witness_missing';
+  constructor(readonly namespace: string) {
+    super(`No authoritative witness row for '${namespace}' — provision explicitly; failing closed (no silent re-anchor).`);
+    this.name = 'WitnessMissingError';
+  }
+}
+export class CheckpointUnavailableError extends Error {
+  readonly code = 'continuity_checkpoint_unavailable';
+  constructor(cause?: unknown) { super('Independent continuity checkpoint is unavailable — failing closed', { cause }); this.name = 'CheckpointUnavailableError'; }
+}
 export class CheckpointInconsistentError extends Error {
-  readonly code = 'continuity_checkpoint_inconsistent';
+  readonly code = 'continuity_checkpoint_epoch_mismatch';
   constructor(readonly redisEpoch: string, readonly witnessEpoch: string) {
-    super(
-      `Redis epoch ${redisEpoch!} disagrees with the witness epoch ${witnessEpoch!} — ` +
-      `failing closed`,
-    );
+    super(`Redis epoch '${redisEpoch}' != witness epoch '${witnessEpoch}' — failing closed (epoch change is a governed transition).`);
     this.name = 'CheckpointInconsistentError';
   }
 }
-
 export class CheckpointConflictError extends Error {
   readonly code = 'continuity_checkpoint_conflict';
-  constructor() {
-    super('Checkpoint advanced concurrently (fencing conflict) — failing closed');
-    this.name = 'CheckpointConflictError';
+  constructor() { super('Witness advanced concurrently (fencing conflict) — failing closed'); this.name = 'CheckpointConflictError'; }
+}
+export class MalformedCasError extends Error {
+  readonly code = 'continuity_malformed_cas';
+  constructor(readonly expected: CheckpointState, readonly got: unknown) {
+    super('Witness compareAndAdvance returned a state other than the requested next — failing closed');
+    this.name = 'MalformedCasError';
   }
 }
+export class SequenceExhaustedError extends Error {
+  readonly code = 'continuity_sequence_exhausted';
+  constructor(readonly sequence: number) { super(`Sequence ${sequence} is at the safe-integer ceiling — rotate the epoch (governed) before continuing.`); this.name = 'SequenceExhaustedError'; }
+}
+export class NotAuthorizedError extends Error {
+  readonly code = 'continuity_provision_unauthorized';
+  constructor() { super('Explicit authorization is required to provision a genesis witness row'); this.name = 'NotAuthorizedError'; }
+}
+export class ContinuityValidationError extends Error {
+  readonly code = 'continuity_validation';
+  constructor(message: string) { super(message); this.name = 'ContinuityValidationError'; }
+}
 
-/** Snapshot of the authoritative checkpoint for a namespace. */
+// ── Types ────────────────────────────────────────────────────────────────────
 export interface CheckpointState {
   epoch: string;
   sequence: number;
 }
-
-/**
- * Independent, authoritative, monotonic checkpoint. Implemented against a
- * fenced PostgreSQL row (or equivalent external witness) on a DIFFERENT failure
- * domain than Redis. A local file on Redis's own host does NOT satisfy this.
- */
-export interface MonotonicCheckpoint {
-  /**
-   * Current {epoch, sequence}, or null if none exists yet. MUST throw (not
-   * return a stale/guessed value) if the store cannot be reached — callers
-   * fail closed on throw.
-   */
-  read(namespace: string): Promise<CheckpointState | null>;
-  /**
-   * Atomically set the checkpoint for `namespace` to `{epoch, sequence: next}`
-   * ONLY IF its current state equals `expected` (compare-and-set / fencing).
-   * Returns the new state on success; throws CheckpointConflictError if the
-   * current state no longer equals `expected` (a concurrent writer or a
-   * rollback moved it). Must be a single atomic transaction.
-   */
-  compareAndAdvance(
-    namespace: string,
-    expected: CheckpointState | null,
-    next: CheckpointState,
-  ): Promise<CheckpointState>;
-}
-
-/** Redis's mirror of the sequence for the current epoch, read by the caller. */
 export interface RedisSequenceView {
   epoch: string;
   sequence: number;
 }
+export type RollbackVerdict = 'ok' | 'rollback' | 'redis-ahead' | 'epoch-mismatch' | 'witness-missing';
+
+/** (MED4) bounded identifier grammar for namespace/epoch. */
+const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$/;
+const MAX_SEQUENCE = Number.MAX_SAFE_INTEGER - 1;
+
+function assertId(v: string, label: string): void {
+  if (typeof v !== 'string' || !ID_PATTERN.test(v)) throw new ContinuityValidationError(`${label} must match ${ID_PATTERN}`);
+}
+function assertSeq(n: number, label: string): void {
+  if (!Number.isSafeInteger(n) || n < 0) throw new ContinuityValidationError(`${label} must be a non-negative safe integer`);
+}
+function assertState(s: unknown, label: string): asserts s is CheckpointState {
+  if (!s || typeof s !== 'object') throw new ContinuityValidationError(`${label} must be a state object`);
+  const st = s as CheckpointState;
+  assertId(st.epoch, `${label}.epoch`);
+  assertSeq(st.sequence, `${label}.sequence`);
+}
+
+/**
+ * Independent, authoritative, monotonic witness. Real impl = a fenced
+ * PostgreSQL row on a DIFFERENT failure domain than Redis. A local file on
+ * Redis's host does NOT satisfy this.
+ */
+export interface MonotonicCheckpoint {
+  /** Current state, or null if none exists. MUST throw (never guess) on outage. */
+  read(namespace: string): Promise<CheckpointState | null>;
+  /** Atomic CAS: set to `next` iff current == `expected`; else throw
+   *  CheckpointConflictError. Returns the persisted new state. */
+  compareAndAdvance(namespace: string, expected: CheckpointState | null, next: CheckpointState): Promise<CheckpointState>;
+  /** Create the genesis row iff none exists; throw CheckpointConflictError if
+   *  one already exists. Used only by explicit provisioning. */
+  createGenesis(namespace: string, genesis: CheckpointState): Promise<CheckpointState>;
+}
 
 export interface RollbackCheckpointOptions {
   namespace: string;
-  /** Injected epoch factory for the very first checkpoint (unique per boot). */
-  now?: () => number;
 }
 
 export class RollbackCheckpointGuard {
-  constructor(
-    private readonly witness: MonotonicCheckpoint,
-    private readonly options: RollbackCheckpointOptions,
-  ) {
-    if (!options.namespace) throw new RangeError('namespace is required');
+  private readonly ns: string;
+
+  constructor(private readonly witness: MonotonicCheckpoint, options: RollbackCheckpointOptions) {
+    assertId(options.namespace, 'namespace');
+    this.ns = options.namespace;
   }
 
   /**
-   * Gate to run immediately before consuming a nonce. Compares Redis's mirror
-   * against the independent witness and advances the witness for this accept.
-   * Throws (fail closed) on any disagreement; on success returns the new
-   * sequence the caller must mirror back into Redis.
-   *
-   * @param redis Redis's current view of {epoch, sequence}. When Redis has just
-   *   claimed a fresh epoch (sequence 0) this bootstraps the witness.
+   * (HIGH2) Explicit, authorized genesis provisioning. `authorization` must be a
+   * non-empty token — this makes provisioning a deliberate authenticated act,
+   * never an implicit side effect of verification. The deployment binds real
+   * authentication to producing that token. Refuses if a witness already exists.
    */
-  async verifyAndAdvance(redis: RedisSequenceView): Promise<number> {
-    const ns = this.options.namespace;
+  async provision(genesisEpoch: string, authorization: string): Promise<CheckpointState> {
+    if (typeof authorization !== 'string' || authorization.length === 0) throw new NotAuthorizedError();
+    assertId(genesisEpoch, 'genesisEpoch');
+    return this.witness.createGenesis(this.ns, { epoch: genesisEpoch, sequence: 0 });
+  }
+
+  /** (HIGH1) Pure detection, no side effects. Fails closed on outage. */
+  async check(redis: RedisSequenceView): Promise<RollbackVerdict> {
+    assertId(redis.epoch, 'redis.epoch');
+    assertSeq(redis.sequence, 'redis.sequence');
     let current: CheckpointState | null;
     try {
-      current = await this.witness.read(ns);
+      current = await this.witness.read(this.ns);
     } catch (err) {
       throw new CheckpointUnavailableError(err);
     }
-
-    if (current === null) {
-      // First use for this witness: adopt Redis's epoch at its current
-      // sequence, then advance by one for the accept in progress.
-      return this.advance(ns, null, redis.epoch, redis.sequence);
-    }
-
-    if (current.epoch !== redis.epoch) {
-      // Redis and the witness disagree on epoch. If Redis moved to a brand-new
-      // epoch (fresh marker) the continuity guard handles that via quarantine;
-      // here we refuse to advance an inconsistent pair.
-      throw new CheckpointInconsistentError(redis.epoch, current.epoch);
-    }
-
-    if (redis.sequence < current.sequence) {
-      // Redis's mirror is BEHIND the authoritative witness for the same epoch:
-      // Redis was rolled back to an older snapshot. This is the #15 condition.
-      throw new RollbackDetectedError(redis.sequence, current.sequence);
-    }
-
-    // Redis is at or ahead of the witness for this epoch. Advance the witness
-    // by one (fenced) for this accept.
-    return this.advance(ns, current, redis.epoch, current.sequence);
+    if (current === null) return 'witness-missing';
+    assertState(current, 'witness');
+    if (current.epoch !== redis.epoch) return 'epoch-mismatch';
+    if (redis.sequence < current.sequence) return 'rollback';
+    if (redis.sequence > current.sequence) return 'redis-ahead';
+    return 'ok';
   }
 
-  private async advance(
-    ns: string,
-    expected: CheckpointState | null,
-    epoch: string,
-    fromSequence: number,
-  ): Promise<number> {
-    const next: CheckpointState = { epoch, sequence: fromSequence + 1 };
+  /**
+   * Pre-auth RESERVATION: verify exact steady-state agreement then fenced-advance
+   * the witness by one, returning the reserved sequence. Throws (fail closed) on
+   * any non-'ok' verdict. NOT atomically coupled to nonce consumption — see the
+   * module header.
+   */
+  async reserve(redis: RedisSequenceView): Promise<number> {
+    const verdict = await this.check(redis);
+    switch (verdict) {
+      case 'witness-missing': throw new WitnessMissingError(this.ns);
+      case 'epoch-mismatch': {
+        const w = await this.witness.read(this.ns);
+        throw new CheckpointInconsistentError(redis.epoch, w ? w.epoch : '(none)');
+      }
+      case 'rollback': {
+        const w = (await this.witness.read(this.ns))!;
+        throw new RollbackDetectedError(redis.sequence, w.sequence);
+      }
+      case 'redis-ahead': {
+        const w = (await this.witness.read(this.ns))!;
+        throw new RedisAheadError(redis.sequence, w.sequence);
+      }
+      case 'ok':
+        break;
+    }
+    // verdict === 'ok': redis.sequence === witness.sequence exactly.
+    if (redis.sequence >= MAX_SEQUENCE) throw new SequenceExhaustedError(redis.sequence);
+    const expected: CheckpointState = { epoch: redis.epoch, sequence: redis.sequence };
+    const next: CheckpointState = { epoch: redis.epoch, sequence: redis.sequence + 1 };
+    let result: CheckpointState;
     try {
-      const result = await this.witness.compareAndAdvance(ns, expected, next);
-      return result.sequence;
+      result = await this.witness.compareAndAdvance(this.ns, expected, next);
     } catch (err) {
       if (err instanceof CheckpointConflictError) throw err;
       throw new CheckpointUnavailableError(err);
     }
+    // (MED4) validate CAS-returned state EXACTLY.
+    if (!result || result.epoch !== next.epoch || result.sequence !== next.sequence) {
+      throw new MalformedCasError(next, result);
+    }
+    return result.sequence;
   }
 }

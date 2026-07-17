@@ -4,46 +4,50 @@ import {
   CheckpointConflictError,
   CheckpointInconsistentError,
   CheckpointUnavailableError,
+  MalformedCasError,
   MonotonicCheckpoint,
+  NotAuthorizedError,
+  RedisAheadError,
   RollbackCheckpointGuard,
   RollbackDetectedError,
+  SequenceExhaustedError,
+  WitnessMissingError,
   type CheckpointState,
 } from '../src/rollback-checkpoint.js';
 
 /**
- * In-memory witness that can simulate the adversarial conditions. NOTE (per
- * issue #15): a fake CANNOT close the issue — it only proves the guard LOGIC.
- * The real control requires a fenced PostgreSQL row + a live Redis rollback
- * drill. These tests validate the mechanism's fail-closed decisions only.
+ * In-memory witness — proves the primitive's LOGIC only. Per #15 a fake cannot
+ * close the issue; the real control needs a fenced PostgreSQL row + a live
+ * Redis rollback drill.
  */
 class FakeWitness implements MonotonicCheckpoint {
   private store = new Map<string, CheckpointState>();
   down = false;
+  /** Optional hook to corrupt the CAS return (malformed-CAS test). */
+  casOverride: ((next: CheckpointState) => CheckpointState) | null = null;
 
   async read(ns: string): Promise<CheckpointState | null> {
     if (this.down) throw new Error('witness unreachable');
     const s = this.store.get(ns);
     return s ? { ...s } : null;
   }
-
-  async compareAndAdvance(
-    ns: string,
-    expected: CheckpointState | null,
-    next: CheckpointState,
-  ): Promise<CheckpointState> {
+  async compareAndAdvance(ns: string, expected: CheckpointState | null, next: CheckpointState): Promise<CheckpointState> {
     if (this.down) throw new Error('witness unreachable');
     const cur = this.store.get(ns) ?? null;
     if (!sameState(cur, expected)) throw new CheckpointConflictError();
+    const persisted = this.casOverride ? this.casOverride(next) : { ...next };
     this.store.set(ns, { ...next });
-    return { ...next };
+    return { ...persisted };
   }
-
-  /** Test helper: force the authoritative sequence (simulate it having advanced). */
-  force(ns: string, state: CheckpointState): void {
-    this.store.set(ns, { ...state });
+  async createGenesis(ns: string, genesis: CheckpointState): Promise<CheckpointState> {
+    if (this.down) throw new Error('witness unreachable');
+    if (this.store.has(ns)) throw new CheckpointConflictError();
+    this.store.set(ns, { ...genesis });
+    return { ...genesis };
   }
+  force(ns: string, s: CheckpointState): void { this.store.set(ns, { ...s }); }
+  delete(ns: string): void { this.store.delete(ns); }
 }
-
 function sameState(a: CheckpointState | null, b: CheckpointState | null): boolean {
   if (a === null || b === null) return a === b;
   return a.epoch === b.epoch && a.sequence === b.sequence;
@@ -52,97 +56,112 @@ function sameState(a: CheckpointState | null, b: CheckpointState | null): boolea
 const NS = 'test';
 const guardFor = (w: MonotonicCheckpoint) => new RollbackCheckpointGuard(w, { namespace: NS });
 
-describe('RollbackCheckpointGuard (#15 mechanism)', () => {
-  it('bootstraps the witness on first use and advances by one', async () => {
+describe('RollbackCheckpointGuard (#15 detection + reservation)', () => {
+  it('HIGH2: no silent re-anchor — missing witness fails closed on check and reserve', async () => {
     const w = new FakeWitness();
     const g = guardFor(w);
-    const seq = await g.verifyAndAdvance({ epoch: 'e1', sequence: 0 });
-    expect(seq).toBe(1);
-    expect(await w.read(NS)).toEqual({ epoch: 'e1', sequence: 1 });
+    expect(await g.check({ epoch: 'e1', sequence: 0 })).toBe('witness-missing');
+    await expect(g.reserve({ epoch: 'e1', sequence: 0 })).rejects.toBeInstanceOf(WitnessMissingError);
   });
 
-  it('advances monotonically across a run of accepts', async () => {
+  it('HIGH2: explicit authorized provisioning creates genesis; empty auth is refused', async () => {
     const w = new FakeWitness();
     const g = guardFor(w);
-    let redisSeq = 0;
-    for (let i = 1; i <= 5; i++) {
-      const s = await g.verifyAndAdvance({ epoch: 'e1', sequence: redisSeq });
-      expect(s).toBe(i);
-      redisSeq = s; // caller mirrors it back into Redis
-    }
+    await expect(g.provision('e1', '')).rejects.toBeInstanceOf(NotAuthorizedError);
+    const genesis = await g.provision('e1', 'authorized-token');
+    expect(genesis).toEqual({ epoch: 'e1', sequence: 0 });
+    // re-provision refused (row exists)
+    await expect(g.provision('e1', 'authorized-token')).rejects.toBeInstanceOf(CheckpointConflictError);
   });
 
-  it('DETECTS a same-epoch rollback (Redis behind the witness) and fails closed', async () => {
+  it('HIGH1: steady state requires EXACT equality; reserve advances by one', async () => {
     const w = new FakeWitness();
     const g = guardFor(w);
-    // Accept a few; witness + Redis both reach 3.
-    let redisSeq = 0;
-    for (let i = 0; i < 3; i++) redisSeq = await g.verifyAndAdvance({ epoch: 'e1', sequence: redisSeq });
-    expect(redisSeq).toBe(3);
-    // Redis is snapshot-restored to an OLDER same-epoch state (sequence 1),
-    // while the independent witness retains 3.
-    await expect(
-      g.verifyAndAdvance({ epoch: 'e1', sequence: 1 }),
-    ).rejects.toBeInstanceOf(RollbackDetectedError);
+    await g.provision('e1', 'auth'); // witness at seq 0
+    expect(await g.check({ epoch: 'e1', sequence: 0 })).toBe('ok');
+    expect(await g.reserve({ epoch: 'e1', sequence: 0 })).toBe(1);
+    expect(await g.reserve({ epoch: 'e1', sequence: 1 })).toBe(2);
   });
 
-  it('fails closed when the witness is unavailable', async () => {
-    const w = new FakeWitness();
+  it('HIGH1: redis BEHIND witness = rollback (redis=1 witness=3)', async () => {
+    const w = new FakeWitness(); w.force(NS, { epoch: 'e1', sequence: 3 });
     const g = guardFor(w);
-    w.down = true;
-    await expect(
-      g.verifyAndAdvance({ epoch: 'e1', sequence: 0 }),
-    ).rejects.toBeInstanceOf(CheckpointUnavailableError);
+    expect(await g.check({ epoch: 'e1', sequence: 1 })).toBe('rollback');
+    await expect(g.reserve({ epoch: 'e1', sequence: 1 })).rejects.toBeInstanceOf(RollbackDetectedError);
   });
 
-  it('fails closed when Redis and the witness disagree on epoch', async () => {
-    const w = new FakeWitness();
-    w.force(NS, { epoch: 'e1', sequence: 2 });
+  it('HIGH1: redis AHEAD of witness is ALSO an anomaly (redis=10 witness=4)', async () => {
+    const w = new FakeWitness(); w.force(NS, { epoch: 'e1', sequence: 4 });
     const g = guardFor(w);
-    await expect(
-      g.verifyAndAdvance({ epoch: 'DIFFERENT', sequence: 5 }),
-    ).rejects.toBeInstanceOf(CheckpointInconsistentError);
+    expect(await g.check({ epoch: 'e1', sequence: 10 })).toBe('redis-ahead');
+    await expect(g.reserve({ epoch: 'e1', sequence: 10 })).rejects.toBeInstanceOf(RedisAheadError);
   });
 
-  it('fails closed on a concurrent-writer fencing conflict', async () => {
-    const w = new FakeWitness();
-    w.force(NS, { epoch: 'e1', sequence: 2 });
+  it('epoch mismatch fails closed', async () => {
+    const w = new FakeWitness(); w.force(NS, { epoch: 'e1', sequence: 2 });
     const g = guardFor(w);
-    // Another writer advances the witness between this guard's read and CAS.
-    const original = w.compareAndAdvance.bind(w);
+    expect(await g.check({ epoch: 'DIFFERENT', sequence: 2 })).toBe('epoch-mismatch');
+    await expect(g.reserve({ epoch: 'DIFFERENT', sequence: 2 })).rejects.toBeInstanceOf(CheckpointInconsistentError);
+  });
+
+  it('witness outage fails closed', async () => {
+    const w = new FakeWitness(); w.force(NS, { epoch: 'e1', sequence: 1 });
+    const g = guardFor(w); w.down = true;
+    await expect(g.check({ epoch: 'e1', sequence: 1 })).rejects.toBeInstanceOf(CheckpointUnavailableError);
+    await expect(g.reserve({ epoch: 'e1', sequence: 1 })).rejects.toBeInstanceOf(CheckpointUnavailableError);
+  });
+
+  it('concurrent-writer fencing conflict fails closed', async () => {
+    const w = new FakeWitness(); w.force(NS, { epoch: 'e1', sequence: 2 });
+    const g = guardFor(w);
+    const orig = w.compareAndAdvance.bind(w);
     let raced = false;
     (w as unknown as { compareAndAdvance: MonotonicCheckpoint['compareAndAdvance'] }).compareAndAdvance =
-      async (ns, expected, next) => {
-        if (!raced) {
-          raced = true;
-          w.force(NS, { epoch: 'e1', sequence: 3 }); // someone else moved it
-        }
-        return original(ns, expected, next);
-      };
-    await expect(
-      g.verifyAndAdvance({ epoch: 'e1', sequence: 2 }),
-    ).rejects.toBeInstanceOf(CheckpointConflictError);
+      async (ns, expected, next) => { if (!raced) { raced = true; w.force(NS, { epoch: 'e1', sequence: 3 }); } return orig(ns, expected, next); };
+    await expect(g.reserve({ epoch: 'e1', sequence: 2 })).rejects.toBeInstanceOf(CheckpointConflictError);
   });
 
-  it('a witness that survives a verifier restart still detects the rollback', async () => {
-    const w = new FakeWitness();
-    // Guard instance 1 accepts to sequence 2.
-    let redisSeq = 0;
-    const g1 = guardFor(w);
-    for (let i = 0; i < 2; i++) redisSeq = await g1.verifyAndAdvance({ epoch: 'e1', sequence: redisSeq });
-    // "Restart": brand-new guard instance, same durable witness. Redis rolled
-    // back to sequence 0 during the outage.
-    const g2 = guardFor(w);
-    await expect(
-      g2.verifyAndAdvance({ epoch: 'e1', sequence: 0 }),
-    ).rejects.toBeInstanceOf(RollbackDetectedError);
-  });
-
-  it('accepts normally when Redis is at or ahead of the witness', async () => {
-    const w = new FakeWitness();
-    w.force(NS, { epoch: 'e1', sequence: 4 });
+  it('MED4: malformed CAS return (store lies) fails closed', async () => {
+    const w = new FakeWitness(); w.force(NS, { epoch: 'e1', sequence: 2 });
+    w.casOverride = () => ({ epoch: 'e1', sequence: 99 }); // returns wrong state
     const g = guardFor(w);
-    // Redis exactly matches -> advance to 5.
-    expect(await g.verifyAndAdvance({ epoch: 'e1', sequence: 4 })).toBe(5);
+    await expect(g.reserve({ epoch: 'e1', sequence: 2 })).rejects.toBeInstanceOf(MalformedCasError);
+  });
+
+  it('MED4: sequence exhaustion forces governed rotation', async () => {
+    const w = new FakeWitness();
+    const near = Number.MAX_SAFE_INTEGER - 1;
+    w.force(NS, { epoch: 'e1', sequence: near });
+    const g = guardFor(w);
+    await expect(g.reserve({ epoch: 'e1', sequence: near })).rejects.toBeInstanceOf(SequenceExhaustedError);
+  });
+
+  it('MED4: invalid ids / sequences are rejected', async () => {
+    const w = new FakeWitness();
+    expect(() => new RollbackCheckpointGuard(w, { namespace: 'bad ns' })).toThrow();
+    const g = guardFor(w);
+    await expect(g.check({ epoch: 'bad epoch', sequence: 0 })).rejects.toBeTruthy();
+    await expect(g.check({ epoch: 'e1', sequence: -1 })).rejects.toBeTruthy();
+  });
+
+  it('HIGH2 deletion regression: deleting the trust row after use fails closed (no re-anchor)', async () => {
+    const w = new FakeWitness();
+    const g = guardFor(w);
+    await g.provision('e1', 'auth');
+    await g.reserve({ epoch: 'e1', sequence: 0 }); // witness -> 1
+    w.delete(NS); // external trust row deleted
+    // Redis rolled back to 0; without the row a naive impl would re-anchor. We fail closed.
+    expect(await g.check({ epoch: 'e1', sequence: 0 })).toBe('witness-missing');
+    await expect(g.reserve({ epoch: 'e1', sequence: 0 })).rejects.toBeInstanceOf(WitnessMissingError);
+  });
+
+  it('reservation-before-commit crash leaves witness ahead -> detected as rollback next time', async () => {
+    const w = new FakeWitness();
+    const g = guardFor(w);
+    await g.provision('e1', 'auth');
+    const reserved = await g.reserve({ epoch: 'e1', sequence: 0 }); // witness -> 1
+    expect(reserved).toBe(1);
+    // "crash" before the caller mirrors 1 into Redis; Redis still shows 0.
+    expect(await g.check({ epoch: 'e1', sequence: 0 })).toBe('rollback');
   });
 });
