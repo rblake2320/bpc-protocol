@@ -155,6 +155,23 @@ export type {
   RollbackVerdict,
 } from './rollback-checkpoint.js';
 export {
+  HA_OUTBOX_PG_SCHEMA,
+  PgDurableOutbox,
+  PgDurablePublisher,
+  PgPromotionFence,
+  PgReceiverCheckpoint,
+  createBoundTx,
+} from './ha-outbox-pg.js';
+export type {
+  MutationApplier,
+  OutboxTransport,
+  PgBackend,
+  PgExecutor,
+  PgOutboxOptions,
+  PgTransactor,
+  PgTx,
+} from './ha-outbox-pg.js';
+export {
   RedisContinuityConfigurationError,
   createGovernedRedisBackedNonceStore,
 } from './redis-governed.js';
