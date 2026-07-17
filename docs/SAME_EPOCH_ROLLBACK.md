@@ -11,8 +11,17 @@ domain than Redis). It is **not** atomically coupled to nonce consumption.
 - **`reserve(redis)`** — verify exact steady-state agreement, then fenced-advance
   the witness by one; returns the reserved sequence. Fails closed on any non-`ok`
   verdict.
-- **`provision(genesisEpoch, authorization)`** — explicit, authorized genesis
-  creation. Empty authorization is refused; an existing row is refused.
+- **`provision(genesisEpoch)`** — genesis creation gated by an injected
+  `ProvisioningAuthorizer` bound in the constructor (a non-empty string is **not**
+  authorization; the deployment binds real authentication/policy). Denied →
+  `NotAuthorizedError`; authorizer unavailable or witness outage →
+  `CheckpointUnavailableError` (fail closed); an existing row is refused.
+  It creates ONLY the genesis row — it is **not** an epoch transition.
+
+**Epoch transitions are NOT implemented** by this primitive and remain #15
+scope: an epoch that differs from the witness is reported as `epoch-mismatch`
+(fail closed). A governed, fenced, independently-approved epoch rotation is
+future work required to close #15.
 
 ## Steady-state invariant (exact equality)
 For the current epoch, Redis's mirrored sequence MUST **equal** the witness.

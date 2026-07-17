@@ -13,7 +13,12 @@ import {
   SequenceExhaustedError,
   WitnessMissingError,
   type CheckpointState,
+  type ProvisioningAuthorizer,
 } from '../src/rollback-checkpoint.js';
+
+const ALLOW: ProvisioningAuthorizer = { async authorizeProvision() { return true; } };
+const DENY: ProvisioningAuthorizer = { async authorizeProvision() { return false; } };
+const AUTHORIZER_DOWN: ProvisioningAuthorizer = { async authorizeProvision() { throw new Error('authorizer unavailable'); } };
 
 /**
  * In-memory witness — proves the primitive's LOGIC only. Per #15 a fake cannot
@@ -54,7 +59,7 @@ function sameState(a: CheckpointState | null, b: CheckpointState | null): boolea
 }
 
 const NS = 'test';
-const guardFor = (w: MonotonicCheckpoint) => new RollbackCheckpointGuard(w, { namespace: NS });
+const guardFor = (w: MonotonicCheckpoint, authorizer: ProvisioningAuthorizer = ALLOW) => new RollbackCheckpointGuard(w, { namespace: NS, authorizer });
 
 describe('RollbackCheckpointGuard (#15 detection + reservation)', () => {
   it('HIGH2: no silent re-anchor — missing witness fails closed on check and reserve', async () => {
@@ -64,20 +69,35 @@ describe('RollbackCheckpointGuard (#15 detection + reservation)', () => {
     await expect(g.reserve({ epoch: 'e1', sequence: 0 })).rejects.toBeInstanceOf(WitnessMissingError);
   });
 
-  it('HIGH2: explicit authorized provisioning creates genesis; empty auth is refused', async () => {
+  it('re-review A: provisioning is gated by the injected authorizer, not a string', async () => {
+    // deny
+    await expect(guardFor(new FakeWitness(), DENY).provision('e1')).rejects.toBeInstanceOf(NotAuthorizedError);
+    // allow
     const w = new FakeWitness();
-    const g = guardFor(w);
-    await expect(g.provision('e1', '')).rejects.toBeInstanceOf(NotAuthorizedError);
-    const genesis = await g.provision('e1', 'authorized-token');
+    const genesis = await guardFor(w, ALLOW).provision('e1');
     expect(genesis).toEqual({ epoch: 'e1', sequence: 0 });
     // re-provision refused (row exists)
-    await expect(g.provision('e1', 'authorized-token')).rejects.toBeInstanceOf(CheckpointConflictError);
+    await expect(guardFor(w, ALLOW).provision('e1')).rejects.toBeInstanceOf(CheckpointConflictError);
+  });
+
+  it('re-review A: authorizer unavailable fails closed (CheckpointUnavailableError)', async () => {
+    await expect(guardFor(new FakeWitness(), AUTHORIZER_DOWN).provision('e1'))
+      .rejects.toBeInstanceOf(CheckpointUnavailableError);
+  });
+
+  it('provision witness outage fails closed (CheckpointUnavailableError)', async () => {
+    const w = new FakeWitness(); w.down = true;
+    await expect(guardFor(w, ALLOW).provision('e1')).rejects.toBeInstanceOf(CheckpointUnavailableError);
+  });
+
+  it('constructor requires a ProvisioningAuthorizer', () => {
+    expect(() => new RollbackCheckpointGuard(new FakeWitness(), { namespace: NS } as never)).toThrow();
   });
 
   it('HIGH1: steady state requires EXACT equality; reserve advances by one', async () => {
     const w = new FakeWitness();
     const g = guardFor(w);
-    await g.provision('e1', 'auth'); // witness at seq 0
+    await g.provision('e1'); // witness at seq 0
     expect(await g.check({ epoch: 'e1', sequence: 0 })).toBe('ok');
     expect(await g.reserve({ epoch: 'e1', sequence: 0 })).toBe(1);
     expect(await g.reserve({ epoch: 'e1', sequence: 1 })).toBe(2);
@@ -138,7 +158,7 @@ describe('RollbackCheckpointGuard (#15 detection + reservation)', () => {
 
   it('MED4: invalid ids / sequences are rejected', async () => {
     const w = new FakeWitness();
-    expect(() => new RollbackCheckpointGuard(w, { namespace: 'bad ns' })).toThrow();
+    expect(() => new RollbackCheckpointGuard(w, { namespace: 'bad ns', authorizer: ALLOW })).toThrow();
     const g = guardFor(w);
     await expect(g.check({ epoch: 'bad epoch', sequence: 0 })).rejects.toBeTruthy();
     await expect(g.check({ epoch: 'e1', sequence: -1 })).rejects.toBeTruthy();
@@ -147,7 +167,7 @@ describe('RollbackCheckpointGuard (#15 detection + reservation)', () => {
   it('HIGH2 deletion regression: deleting the trust row after use fails closed (no re-anchor)', async () => {
     const w = new FakeWitness();
     const g = guardFor(w);
-    await g.provision('e1', 'auth');
+    await g.provision('e1');
     await g.reserve({ epoch: 'e1', sequence: 0 }); // witness -> 1
     w.delete(NS); // external trust row deleted
     // Redis rolled back to 0; without the row a naive impl would re-anchor. We fail closed.
@@ -158,7 +178,7 @@ describe('RollbackCheckpointGuard (#15 detection + reservation)', () => {
   it('reservation-before-commit crash leaves witness ahead -> detected as rollback next time', async () => {
     const w = new FakeWitness();
     const g = guardFor(w);
-    await g.provision('e1', 'auth');
+    await g.provision('e1');
     const reserved = await g.reserve({ epoch: 'e1', sequence: 0 }); // witness -> 1
     expect(reserved).toBe(1);
     // "crash" before the caller mirrors 1 into Redis; Redis still shows 0.

@@ -104,6 +104,7 @@ export type {
   MonotonicCheckpoint,
   RedisSequenceView,
   RollbackCheckpointOptions,
+  ProvisioningAuthorizer,
   RollbackVerdict,
 } from './rollback-checkpoint.js';
 export {

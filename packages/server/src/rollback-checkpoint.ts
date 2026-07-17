@@ -20,12 +20,17 @@
  * STEADY STATE (HIGH1): Redis's mirrored sequence MUST EQUAL the witness for the
  * current epoch. `redis < witness` = same-epoch rollback (restored older
  * snapshot). `redis > witness` = the witness lost acknowledged writes (or Redis
- * has un-witnessed writes) — ALSO an anomaly; both fail closed. Changing epoch
- * is a SEPARATE governed transition (`provision`), never silent acceptance.
+ * has un-witnessed writes) — ALSO an anomaly; both fail closed. An epoch CHANGE
+ * (rotation to a new sourceEpoch after a governed resync) is NOT implemented by
+ * this primitive and remains #15 scope; here an epoch that differs from the
+ * witness is simply `epoch-mismatch` (fail closed).
  *
- * PROVISIONING (HIGH2): the genesis witness row is created ONLY by an explicit,
- * authorized `provision(...)` call. A missing witness row during `check`/
- * `reserve` is fail-closed (`WitnessMissingError`) — there is NO silent
+ * PROVISIONING (HIGH2): the genesis witness row is created ONLY by an explicit
+ * `provision(...)` call whose authorization is decided by an injected
+ * `ProvisioningAuthorizer` bound in the constructor (a non-empty string is NOT
+ * authorization). `provision` creates ONLY the genesis row and refuses if one
+ * already exists — it is not an epoch-transition. A missing witness row during
+ * `check`/`reserve` is fail-closed (`WitnessMissingError`) — there is NO silent
  * re-anchor to whatever Redis currently claims (that would let a deleted trust
  * row + a Redis rollback bypass the anchor).
  *
@@ -135,28 +140,58 @@ export interface MonotonicCheckpoint {
   createGenesis(namespace: string, genesis: CheckpointState): Promise<CheckpointState>;
 }
 
+/**
+ * Decides whether a genesis provisioning is authorized. The deployment binds
+ * real authentication/policy here (governed boundary, signed capability, mTLS
+ * peer identity, etc.) — the guard itself makes no authentication claim. MUST
+ * throw if the decision cannot be made (authorizer unavailable) so the guard
+ * fails closed rather than proceeding.
+ */
+export interface ProvisioningAuthorizer {
+  authorizeProvision(namespace: string, genesisEpoch: string): Promise<boolean>;
+}
+
 export interface RollbackCheckpointOptions {
   namespace: string;
+  /** Required. Authorization for genesis provisioning is delegated here. */
+  authorizer: ProvisioningAuthorizer;
 }
 
 export class RollbackCheckpointGuard {
   private readonly ns: string;
+  private readonly authorizer: ProvisioningAuthorizer;
 
   constructor(private readonly witness: MonotonicCheckpoint, options: RollbackCheckpointOptions) {
     assertId(options.namespace, 'namespace');
+    if (!options.authorizer || typeof options.authorizer.authorizeProvision !== 'function') {
+      throw new ContinuityValidationError('a ProvisioningAuthorizer is required');
+    }
     this.ns = options.namespace;
+    this.authorizer = options.authorizer;
   }
 
   /**
-   * (HIGH2) Explicit, authorized genesis provisioning. `authorization` must be a
-   * non-empty token — this makes provisioning a deliberate authenticated act,
-   * never an implicit side effect of verification. The deployment binds real
-   * authentication to producing that token. Refuses if a witness already exists.
+   * (HIGH2 / re-review A) Genesis provisioning gated by the injected
+   * ProvisioningAuthorizer — NOT by a caller-supplied string. Denied → throws
+   * NotAuthorizedError; authorizer unavailable OR witness outage → throws
+   * CheckpointUnavailableError (fail closed). Creates ONLY the genesis row and
+   * refuses if one already exists (this is not an epoch transition).
    */
-  async provision(genesisEpoch: string, authorization: string): Promise<CheckpointState> {
-    if (typeof authorization !== 'string' || authorization.length === 0) throw new NotAuthorizedError();
+  async provision(genesisEpoch: string): Promise<CheckpointState> {
     assertId(genesisEpoch, 'genesisEpoch');
-    return this.witness.createGenesis(this.ns, { epoch: genesisEpoch, sequence: 0 });
+    let allowed: boolean;
+    try {
+      allowed = await this.authorizer.authorizeProvision(this.ns, genesisEpoch);
+    } catch (err) {
+      throw new CheckpointUnavailableError(err);
+    }
+    if (!allowed) throw new NotAuthorizedError();
+    try {
+      return await this.witness.createGenesis(this.ns, { epoch: genesisEpoch, sequence: 0 });
+    } catch (err) {
+      if (err instanceof CheckpointConflictError) throw err;
+      throw new CheckpointUnavailableError(err);
+    }
   }
 
   /** (HIGH1) Pure detection, no side effects. Fails closed on outage. */
