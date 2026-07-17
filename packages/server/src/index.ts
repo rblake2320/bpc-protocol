@@ -87,6 +87,25 @@ export type {
   RedisContinuityOptions,
 } from './redis-continuity.js';
 export {
+  HA_OUTBOX_CONTRACT_VERSION,
+  HA_OUTBOX_DIGEST_DOMAIN,
+  canonicalJSON,
+  canonicalOpDigest,
+  idempotencyKeyOf,
+} from './ha-outbox-contract.js';
+export type {
+  DurableOutbox,
+  DurableTx,
+  IdempotencyKey,
+  OutboxPublisher,
+  OutboxRecord,
+  OutboxRecordHeader,
+  PromotionFence,
+  PublisherBackpressure,
+  ReceiverCheckpoint,
+  ReceiverDecision,
+} from './ha-outbox-contract.js';
+export {
   RedisContinuityConfigurationError,
   createGovernedRedisBackedNonceStore,
 } from './redis-governed.js';

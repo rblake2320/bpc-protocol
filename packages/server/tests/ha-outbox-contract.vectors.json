@@ -1,0 +1,163 @@
+{
+  "contractVersion": "1",
+  "digestDomain": "selfconnect/ha-outbox/v1",
+  "positive": [
+    {
+      "name": "bpc-pair-set",
+      "streamId": "bpc:pair:default/v1",
+      "sourceEpoch": "e1",
+      "sequence": 0,
+      "mutation": {
+        "op": "set",
+        "pairId": "p1",
+        "scope": "read"
+      },
+      "expectedDigest": "852f1022d905cbc5fe8dab51d87740ccb8efc20f8abb493f68e30910eed135a2"
+    },
+    {
+      "name": "bpc-pair-delete",
+      "streamId": "bpc:pair:default/v1",
+      "sourceEpoch": "e1",
+      "sequence": 1,
+      "mutation": {
+        "op": "delete",
+        "pairId": "p1"
+      },
+      "expectedDigest": "4d70ad5f0c4c150281e84bbc914d1dbf3127c49b7f96d26183b65dbb939ceeb5"
+    },
+    {
+      "name": "tsk-tumbler-advance",
+      "streamId": "tsk:tumbler:default/v1",
+      "sourceEpoch": "e7",
+      "sequence": 42,
+      "mutation": {
+        "op": "advance",
+        "tumblerId": "t1",
+        "head": "h9"
+      },
+      "expectedDigest": "e7e3c7c1344f5b97b8166644183da26b05a4416cf4f3662705b7734e16ffe14b"
+    },
+    {
+      "name": "key-order-independent",
+      "streamId": "s/v1",
+      "sourceEpoch": "e1",
+      "sequence": 2,
+      "mutation": {
+        "b": 2,
+        "a": 1,
+        "nested": {
+          "y": 1,
+          "x": 2
+        }
+      },
+      "expectedDigest": "91942ef7d1f0bee8ef52f825f19354dc90433a17bdda4381963852be6f1d6887"
+    }
+  ],
+  "tamper": [
+    {
+      "name": "tamper-scope",
+      "base": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 3,
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "tampered": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 3,
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "admin"
+        }
+      },
+      "baseDigest": "9d14c8f3944e36f4e592a51b649cf9cd0234e6822523cc1deead764688a3e4cb",
+      "tamperedDigest": "2085f5415c9609673bbdffafc2e829ec6b29af3b93feec2b46f7999c567e229a"
+    },
+    {
+      "name": "tamper-sequence",
+      "base": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 3,
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "tampered": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 4,
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "baseDigest": "9d14c8f3944e36f4e592a51b649cf9cd0234e6822523cc1deead764688a3e4cb",
+      "tamperedDigest": "3921f56f28569a3658dd54c589262870830eff650b9ba036fd64432cf96d3707"
+    },
+    {
+      "name": "tamper-epoch",
+      "base": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 3,
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "tampered": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e2",
+        "sequence": 3,
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "baseDigest": "9d14c8f3944e36f4e592a51b649cf9cd0234e6822523cc1deead764688a3e4cb",
+      "tamperedDigest": "d195a93dd0f9b5342ae8ad3eae8955e2f4b019ba87ad3fa97f74066d5080c3a1"
+    },
+    {
+      "name": "tamper-streamId",
+      "base": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 3,
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "tampered": {
+        "streamId": "other/v1",
+        "sourceEpoch": "e1",
+        "sequence": 3,
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "baseDigest": "9d14c8f3944e36f4e592a51b649cf9cd0234e6822523cc1deead764688a3e4cb",
+      "tamperedDigest": "b22f972e3ee354f0a43c2c369f8dc40ba6101ec8dc0eae94699222481e91442b"
+    }
+  ],
+  "keyOrderInvariant": {
+    "digestA": "03570527b7c0a7bb1eab81636c8ebefcef9e7532119aa49973895f4f82146225",
+    "digestB": "03570527b7c0a7bb1eab81636c8ebefcef9e7532119aa49973895f4f82146225",
+    "mustEqual": true
+  }
+}
