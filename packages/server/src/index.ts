@@ -87,6 +87,19 @@ export type {
   RedisContinuityOptions,
 } from './redis-continuity.js';
 export {
+  CheckpointConflictError,
+  CheckpointInconsistentError,
+  CheckpointUnavailableError,
+  RollbackCheckpointGuard,
+  RollbackDetectedError,
+} from './rollback-checkpoint.js';
+export type {
+  CheckpointState,
+  MonotonicCheckpoint,
+  RedisSequenceView,
+  RollbackCheckpointOptions,
+} from './rollback-checkpoint.js';
+export {
   RedisContinuityConfigurationError,
   createGovernedRedisBackedNonceStore,
 } from './redis-governed.js';
