@@ -162,6 +162,7 @@ export {
   PgDurablePublisher,
   PgPromotionFence,
   PgReceiverCheckpoint,
+  assertSchemaReady,
   assertSchemaVersion,
   attestSchema,
   createBoundTx,

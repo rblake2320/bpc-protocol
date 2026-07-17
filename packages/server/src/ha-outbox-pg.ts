@@ -216,23 +216,24 @@ const HA_OUTBOX_TABLES = [
 ] as const;
 
 /**
- * (R5/HIGH) Pinned manifest of the EXACT expected schema in the CURRENT schema:
- * every table's columns (name, type, nullability, default), every PK/CHECK/
- * unique/FK constraint definition, and every index definition. Computed over a
- * known-good v2 provisioning and constant-time compared at attestation. Any
- * deviation — a missing/altered column, a weakened/removed CHECK, a wrong PK, a
- * missing/wrong partial index, or same-named objects in a different schema —
- * changes the digest and fails closed. PostgreSQL-major-version specific (catalog
- * rendering): a supported-PG bump requires recomputing this via schemaManifest().
+ * (R5/R6/HIGH) Pinned manifest of the EXACT expected schema in the CURRENT
+ * schema: every table's columns (ordinal position, name, type, nullability,
+ * default), every PK/CHECK/unique/FK constraint definition, and every index
+ * definition. Computed over a known-good v2 provisioning and constant-time
+ * compared at attestation. Any deviation — a missing/altered/reordered column, a
+ * weakened/removed CHECK, a wrong PK, a missing/wrong partial index, or
+ * same-named objects in a different schema — changes the digest and fails closed.
+ * PostgreSQL-major-version specific (catalog rendering): a supported-PG bump
+ * requires recomputing this via schemaManifest().
  */
-export const HA_OUTBOX_SCHEMA_MANIFEST = '19a34450ba8312a54e87ef22f04c524caad255fcca13b7026be9a2e552631218';
+export const HA_OUTBOX_SCHEMA_MANIFEST = 'e2a09fd85eee5d7524c5112f189c1b1b6809047a0b1a0be594f5fb0e2b43b62e';
 
 /** Canonical fingerprint of the live schema in `current_schema()`. Deterministic
  *  (no oids/timestamps); identical normalization to the pinned manifest. */
 export async function schemaManifest(exec: PgExecutor): Promise<string> {
   const tables = HA_OUTBOX_TABLES as unknown as string[];
   const cols = (await exec.query(
-    `SELECT table_name, column_name, udt_name, is_nullable, coalesce(column_default, '') AS cd
+    `SELECT table_name, ordinal_position, column_name, udt_name, is_nullable, coalesce(column_default, '') AS cd
      FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ANY($1)`,
     [tables],
   )).rows;
@@ -248,7 +249,7 @@ export async function schemaManifest(exec: PgExecutor): Promise<string> {
   )).rows;
   const stripSchema = (s: string) => s.replace(/ ON \w+\./, ' ON ');
   const parts: string[] = [];
-  for (const r of cols) parts.push(`COL|${r.table_name}|${r.column_name}|${r.udt_name}|${r.is_nullable}|${r.cd}`);
+  for (const r of cols) parts.push(`COL|${r.table_name}|${r.ordinal_position}|${r.column_name}|${r.udt_name}|${r.is_nullable}|${r.cd}`);
   for (const r of cons) parts.push(`CON|${r.t}|${r.contype}|${r.def}`);
   for (const r of idx) parts.push(`IDX|${r.t}|${r.indexname}|${stripSchema(String(r.indexdef))}`);
   parts.sort();
@@ -264,13 +265,33 @@ export async function attestSchema(exec: PgExecutor): Promise<void> {
   }
 }
 
-/** (MED) Fail closed unless the live schema matches the version this build
- *  expects. Prevents running new code against an un-migrated database. */
+/** (MED) Fail closed unless the meta VERSION matches this build. This is the
+ *  version-only check; it does NOT detect post-provision structural drift — use
+ *  `assertSchemaReady` for the full runtime readiness gate. */
 export async function assertSchemaVersion(db: PgTransactor): Promise<void> {
   const rows = (await db.transaction((exec) => exec.query('SELECT schema_version FROM ha_outbox_meta WHERE id = 1'))).rows;
   if (!rows.length) throw new ContractValidationError('ha_outbox schema is not provisioned (no meta row)');
   const found = safeSeq(rows[0].schema_version, 'schema_version');
   if (found !== HA_OUTBOX_SCHEMA_VERSION) throw new ContractValidationError(`ha_outbox schema version mismatch: db=${found} expected=${HA_OUTBOX_SCHEMA_VERSION}`);
+}
+
+/**
+ * (R6/HIGH2) The RUNTIME READINESS GATE — the single public assertion callers
+ * use before operating. In ONE serializable tx it performs BOTH a full manifest
+ * attestation (catches post-provision structural drift: an ALTER/DROP of a
+ * CHECK/index/table that left meta untouched) AND the version check. A schema
+ * that was validly stamped v2 and later mutated fails here even though
+ * assertSchemaVersion alone would pass.
+ */
+export async function assertSchemaReady(db: PgTransactor): Promise<void> {
+  await db.transaction(async (exec) => {
+    await assertSerializable(exec);
+    await attestSchema(exec);
+    const rows = (await exec.query('SELECT schema_version FROM ha_outbox_meta WHERE id = 1')).rows;
+    if (!rows.length) throw new ContractValidationError('ha_outbox schema is not provisioned (no meta row)');
+    const found = safeSeq(rows[0].schema_version, 'schema_version');
+    if (found !== HA_OUTBOX_SCHEMA_VERSION) throw new ContractValidationError(`ha_outbox schema version mismatch: db=${found} expected=${HA_OUTBOX_SCHEMA_VERSION}`);
+  });
 }
 
 /**
@@ -292,17 +313,28 @@ export async function provisionSchemaVersion(db: PgTransactor): Promise<void> {
 }
 
 /**
- * (R4/R5/HIGH) EXPLICIT version advance — the ONLY path that may bump an existing
- * meta row. Runs a FULL catalog attestation (attestSchema) in the SAME
- * serializable tx and only then advances the version. A malformed/partial/
- * foreign-schema layout — even one that superficially has the right column names
- * or a same-named table in another schema — fails attestation and the version
- * can never race ahead of the actual columns/constraints/indexes.
+ * (R4/R5/R6/HIGH) EXPLICIT version advance — the ONLY path that may bump an
+ * existing meta row. Runs a FULL catalog attestation (attestSchema) in the SAME
+ * serializable tx, then advances FORWARD-ONLY: it reads the current version under
+ * lock and only stamps when meta is absent OR at a lower supported version.
+ * A version already at current is a no-op; a FUTURE version (> this build — e.g.
+ * a semantic-only revision or a pre-staged marker sharing this catalog) is
+ * REFUSED, never silently downgraded. A malformed/partial/foreign-schema layout
+ * fails attestation, so the version can never race ahead of the real structure.
  */
 export async function migrateSchemaToCurrent(db: PgTransactor): Promise<void> {
   await db.transaction(async (exec) => {
     await assertSerializable(exec);
     await attestSchema(exec);
+    // read current authority under lock (meta PK + id=1 CHECK guarantee <= 1 row;
+    // still assert it defensively so multiple/foreign authority rows fail closed).
+    const rows = (await exec.query('SELECT schema_version FROM ha_outbox_meta FOR UPDATE')).rows;
+    if (rows.length > 1) throw new ContractValidationError('multiple schema-version authority rows');
+    if (rows.length === 1) {
+      const cur = safeSeq(rows[0].schema_version, 'schema_version');
+      if (cur === HA_OUTBOX_SCHEMA_VERSION) return; // already current — no-op
+      if (cur > HA_OUTBOX_SCHEMA_VERSION) throw new ContractValidationError(`refusing to downgrade schema version ${cur} -> ${HA_OUTBOX_SCHEMA_VERSION}`);
+    }
     const res = await exec.query(
       `INSERT INTO ha_outbox_meta (id, schema_version) VALUES (1, ${HA_OUTBOX_SCHEMA_VERSION})
        ON CONFLICT (id) DO UPDATE SET schema_version = EXCLUDED.schema_version`,

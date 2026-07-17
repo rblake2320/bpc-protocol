@@ -31,6 +31,7 @@ import {
   PgDurableOutbox,
   PgDurablePublisher,
   PgReceiverCheckpoint,
+  assertSchemaReady,
   assertSchemaVersion,
   attestSchema,
   canonicalOpDigest,
@@ -324,6 +325,38 @@ async function main(): Promise<void> {
     await migrateSchemaToCurrent(serial); // attests OK -> advances
     assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), HA_OUTBOX_SCHEMA_VERSION);
     await assertSchemaVersion(serial);
+  });
+
+  await check('(R6/HIGH1) migration is forward-only: a FUTURE version is never downgraded, data preserved', async () => {
+    const sid = 'sc:nodown/v1'; await provision(sid);
+    const ob = mkOutbox(serial, sid);
+    await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'keepme' }, fenceToken: 0n }));
+    // simulate a future version sharing this exact catalog (semantic-only revision / pre-staged marker)
+    await pool.query('UPDATE ha_outbox_meta SET schema_version = 3 WHERE id = 1');
+    await assert.rejects(() => migrateSchemaToCurrent(serial), /refusing to downgrade/);
+    assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), 3, 'future version must be preserved');
+    assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM ha_outbox_rows WHERE stream_id=$1', [sid])).rows[0].n), 1, 'data must be preserved on refused downgrade');
+    // being already-current is a clean no-op
+    await pool.query('UPDATE ha_outbox_meta SET schema_version = $1 WHERE id = 1', [HA_OUTBOX_SCHEMA_VERSION]);
+    await migrateSchemaToCurrent(serial);
+    assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), HA_OUTBOX_SCHEMA_VERSION);
+  });
+
+  await check('(R6/HIGH2) assertSchemaReady catches post-stamp structural drift (version-only check does not)', async () => {
+    await assertSchemaReady(serial); // fresh + stamped -> ready
+    // validly stamped v2, then drop a CHECK while leaving meta = 2
+    await pool.query(`DO $$ DECLARE r record; BEGIN
+      FOR r IN SELECT conname FROM pg_constraint c JOIN pg_class rel ON rel.oid=c.conrelid
+               WHERE rel.relname='ha_outbox_rows' AND c.contype='c' AND pg_get_constraintdef(c.oid) LIKE '%op_digest%'
+      LOOP EXECUTE 'ALTER TABLE ha_outbox_rows DROP CONSTRAINT '||quote_ident(r.conname); END LOOP; END $$;`);
+    assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), HA_OUTBOX_SCHEMA_VERSION);
+    await assertSchemaVersion(serial); // version-only check still passes (the bypass)
+    await assert.rejects(() => assertSchemaReady(serial), /attestation failed/, 'readiness gate must catch structural drift');
+    // dropping a table too
+    await resetSchema();
+    await assertSchemaReady(serial);
+    await pool.query('DROP INDEX ha_outbox_rows_deliverable');
+    await assert.rejects(() => assertSchemaReady(serial), /attestation failed/);
   });
 
   await check('(R5/HIGH2) quarantine conflict with a mismatched preexisting row fails closed', async () => {
