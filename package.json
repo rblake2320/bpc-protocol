@@ -13,6 +13,7 @@
     "test": "node --test tests/workspace-test-runner.test.mjs && node scripts/run-workspace-tests.mjs",
     "test:redis": "tsx redis-nonce-integration.mts",
     "test:postgres": "tsx postgres-store-integration.mts",
+    "test:postgres:ha": "tsx ha-outbox-pg-integration.mts",
     "test:interop": "tsx cross-language-integration.mts",
     "test:adversarial": "tsx adversarial-integration.mts",
     "test:pack": "npm pack --dry-run --workspaces",
