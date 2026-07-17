@@ -51,6 +51,10 @@ jobs:
       - run: npm run test:interop
       - run: npm run test:redis
       - run: npm run test:postgres
+      # HA durable-outbox (#16) real-PG evidence — the script throws if
+      # BPC_TEST_POSTGRES_URL is unset, so this step FAILS rather than silently
+      # skipping (asserts the real-PG tests actually executed).
+      - run: npm run test:postgres:ha
       - run: npm audit --omit=dev
 
   python:

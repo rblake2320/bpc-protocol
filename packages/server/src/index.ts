@@ -156,15 +156,18 @@ export type {
 } from './rollback-checkpoint.js';
 export {
   HA_OUTBOX_PG_SCHEMA,
+  HA_OUTBOX_SCHEMA_VERSION,
   PgDurableOutbox,
   PgDurablePublisher,
   PgPromotionFence,
   PgReceiverCheckpoint,
+  assertSchemaVersion,
   createBoundTx,
 } from './ha-outbox-pg.js';
 export type {
   AckReceipt,
   AckReceiptVerifier,
+  DrainResult,
   MutationApplier,
   OutboxTransport,
   PgBackend,

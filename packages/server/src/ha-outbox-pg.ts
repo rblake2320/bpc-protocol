@@ -114,19 +114,38 @@ export function createBoundTx(exec: PgExecutor): PgTx {
   return tx;
 }
 
+/** Schema version this build provisions/expects. Bump on any DDL change;
+ *  `assertSchemaVersion` fails closed on drift so a stale migration cannot be
+ *  used with newer code. */
+export const HA_OUTBOX_SCHEMA_VERSION = 2 as const;
+
+// Contract fence bound: a fence token is an integer with at most 39 digits
+// (FENCE_TOKEN_PATTERN in the contract), i.e. strictly < 10^39. The DDL enforces
+// the SAME bound plus integrality (scale 0) so a fractional or oversized value
+// cannot be persisted.
+const FENCE_MAX_EXCLUSIVE = '1e39';
+
 /**
  * DDL for the outbox tables. Source-side and receiver-side checkpoints are
- * SEPARATE tables (independent authorities); rows carry a claim-lease. Every
- * numeric/text column carries a CHECK so a malformed row cannot be persisted:
+ * SEPARATE tables (independent authorities); rows carry a claim marker and a
+ * quarantine marker; a per-stream publisher lease enforces single-active,
+ * in-order delivery. Every numeric/text column carries a CHECK so a malformed
+ * row cannot be persisted:
  *  - sequence non-negative and within JS safe-integer range,
- *  - fence_token non-negative,
+ *  - fence_token a non-negative INTEGER strictly below the contract's 10^39 bound,
  *  - op_digest exactly 64 lowercase hex,
  *  - stream_id / source_epoch non-empty and bounded.
  */
 export const HA_OUTBOX_PG_SCHEMA = `
+CREATE TABLE IF NOT EXISTS ha_outbox_meta (
+  id             integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  schema_version integer NOT NULL CHECK (schema_version >= 1)
+);
+INSERT INTO ha_outbox_meta (id, schema_version) VALUES (1, ${HA_OUTBOX_SCHEMA_VERSION})
+  ON CONFLICT (id) DO UPDATE SET schema_version = EXCLUDED.schema_version;
 CREATE TABLE IF NOT EXISTS ha_outbox_fence (
   stream_id     text PRIMARY KEY CHECK (length(stream_id) BETWEEN 1 AND 512),
-  fence_token   numeric NOT NULL DEFAULT 0 CHECK (fence_token >= 0)
+  fence_token   numeric NOT NULL DEFAULT 0 CHECK (fence_token >= 0 AND scale(fence_token) = 0 AND fence_token < ${FENCE_MAX_EXCLUSIVE})
 );
 -- Source-side allocator checkpoint (last ALLOCATED sequence).
 CREATE TABLE IF NOT EXISTS ha_outbox_source_checkpoint (
@@ -147,17 +166,35 @@ CREATE TABLE IF NOT EXISTS ha_outbox_rows (
   stream_id     text NOT NULL CHECK (length(stream_id) BETWEEN 1 AND 512),
   source_epoch  text NOT NULL CHECK (length(source_epoch) BETWEEN 1 AND 512),
   sequence      bigint NOT NULL CHECK (sequence >= 1 AND sequence <= 9007199254740991),
-  fence_token   numeric NOT NULL CHECK (fence_token >= 0),
+  fence_token   numeric NOT NULL CHECK (fence_token >= 0 AND scale(fence_token) = 0 AND fence_token < ${FENCE_MAX_EXCLUSIVE}),
   op_digest     text NOT NULL CHECK (op_digest ~ '^[0-9a-f]{64}$'),
   mutation      jsonb NOT NULL,                   -- secret-stripped
-  claim_token   text,                             -- current publisher lease holder
-  claim_until   timestamptz,                      -- lease expiry (retryable after)
   published_at  timestamptz,
   acked_at      timestamptz,
+  quarantined_at timestamptz,                     -- terminal-reject divergence park
   PRIMARY KEY (stream_id, source_epoch, sequence)
 );
-CREATE INDEX IF NOT EXISTS ha_outbox_rows_claimable
-  ON ha_outbox_rows (stream_id, sequence) WHERE acked_at IS NULL;
+CREATE INDEX IF NOT EXISTS ha_outbox_rows_deliverable
+  ON ha_outbox_rows (stream_id, sequence) WHERE acked_at IS NULL AND quarantined_at IS NULL;
+-- Per-stream publisher lease: only the current lease holder may deliver a
+-- stream, and it delivers strictly ascending/contiguous — this is what makes
+-- an ordered stream single-active. Parallelism is ACROSS streams only.
+CREATE TABLE IF NOT EXISTS ha_outbox_publisher_lease (
+  stream_id     text PRIMARY KEY CHECK (length(stream_id) BETWEEN 1 AND 512),
+  lease_token   text,
+  lease_until   timestamptz
+);
+-- Terminally-rejected records (fork/stale/unsanitized/epoch): parked for
+-- investigation, NEVER acked as delivered and NEVER silently dropped.
+CREATE TABLE IF NOT EXISTS ha_outbox_quarantine (
+  stream_id     text NOT NULL CHECK (length(stream_id) BETWEEN 1 AND 512),
+  source_epoch  text NOT NULL CHECK (length(source_epoch) BETWEEN 1 AND 512),
+  sequence      bigint NOT NULL CHECK (sequence >= 1 AND sequence <= 9007199254740991),
+  op_digest     text NOT NULL CHECK (op_digest ~ '^[0-9a-f]{64}$'),
+  decision      text NOT NULL,
+  quarantined_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (stream_id, source_epoch, sequence)
+);
 -- Receiver-side durable applied history (independent of the source outbox
 -- table) so duplicate/fork/stale decisions survive on the receiver.
 CREATE TABLE IF NOT EXISTS ha_outbox_applied (
@@ -168,6 +205,15 @@ CREATE TABLE IF NOT EXISTS ha_outbox_applied (
   PRIMARY KEY (stream_id, source_epoch, sequence)
 );
 `;
+
+/** (MED) Fail closed unless the live schema matches the version this build
+ *  expects. Prevents running new code against an un-migrated database. */
+export async function assertSchemaVersion(db: PgTransactor): Promise<void> {
+  const rows = (await db.transaction((exec) => exec.query('SELECT schema_version FROM ha_outbox_meta WHERE id = 1'))).rows;
+  if (!rows.length) throw new ContractValidationError('ha_outbox schema is not provisioned (no meta row)');
+  const found = safeSeq(rows[0].schema_version, 'schema_version');
+  if (found !== HA_OUTBOX_SCHEMA_VERSION) throw new ContractValidationError(`ha_outbox schema version mismatch: db=${found} expected=${HA_OUTBOX_SCHEMA_VERSION}`);
+}
 
 export interface PgOutboxOptions<Raw, Clean> {
   streamId: string;
@@ -219,7 +265,7 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
     if (input.fenceToken !== persistedFence) throw new StaleFenceError(input.fenceToken, persistedFence);
 
     // (11) admission INSIDE the tx: over the bound → abort the mutation.
-    const pending = safeSeq((await exec.query('SELECT count(*)::bigint AS n FROM ha_outbox_rows WHERE stream_id = $1 AND acked_at IS NULL', [streamId])).rows[0].n, 'pending-count');
+    const pending = safeSeq((await exec.query('SELECT count(*)::bigint AS n FROM ha_outbox_rows WHERE stream_id = $1 AND acked_at IS NULL AND quarantined_at IS NULL', [streamId])).rows[0].n, 'pending-count');
     if (pending >= this.opts.maxPendingRows) throw new OutboxBackpressureError(this.opts.backpressure);
 
     // (i) allocate the next sequence within the tx (source checkpoint = allocator).
@@ -249,55 +295,83 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
   }
 }
 
-/** (#4/HIGH2) Record-bound acknowledgement the receiver returns. The tuple/
- *  digest fields prove ECHO only; `receiverId`/`keyId`/`issuedAt`/`signature`
- *  let an `AckReceiptVerifier` prove the ACK actually came from the authorized
- *  receiver over the record. */
+/** (#4/HIGH2/H1) Record-bound acknowledgement the receiver returns. The tuple/
+ *  digest prove ECHO only; `receiverId`/`keyId`/`issuedAt`/`signature` let an
+ *  `AckReceiptVerifier` prove the ACK came from the authorized receiver over the
+ *  record; `decision` is the SIGNED receiver verdict — the source acts on it
+ *  (only applied|duplicate-ok removes the row from the outbox). */
 export interface AckReceipt {
   streamId: string;
   sourceEpoch: string;
   sequence: number;
   opDigest: string;
+  decision: ReceiverDecision;
   receiverId: string;
   keyId: string;
   issuedAt: string;
   signature: string;
 }
-/** (HIGH2) Verifies a receipt is a genuine, authorized acknowledgement of THIS
- *  record. MUST throw on an invalid signature, an unknown/unauthorized key, or
- *  when the verifying material is unavailable (fail-closed). A field-perfect but
- *  unsigned/forged receipt MUST be rejected here. */
+/** (HIGH2/H1) Verifies a receipt is a genuine, authorized acknowledgement of
+ *  THIS record AND its `decision`. MUST throw on an invalid signature, an
+ *  unknown/unauthorized key, unavailable verifying material, or a signature that
+ *  does not cover `decision` (fail-closed). A field-perfect but unsigned/forged
+ *  receipt — including one with a swapped decision — MUST be rejected here. */
 export interface AckReceiptVerifier {
   verify(receipt: AckReceipt, record: OutboxRecord<unknown>): Promise<void>;
 }
-/** Transport delivers a record and returns the receiver's ACK receipt. A throw
- *  (or a receipt that fails verification / does not match) leaves the row
- *  unacked — the row is NEVER acked on call-completion alone. */
+/** Transport delivers a record and returns the receiver's signed decision
+ *  receipt. A throw leaves the row undelivered (retry). The row is NEVER acked
+ *  on call-completion alone — only on a verified applied|duplicate-ok decision. */
 export interface OutboxTransport {
   deliverAndAwaitAck(record: OutboxRecord<unknown>): Promise<AckReceipt>;
 }
 
+/** Decisions that mean the receiver durably owns the record → source may ACK. */
+const ACK_DECISIONS: ReadonlySet<ReceiverDecision> = new Set<ReceiverDecision>(['applied', 'duplicate-ok']);
+/** Transient rejections → release the lease and retry later (no advance). */
+const TRANSIENT_DECISIONS: ReadonlySet<ReceiverDecision> = new Set<ReceiverDecision>(['reject-gap', 'reject-fence']);
+// Everything else (reject-fork / reject-stale / reject-unsanitized / reject-epoch)
+// is a terminal divergence → quarantine + halt, never ACK, never drop.
+
 export interface PgPublisherOptions {
-  /** Max rows claimed per drain (bounds lock scope + batch size). */
-  batchSize: number;
-  /** Lease duration in ms; a claimed-but-unacked row is retryable after this. */
+  /** Publisher lease duration in ms; a held-but-idle stream is reclaimable after. */
   leaseMs: number;
 }
 
+export interface DrainResult {
+  /** rows delivered to the transport this drain */
+  published: number;
+  /** rows acked (verified applied|duplicate-ok) and removed from the outbox */
+  acked: number;
+  /** rows parked as terminal divergence (fork/stale/unsanitized/epoch) */
+  quarantined: number;
+  /** true if the drain stopped on a transient rejection and should be retried */
+  retriable: boolean;
+}
+
 /**
- * Durable publisher with a BOUNDED CLAIM-LEASE (HIGH1). One drain is:
- *   1) short serializable tx: claim ≤ batchSize claimable rows (SKIP LOCKED),
- *      stamp a unique claim_token + claim_until, COMMIT — releases all locks.
- *   2) for each claimed row: revalidate + recompute digest, deliver over the
- *      transport and await an ACK receipt, OUTSIDE any DB tx (no lock held
- *      across the network), verify the receipt (crypto + record-bound).
- *   3) short serializable tx: ACK exactly this row iff it is still unacked AND
- *      still holds our claim_token AND op_digest matches — assert 1 row.
- * A crash after (1)/before (3) leaves the lease to expire and be reclaimed; the
- * receiver is idempotent, so redelivery is safe. Never sheds.
+ * Durable publisher with PER-STREAM ORDERED single-active delivery (H1/H2).
+ *
+ * A stream is a totally-ordered log, so exactly one publisher may deliver it at
+ * a time and it delivers strictly ascending / contiguous. Parallelism is ACROSS
+ * streams (distinct lease rows), never within one stream. One drain is:
+ *   1) short serializable tx: acquire the per-stream publisher lease (steal only
+ *      if expired). If held elsewhere → nothing to do.
+ *   2) loop: read the LOWEST undelivered row (acked_at IS NULL AND
+ *      quarantined_at IS NULL) under our lease; revalidate + recompute digest;
+ *      deliver OUTSIDE any tx and await the signed decision receipt.
+ *   3) verify the receipt (crypto + record-bound + covers decision), then act on
+ *      the SIGNED decision:
+ *        applied|duplicate-ok → short tx: ACK exactly this row (guarded by
+ *          unacked + op_digest), assert 1 row, advance to the next.
+ *        reject-gap|reject-fence (transient) → STOP, leave unacked, retry later.
+ *        reject-* (terminal) → short tx: quarantine this row + record it, STOP.
+ *   4) release the lease.
+ * Because delivery is lowest-first and only advances on applied|duplicate-ok,
+ * the receiver's contiguous cp+1 rule is always satisfied in order — no
+ * out-of-order delivery, no gap-induced loss, no ack of a rejected record.
  */
 export class PgDurablePublisher<Clean> {
-  private readonly batchSize: number;
   private readonly leaseMs: number;
   constructor(
     private readonly db: PgTransactor,
@@ -306,71 +380,125 @@ export class PgDurablePublisher<Clean> {
     readonly backpressure: PublisherBackpressure,
     /** (#5) sanitizer to revalidate each DB row before publishing. */
     private readonly sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'assertSanitized'>,
-    /** (HIGH2) verifier for the receiver's ACK receipt — REQUIRED (fail-closed). */
+    /** (HIGH2) verifier for the receiver's signed decision receipt — REQUIRED. */
     private readonly ackVerifier: AckReceiptVerifier,
-    opts: PgPublisherOptions = { batchSize: 64, leaseMs: 30_000 },
+    opts: PgPublisherOptions = { leaseMs: 30_000 },
   ) {
-    if (!Number.isSafeInteger(opts.batchSize) || opts.batchSize <= 0) throw new ContractValidationError('batchSize must be a positive safe integer');
     if (!Number.isSafeInteger(opts.leaseMs) || opts.leaseMs <= 0) throw new ContractValidationError('leaseMs must be a positive safe integer');
-    this.batchSize = opts.batchSize;
     this.leaseMs = opts.leaseMs;
   }
 
-  async drainOnce(): Promise<{ published: number; acked: number }> {
-    const claimToken = randomUUID();
-    // (1) bounded claim — short tx, releases locks on COMMIT.
-    const claimed = await this.db.transaction(async (exec) => {
+  /** Acquire the per-stream lease (steal only if expired). Returns true if held. */
+  private async acquireLease(leaseToken: string): Promise<boolean> {
+    return this.db.transaction(async (exec) => {
       await assertSerializable(exec);
-      return (await exec.query(
-        `WITH cte AS (
-           SELECT stream_id, source_epoch, sequence FROM ha_outbox_rows
-           WHERE stream_id = $1 AND acked_at IS NULL AND (claim_until IS NULL OR claim_until < now())
-           ORDER BY sequence ASC LIMIT $2 FOR UPDATE SKIP LOCKED
-         )
-         UPDATE ha_outbox_rows r
-         SET claim_token = $3, claim_until = now() + ($4::text || ' milliseconds')::interval
-         FROM cte
-         WHERE r.stream_id = cte.stream_id AND r.source_epoch = cte.source_epoch AND r.sequence = cte.sequence
-         RETURNING r.source_epoch, r.sequence, r.fence_token, r.op_digest, r.mutation`,
-        [this.streamId, this.batchSize, claimToken, String(this.leaseMs)],
-      )).rows;
+      const res = await exec.query(
+        `INSERT INTO ha_outbox_publisher_lease (stream_id, lease_token, lease_until)
+         VALUES ($1, $2, now() + ($3::text || ' milliseconds')::interval)
+         ON CONFLICT (stream_id) DO UPDATE
+           SET lease_token = EXCLUDED.lease_token, lease_until = EXCLUDED.lease_until
+           WHERE ha_outbox_publisher_lease.lease_until IS NULL OR ha_outbox_publisher_lease.lease_until < now()
+         RETURNING lease_token`,
+        [this.streamId, leaseToken, String(this.leaseMs)],
+      );
+      return res.rowCount === 1;
     });
+  }
 
-    let published = 0, acked = 0;
-    for (const r of claimed) {
-      const sourceEpoch = String(r.source_epoch);
-      const sequence = safeSeq(r.sequence, 'row.sequence');
-      const storedDigest = String(r.op_digest);
-      const mutation = r.mutation as SanitizedMutation<Clean>;
-      // (#5) fail closed on a corrupted/tampered stored row.
-      this.sanitizer.assertSanitized(mutation);
-      const recomputed = canonicalOpDigest<Clean>({ streamId: this.streamId, sourceEpoch, sequence, fenceToken: String(r.fence_token), mutation });
-      if (!digestEquals(recomputed, storedDigest)) throw new ContractValidationError(`corrupted outbox row: digest mismatch at ${this.streamId}/${sourceEpoch}/${sequence}`);
+  private async releaseLease(leaseToken: string): Promise<void> {
+    await this.db.transaction(async (exec) => {
+      await assertSerializable(exec);
+      await exec.query('UPDATE ha_outbox_publisher_lease SET lease_token = NULL, lease_until = NULL WHERE stream_id = $1 AND lease_token = $2', [this.streamId, leaseToken]);
+    });
+  }
 
-      const record: OutboxRecord<unknown> = { contractVersion: '1', streamId: this.streamId, sourceEpoch, sequence, fenceToken: String(r.fence_token), opDigest: storedDigest, mutation };
-      // (2) deliver OUTSIDE any tx — no DB lock is held across this network call.
-      const receipt = await this.transport.deliverAndAwaitAck(record); // throw → lease expires, retried
-      published++;
-      // (HIGH2) cryptographically verify the receipt came from the authorized receiver…
-      await this.ackVerifier.verify(receipt, record); // throw → not acked
-      // …AND is record-bound (echo check on top of the signature).
-      if (receipt.streamId !== this.streamId || receipt.sourceEpoch !== sourceEpoch || receipt.sequence !== sequence || !digestEquals(receipt.opDigest, storedDigest)) {
-        throw new ContractValidationError('ACK receipt does not match the delivered record — not acking');
+  /** Read the lowest deliverable row while re-asserting lease ownership. */
+  private async nextDeliverable(leaseToken: string): Promise<Record<string, unknown> | null> {
+    return this.db.transaction(async (exec) => {
+      await assertSerializable(exec);
+      const lease = (await exec.query('SELECT lease_token FROM ha_outbox_publisher_lease WHERE stream_id = $1 FOR UPDATE', [this.streamId])).rows;
+      if (!lease.length || lease[0].lease_token !== leaseToken) throw new ContractValidationError('publisher lease lost — aborting drain');
+      const rows = (await exec.query(
+        'SELECT source_epoch, sequence, fence_token, op_digest, mutation FROM ha_outbox_rows WHERE stream_id = $1 AND acked_at IS NULL AND quarantined_at IS NULL ORDER BY sequence ASC LIMIT 1',
+        [this.streamId],
+      )).rows;
+      return rows[0] ?? null;
+    });
+  }
+
+  async drainOnce(): Promise<DrainResult> {
+    const leaseToken = randomUUID();
+    if (!(await this.acquireLease(leaseToken))) return { published: 0, acked: 0, quarantined: 0, retriable: true };
+    let published = 0, acked = 0, quarantined = 0, retriable = false;
+    try {
+      for (;;) {
+        const r = await this.nextDeliverable(leaseToken);
+        if (!r) break;
+        const sourceEpoch = String(r.source_epoch);
+        const sequence = safeSeq(r.sequence, 'row.sequence');
+        const storedDigest = String(r.op_digest);
+        const mutation = r.mutation as SanitizedMutation<Clean>;
+        // (#5) fail closed on a corrupted/tampered stored row.
+        this.sanitizer.assertSanitized(mutation);
+        const recomputed = canonicalOpDigest<Clean>({ streamId: this.streamId, sourceEpoch, sequence, fenceToken: String(r.fence_token), mutation });
+        if (!digestEquals(recomputed, storedDigest)) throw new ContractValidationError(`corrupted outbox row: digest mismatch at ${this.streamId}/${sourceEpoch}/${sequence}`);
+
+        const record: OutboxRecord<unknown> = { contractVersion: '1', streamId: this.streamId, sourceEpoch, sequence, fenceToken: String(r.fence_token), opDigest: storedDigest, mutation };
+        // deliver OUTSIDE any tx — no DB lock is held across this network call.
+        const receipt = await this.transport.deliverAndAwaitAck(record); // throw → row stays, retried
+        published++;
+        // (HIGH2) verify signature (must cover the decision) came from the authorized receiver…
+        await this.ackVerifier.verify(receipt, record); // throw → not acked
+        // …AND the receipt is record-bound (echo check on top of the signature).
+        if (receipt.streamId !== this.streamId || receipt.sourceEpoch !== sourceEpoch || receipt.sequence !== sequence || !digestEquals(receipt.opDigest, storedDigest)) {
+          throw new ContractValidationError('ACK receipt does not match the delivered record — not acking');
+        }
+
+        if (ACK_DECISIONS.has(receipt.decision)) {
+          // (H1) durable ownership → ACK exactly this row, then advance.
+          await this.db.transaction(async (exec) => {
+            await assertSerializable(exec);
+            const lease = (await exec.query('SELECT lease_token FROM ha_outbox_publisher_lease WHERE stream_id = $1 FOR UPDATE', [this.streamId])).rows;
+            if (!lease.length || lease[0].lease_token !== leaseToken) throw new ContractValidationError('publisher lease lost — not acking');
+            const res = await exec.query(
+              `UPDATE ha_outbox_rows SET published_at = now(), acked_at = now()
+               WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3 AND acked_at IS NULL AND quarantined_at IS NULL AND op_digest = $4`,
+              [this.streamId, sourceEpoch, sequence, storedDigest],
+            );
+            affectedOne(res, 'publisher ack');
+          });
+          acked++;
+          continue;
+        }
+        if (TRANSIENT_DECISIONS.has(receipt.decision)) {
+          // (H1) transient NACK → stop; leave the row for a later retry. Never advance.
+          retriable = true;
+          break;
+        }
+        // (H1) terminal NACK → quarantine + halt. Never ACK, never drop.
+        await this.db.transaction(async (exec) => {
+          await assertSerializable(exec);
+          const lease = (await exec.query('SELECT lease_token FROM ha_outbox_publisher_lease WHERE stream_id = $1 FOR UPDATE', [this.streamId])).rows;
+          if (!lease.length || lease[0].lease_token !== leaseToken) throw new ContractValidationError('publisher lease lost — not quarantining');
+          const ins = await exec.query(
+            `INSERT INTO ha_outbox_quarantine (stream_id, source_epoch, sequence, op_digest, decision)
+             VALUES ($1,$2,$3,$4,$5) ON CONFLICT (stream_id, source_epoch, sequence) DO NOTHING`,
+            [this.streamId, sourceEpoch, sequence, storedDigest, receipt.decision],
+          );
+          if (ins.rowCount !== 1 && ins.rowCount !== 0) throw new ContractValidationError('quarantine insert affected unexpected row count');
+          const mark = await exec.query(
+            'UPDATE ha_outbox_rows SET quarantined_at = now() WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3 AND acked_at IS NULL AND quarantined_at IS NULL',
+            [this.streamId, sourceEpoch, sequence],
+          );
+          affectedOne(mark, 'quarantine mark');
+        });
+        quarantined++;
+        break; // divergence on an ordered stream → halt the drain
       }
-      // (3) ACK exactly this row under our claim — short tx, assert 1 row.
-      await this.db.transaction(async (exec) => {
-        await assertSerializable(exec);
-        const res = await exec.query(
-          `UPDATE ha_outbox_rows SET published_at = now(), acked_at = now(), claim_token = NULL
-           WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3
-             AND acked_at IS NULL AND claim_token = $4 AND op_digest = $5`,
-          [this.streamId, sourceEpoch, sequence, claimToken, storedDigest],
-        );
-        affectedOne(res, 'publisher ack');
-      });
-      acked++;
+    } finally {
+      await this.releaseLease(leaseToken);
     }
-    return { published, acked };
+    return { published, acked, quarantined, retriable };
   }
 }
 
