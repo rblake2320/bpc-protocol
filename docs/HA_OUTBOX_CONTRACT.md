@@ -38,10 +38,10 @@ adversarial drill.
 | i | `DurableOutbox.appendInTx` **allocates the sequence inside the tx**, binding allocation + mutation + outbox row atomically. |
 
 ## Genesis / epoch / resync (8)
-Genesis = sequence 0 of a source epoch; first accepted mutation is sequence 1.
+Genesis = sequence 0 of a source epoch and carries NO mutation (a seq-0 mutation digest is rejected); the first mutation is sequence 1.
 A new `sourceEpoch` begins **only** after detected loss/resync; its sequence
 restarts at 0. A gap (received > checkpoint+1) is **never** filled by
-assumption — it forces snapshot + tail resync under a new epoch (`EpochBoundary`).
+assumption — it forces snapshot + tail resync under a governed forward `EpochTransitionRecord` (typed, digested via `epochTransitionDigest`, fenced, forward-only by `toEpochIndex`, binding a `snapshotDigest`).
 
 ## Failure invariants (I1–I9)
 I1 no acknowledged mutation lost · I2 no double apply (HOTP never double-consumed

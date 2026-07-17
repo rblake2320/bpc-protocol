@@ -1,8 +1,8 @@
 {
   "contractVersion": "1",
   "digestDomain": "selfconnect/ha-outbox/v1",
-  "framing": "sha256 over concat u32be(utf8len(field))||utf8(field) for [domain,version,streamId,sourceEpoch,decimal(sequence),decimal(fenceToken),JCS(mutation)]",
-  "canonicalization": "RFC8785 JCS / RFC7493 I-JSON; safe-integer numbers; UTF-16 key order; lone surrogates + symbol keys + accessors rejected; per-string<=65536 total<=1048576 bytes",
+  "framing": "sha256 over concat u32be(utf8len(f))||utf8(f) for [domain,version,streamId,sourceEpoch,decimal(sequence>=1),decimal(fenceToken),JCS(mutation)]",
+  "canonicalization": "RFC8785 JCS / RFC7493 I-JSON; safe-int; UTF-16 key order; reject lone-surrogate/symbol-key/accessor/non-enumerable/array-extra-prop; per-string<=65536 total<=1048576; incremental byte budget",
   "positive": [
     {
       "name": "bpc-pair-set",
@@ -229,7 +229,19 @@
       "name": "sparse",
       "mustReject": true,
       "threw": true,
-      "error": "sparse"
+      "error": "arr-sparse"
+    },
+    {
+      "name": "array-extra-prop",
+      "mustReject": true,
+      "threw": true,
+      "error": "arr-nonindex"
+    },
+    {
+      "name": "getter-prop",
+      "mustReject": true,
+      "threw": true,
+      "error": "accessor"
     },
     {
       "name": "lone-surrogate",
@@ -244,10 +256,10 @@
       "error": "fence"
     },
     {
-      "name": "bad-streamId",
+      "name": "seq0-mutation",
       "mustReject": true,
       "threw": true,
-      "error": "id"
+      "error": "seq"
     },
     {
       "name": "oversized-string",
@@ -261,8 +273,8 @@
     "replacementCharDigest": "32d6c95d3e4b11ff919653493f08b48738ed27f9e8c37fb48a787a566571f0b7"
   },
   "framingNonCollision": {
-    "digestA": "9ebdd3769ef8ad1595ca95b1a37626463396c722c3b6d6ee96cfc67bdb35ad6a",
-    "digestB": "6d8b5d5660ba45abf0139b52378b821248d3d656e651ef7284b1c846509baf8a",
+    "digestA": "56e55b6541a4d9fd15564b08d529553043e52228dd9a0885304b45f52ec558fd",
+    "digestB": "5d2f310bd95a9844627bc7de6dc11cf90e780531a2381fbbabf25f3609f889d8",
     "mustDiffer": true
   },
   "keyOrderInvariant": {
@@ -273,16 +285,21 @@
   "epochTransition": {
     "streamId": "s/v1",
     "fromEpoch": "e1",
+    "fromEpochIndex": 0,
     "toEpoch": "e2",
+    "toEpochIndex": 1,
     "snapshotSequence": 42,
+    "snapshotDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "fenceToken": "9",
-    "expectedDigest": "14bea36aa16791855d77822e409f1aa45066be8b6cb4a51ad1744a53a3beb86c"
+    "expectedDigest": "e94b52c2176189091e9445e479e60c099fdce4d719414bb43540907baac3a943"
   },
   "streamHead": {
     "streamId": "tsk:tumbler:default/v1",
     "sequence": 42,
     "prevHeadDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "opDigest": "29f5bade59a228e0c89b4ccaa9bfe5f1e1f09a65313f9b17789d41aabeff94ab",
-    "expectedDigest": "e2a736adcc928346f21a6ab507b968e566a7b4b5b516c1b3d64382962614f11c"
+    "keyId": "key-1",
+    "alg": "ed25519",
+    "expectedDigest": "0f9453f364c94dac4d8a1decd314871b9b268534f952f1bbac728b51e9fbabb3"
   }
 }

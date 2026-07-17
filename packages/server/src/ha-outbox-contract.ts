@@ -128,46 +128,68 @@ function isPlainObject(v: object): boolean {
 /** Produce the canonical JCS string of an I-JSON value (throws on non-conforming). */
 export function canonicalize(value: unknown): string {
   let nodes = 0;
-  const walk = (v: unknown, depth: number): string => {
+  let bytes = 0; // (8) incremental byte budget — throw mid-walk, never build 640MB.
+  const parts: string[] = [];
+  const push = (s: string): void => {
+    bytes += utf8Len(s);
+    if (bytes > CANON_MAX_TOTAL_BYTES) throw new ContractValidationError('canonical form exceeds CANON_MAX_TOTAL_BYTES');
+    parts.push(s);
+  };
+  const walk = (v: unknown, depth: number): void => {
     if (depth > CANON_MAX_DEPTH) throw new ContractValidationError('max canonicalization depth exceeded');
     if (++nodes > CANON_MAX_NODES) throw new ContractValidationError('max canonicalization node count exceeded');
-    if (v === null) return 'null';
+    if (v === null) return push('null');
     switch (typeof v) {
-      case 'boolean': return v ? 'true' : 'false';
-      case 'number': return jcsNumber(v);
-      case 'string': return jcsString(v);
+      case 'boolean': return push(v ? 'true' : 'false');
+      case 'number': return push(jcsNumber(v));
+      case 'string': return push(jcsString(v));
       case 'undefined': throw new ContractValidationError('undefined is not canonicalizable');
       case 'bigint': throw new ContractValidationError('bigint is not canonicalizable');
       case 'function': throw new ContractValidationError('function is not canonicalizable');
       case 'symbol': throw new ContractValidationError('symbol is not canonicalizable');
     }
     if (Array.isArray(v)) {
-      for (let i = 0; i < v.length; i++) {
-        if (!(i in v)) throw new ContractValidationError('sparse array (hole) is not canonicalizable');
+      // (1)(7) arrays: ONLY exact dense DATA indices + intrinsic length. Reject
+      // holes, accessor indices, and any extra named/symbol own property.
+      if (Object.getOwnPropertySymbols(v).length > 0) throw new ContractValidationError('array with symbol property is not canonicalizable');
+      const names = Object.getOwnPropertyNames(v);
+      let dataIndices = 0;
+      for (const k of names) {
+        if (k === 'length') continue;
+        const idx = Number(k);
+        if (!Number.isInteger(idx) || idx < 0 || String(idx) !== k) throw new ContractValidationError(`array has non-index property '${k}'`);
+        const d = Object.getOwnPropertyDescriptor(v, k)!;
+        if (!('value' in d) || !d.enumerable) throw new ContractValidationError(`array index '${k}' must be an enumerable data property`);
+        dataIndices++;
       }
-      return '[' + v.map((e) => walk(e, depth + 1)).join(',') + ']';
+      if (dataIndices !== v.length) throw new ContractValidationError('array is sparse or has divergent index/length');
+      push('[');
+      for (let i = 0; i < v.length; i++) { if (i) push(','); walk(v[i], depth + 1); }
+      return push(']');
     }
     if (typeof v === 'object') {
       if (!isPlainObject(v)) throw new ContractValidationError('only plain objects are canonicalizable (no Date/Map/Set/class)');
-      // (3) reject own symbol keys and any accessor / non-data properties;
-      // reading a getter would execute code and break determinism.
+      // (3)(7) reject own symbol keys and any accessor / non-enumerable /
+      // non-data property (reading a getter executes code; non-enumerable
+      // props diverge from JSON transport).
       if (Object.getOwnPropertySymbols(v).length > 0) throw new ContractValidationError('symbol keys are not canonicalizable');
       const names = Object.getOwnPropertyNames(v);
       for (const k of names) {
         const d = Object.getOwnPropertyDescriptor(v, k)!;
-        if (!('value' in d)) throw new ContractValidationError(`accessor/non-data property '${k}' is not canonicalizable`);
+        if (!('value' in d)) throw new ContractValidationError(`accessor property '${k}' is not canonicalizable`);
+        if (!d.enumerable) throw new ContractValidationError(`non-enumerable property '${k}' is not canonicalizable`);
         if (k === '__proto__') throw new ContractValidationError('__proto__ key is rejected');
       }
       const obj = v as Record<string, unknown>;
       const keys = names.sort(); // JCS: UTF-16 code-unit order
-      return '{' + keys.map((k) => (assertNoLoneSurrogate(k), jcsString(k) + ':' + walk(obj[k], depth + 1))).join(',') + '}';
+      push('{');
+      keys.forEach((k, i) => { if (i) push(','); assertNoLoneSurrogate(k); push(jcsString(k) + ':'); walk(obj[k], depth + 1); });
+      return push('}');
     }
     throw new ContractValidationError('value is not canonicalizable');
   };
-  const out = walk(value, 0);
-  // (2) total byte bound (per-string bound is enforced in jcsString).
-  if (utf8Len(out) > CANON_MAX_TOTAL_BYTES) throw new ContractValidationError('canonical form exceeds CANON_MAX_TOTAL_BYTES');
-  return out;
+  walk(value, 0);
+  return parts.join('');
 }
 
 // ── (1) Length-prefixed digest framing ───────────────────────────────────────
@@ -208,8 +230,10 @@ export function canonicalOpDigest(input: {
   assertNoLoneSurrogate(input.streamId);
   assertId(input.sourceEpoch, 'sourceEpoch');
   assertNoLoneSurrogate(input.sourceEpoch);
-  if (!Number.isSafeInteger(input.sequence) || input.sequence < 0) {
-    throw new ContractValidationError('sequence must be a non-negative safe integer');
+  // (4) a MUTATION record is sequence >= 1; sequence 0 is the typed genesis of
+  // an epoch and carries no mutation, so it is rejected here.
+  if (!Number.isSafeInteger(input.sequence) || input.sequence < 1) {
+    throw new ContractValidationError('mutation sequence must be a safe integer >= 1 (0 is genesis)');
   }
   assertFenceToken(input.fenceToken);
   const fields = [
@@ -297,44 +321,56 @@ export function assertHeaderConformant(h: OutboxRecordHeader): void {
 export interface EpochTransitionRecord {
   contractVersion: ContractVersion;
   streamId: string;
-  /** epoch being superseded (must be the current durable epoch). */
+  /** epoch being superseded (must equal the current durable epoch). */
   fromEpoch: string;
-  /** new epoch — strictly forward; a receiver rejects a non-forward toEpoch. */
+  /** monotonic index of `fromEpoch` (must equal the current durable index). */
+  fromEpochIndex: number;
+  /** new epoch — MUST differ from fromEpoch. */
   toEpoch: string;
+  /** monotonic index of `toEpoch` — MUST be strictly greater (forward-only). */
+  toEpochIndex: number;
   /** durable snapshot sequence the new epoch's tail continues from. */
   snapshotSequence: number;
+  /** (4) 64-hex digest binding the snapshot state root the new epoch continues. */
+  snapshotDigest: string;
   /** (5) fence token bound into the transition digest. */
   fenceToken: string;
-  /** digest over the above (excluding this field). */
+  /** digest over all of the above (excluding this field). */
   transitionDigest: string;
 }
 
-/** (9) NORMATIVE digest for an epoch transition (same length-prefixed framing). */
+/** (9) NORMATIVE digest for an epoch transition. Binds forward-index + snapshot
+ *  root + fence. Rejects same/backward/arbitrary transitions. */
 export function epochTransitionDigest(input: {
-  streamId: string; fromEpoch: string; toEpoch: string; snapshotSequence: number; fenceToken: string;
+  streamId: string; fromEpoch: string; fromEpochIndex: number; toEpoch: string;
+  toEpochIndex: number; snapshotSequence: number; snapshotDigest: string; fenceToken: string;
 }): string {
   assertId(input.streamId, 'streamId'); assertNoLoneSurrogate(input.streamId);
   assertId(input.fromEpoch, 'fromEpoch'); assertNoLoneSurrogate(input.fromEpoch);
   assertId(input.toEpoch, 'toEpoch'); assertNoLoneSurrogate(input.toEpoch);
-  if (!Number.isSafeInteger(input.snapshotSequence) || input.snapshotSequence < 0) {
-    throw new ContractValidationError('snapshotSequence must be a non-negative safe integer');
-  }
+  if (input.fromEpoch === input.toEpoch) throw new ContractValidationError('epoch transition fromEpoch must differ from toEpoch');
+  if (!Number.isSafeInteger(input.fromEpochIndex) || input.fromEpochIndex < 0) throw new ContractValidationError('fromEpochIndex must be a non-negative safe integer');
+  if (!Number.isSafeInteger(input.toEpochIndex) || input.toEpochIndex <= input.fromEpochIndex) throw new ContractValidationError('toEpochIndex must be strictly greater than fromEpochIndex (forward-only)');
+  if (!Number.isSafeInteger(input.snapshotSequence) || input.snapshotSequence < 0) throw new ContractValidationError('snapshotSequence must be a non-negative safe integer');
+  if (!HEX64.test(input.snapshotDigest)) throw new ContractValidationError('snapshotDigest must be 64 lowercase hex');
   assertFenceToken(input.fenceToken);
   const fields = [
     HA_OUTBOX_DIGEST_DOMAIN + '/epoch-transition',
-    HA_OUTBOX_CONTRACT_VERSION, input.streamId, input.fromEpoch, input.toEpoch,
-    String(input.snapshotSequence), input.fenceToken,
+    HA_OUTBOX_CONTRACT_VERSION, input.streamId, input.fromEpoch, String(input.fromEpochIndex),
+    input.toEpoch, String(input.toEpochIndex), String(input.snapshotSequence),
+    input.snapshotDigest, input.fenceToken,
   ];
   const h = createHash('sha256');
   for (const f of fields) { const b = Buffer.from(f, 'utf8'); h.update(u32be(b.length)); h.update(b); }
   return h.digest('hex');
 }
 
-// ── (7) Backend-bound transaction handle ─────────────────────────────────────
-/** Opaque transaction handle parameterized by a BACKEND brand so a tx obtained
- *  from backend A does not typecheck for backend B. Each backend declares its
- *  own unique brand type; callers cannot forge one. */
-export interface DurableTx<TBackend = unknown> {
+// ── (5)(7) Backend-bound transaction handle (NO default brand) ────────────────
+/** Opaque transaction handle parameterized by a REQUIRED backend brand so a tx
+ *  obtained from backend A does not typecheck for backend B. Each backend
+ *  declares its own unique invariant brand type; callers cannot forge one and
+ *  cannot omit it (no `= unknown` default). */
+export interface DurableTx<TBackend> {
   readonly __backend: TBackend;
 }
 
@@ -373,7 +409,7 @@ export class OutboxBackpressureError extends Error {
  * the bound. Never sheds. The authoritative resource persists+validates the
  * fence token (StaleFenceError).
  */
-export interface DurableOutbox<Raw = unknown, Clean = Raw, TBackend = unknown> {
+export interface DurableOutbox<Raw, Clean, TBackend> {
   readonly sanitizer: MutationSanitizer<Raw, Clean>;
   appendInTx(
     tx: DurableTx<TBackend>,
@@ -396,20 +432,24 @@ export type ReceiverDecision =
   | 'reject-stale' | 'reject-epoch' | 'reject-fence' | 'reject-unsanitized';
 
 /**
- * (3)(10) ONE atomic operation that owns the row LOCK, idempotency check,
- * digest+fence verification, the sanitizer re-check (`assertSanitized` — rejects
- * an unsanitized/secret-bearing record as `reject-unsanitized`), mutation apply,
- * and durable checkpoint advance — all in one transaction. No separate classify.
+ * (3)(6)(10) ONE atomic operation that owns the row LOCK, idempotency check,
+ * digest verification, RECORD-BOUND fence-token validation against the
+ * authoritative persisted token (NO independent token arg — the token is
+ * `record.fenceToken`; a stale one is `reject-fence`), the sanitizer re-check
+ * (`assertSanitized` → `reject-unsanitized`), mutation apply, and durable
+ * checkpoint advance — all in one transaction. No separate classify.
  */
-export interface ReceiverCheckpoint<Clean = unknown, TBackend = unknown> {
+export interface ReceiverCheckpoint<Clean, TBackend> {
   readonly sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'assertSanitized'>;
-  verifyAndApplyInTx(
-    tx: DurableTx<TBackend>,
-    record: OutboxRecord<Clean>,
-    fenceToken: FenceToken,
-  ): Promise<ReceiverDecision>;
-  /** (9) authorized, forward-only epoch transition, atomic under the fence. */
-  transitionEpochInTx(tx: DurableTx<TBackend>, record: EpochTransitionRecord): Promise<void>;
+  verifyAndApplyInTx(tx: DurableTx<TBackend>, record: OutboxRecord<Clean>): Promise<ReceiverDecision>;
+  /**
+   * (9) Authorized, forward-only epoch transition, atomic under the fence.
+   * Idempotent by (streamId, toEpoch): a re-applied record with the SAME
+   * transitionDigest is a no-op; the same toEpoch with a different digest is a
+   * fork (rejected). Rejects unless fromEpoch/fromEpochIndex equals the current
+   * durable epoch and toEpochIndex is strictly greater.
+   */
+  transitionEpochInTx(tx: DurableTx<TBackend>, record: EpochTransitionRecord): Promise<'transitioned' | 'duplicate-ok' | 'reject-fork' | 'reject-stale-epoch' | 'reject-fence'>;
 }
 
 /**
@@ -422,15 +462,45 @@ export interface PromotionFence {
 }
 
 // ── (8) TSK-specific extension (present in both repos; bpc leaves it unused) ──
+/** Signature algorithm identifiers a conforming verifier MUST enumerate. */
+export const STREAM_HEAD_ALGS = ['ed25519', 'ecdsa-p256-sha256'] as const;
+export type StreamHeadAlg = typeof STREAM_HEAD_ALGS[number];
+const KEY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$/;
+
 /** A signed, hash-linked stream head committed atomically with a tumbler
  *  mutation (tsk#10). `prevHeadDigest` links to the previous head; `headDigest`
- *  covers this record; `signature` authenticates it. */
+ *  covers this record incl. keyId+alg; `signature` authenticates it. */
 export interface SignedStreamHead {
   streamId: string;
   sequence: number;
-  prevHeadDigest: string; // 64 hex, or the genesis head
-  headDigest: string;     // 64 hex over (streamId, sequence, prevHeadDigest, opDigest)
-  signature: string;      // detached signature over headDigest (base64url)
+  prevHeadDigest: string;     // 64 hex, or the genesis head
+  /** binds this head to the exact record's opDigest. */
+  opDigest: string;           // 64 hex
+  keyId: string;              // which key signed (policy resolves to material)
+  alg: StreamHeadAlg;         // signature algorithm (enumerated)
+  headDigest: string;         // 64 hex over (streamId, sequence, prevHeadDigest, opDigest, keyId, alg)
+  signature: string;          // detached signature over headDigest (base64url)
+}
+
+/** (3) Verifier policy: resolves keyId→material under an allowed alg and
+ *  verifies the detached signature over `headDigest`. MUST reject unknown
+ *  keyId/alg and any invalid signature; MUST throw (not return true) if the
+ *  policy/key store is unavailable so callers fail closed. */
+export interface StreamHeadVerifier {
+  verify(head: SignedStreamHead): Promise<boolean>;
+}
+
+/** (3) Assert a head binds EXACTLY to a record and is internally consistent
+ *  (digest recomputes, ids/sequence/opDigest match). Does NOT check the
+ *  signature — that is the StreamHeadVerifier's job. */
+export function assertStreamHeadBinds(record: OutboxRecordHeader, head: SignedStreamHead): void {
+  if (head.streamId !== record.streamId) throw new ContractValidationError('stream head streamId != record');
+  if (head.sequence !== record.sequence) throw new ContractValidationError('stream head sequence != record');
+  if (head.opDigest !== record.opDigest) throw new ContractValidationError('stream head opDigest != record');
+  if (!STREAM_HEAD_ALGS.includes(head.alg)) throw new ContractValidationError('unknown stream head alg');
+  if (!KEY_ID_PATTERN.test(head.keyId)) throw new ContractValidationError('invalid keyId');
+  const expect = streamHeadDigest(head);
+  if (head.headDigest !== expect) throw new ContractValidationError('stream head digest mismatch');
 }
 
 /** The tumbler HOTP mutation carries a strictly-increasing counter that MUST
@@ -442,22 +512,30 @@ export interface TskHotpMutation {
 }
 export type HotpMutationSanitizer = MutationSanitizer<TskHotpMutation, TskHotpMutation>;
 
-/** (8) Atomic tumbler apply: verify + consume HOTP counter (reject double-
- *  consume) + append the signed/hash-linked head + advance the durable
- *  checkpoint, ALL in one transaction. */
-export interface TskReceiverCheckpoint<TBackend = unknown>
-  extends ReceiverCheckpoint<TskHotpMutation, TBackend> {
+/**
+ * (2)(8) Tumbler receiver — STANDALONE (does NOT extend the generic
+ * ReceiverCheckpoint, so there is no generic apply path that could bypass the
+ * signed head). The ONLY apply method verifies + consumes the HOTP counter
+ * (reject double-consume), verifies the signed/hash-linked head (binding +
+ * signature), validates the record-bound fence token against the persisted
+ * authoritative token, applies the mutation, and advances the checkpoint —
+ * ALL in one transaction.
+ */
+export interface TskReceiverCheckpoint<TBackend> {
+  readonly sanitizer: Pick<HotpMutationSanitizer, 'assertSanitized'>;
+  readonly headVerifier: StreamHeadVerifier;
   verifyAndApplyTumblerInTx(
     tx: DurableTx<TBackend>,
     record: OutboxRecord<TskHotpMutation>,
     head: SignedStreamHead,
-    fenceToken: FenceToken,
   ): Promise<ReceiverDecision>;
+  transitionEpochInTx(tx: DurableTx<TBackend>, record: EpochTransitionRecord): Promise<'transitioned' | 'duplicate-ok' | 'reject-fork' | 'reject-stale-epoch' | 'reject-fence'>;
 }
 
-/** (8) NORMATIVE head digest for the signed/hash-linked stream head. */
+/** (8) NORMATIVE head digest — binds keyId + alg so a head cannot be re-signed
+ *  under a different key/alg without changing the digest. */
 export function streamHeadDigest(input: {
-  streamId: string; sequence: number; prevHeadDigest: string; opDigest: string;
+  streamId: string; sequence: number; prevHeadDigest: string; opDigest: string; keyId: string; alg: StreamHeadAlg;
 }): string {
   assertId(input.streamId, 'streamId'); assertNoLoneSurrogate(input.streamId);
   if (!Number.isSafeInteger(input.sequence) || input.sequence < 0) {
@@ -465,10 +543,12 @@ export function streamHeadDigest(input: {
   }
   if (!HEX64.test(input.prevHeadDigest)) throw new ContractValidationError('prevHeadDigest must be 64 lowercase hex');
   if (!HEX64.test(input.opDigest)) throw new ContractValidationError('opDigest must be 64 lowercase hex');
+  if (!KEY_ID_PATTERN.test(input.keyId)) throw new ContractValidationError('invalid keyId');
+  if (!STREAM_HEAD_ALGS.includes(input.alg)) throw new ContractValidationError('unknown alg');
   const fields = [
     HA_OUTBOX_DIGEST_DOMAIN + '/tsk-stream-head',
     HA_OUTBOX_CONTRACT_VERSION, input.streamId, String(input.sequence),
-    input.prevHeadDigest, input.opDigest,
+    input.prevHeadDigest, input.opDigest, input.keyId, input.alg,
   ];
   const h = createHash('sha256');
   for (const f of fields) { const b = Buffer.from(f, 'utf8'); h.update(u32be(b.length)); h.update(b); }
