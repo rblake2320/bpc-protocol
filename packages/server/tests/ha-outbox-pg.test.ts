@@ -320,13 +320,16 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 class GatedPg implements PgTransactor {
   executed: string[] = [];
   committed: boolean | null = null;
+  discarded = false;
   insertRan = false;
   gateOn: string | null = null;
+  rejectOn: string | null = null;
   gate = deferred();
   async transaction<T>(fn: (exec: PgExecutor) => Promise<T>): Promise<T> {
     const exec: PgExecutor = {
       query: async (sql: string) => {
         this.executed.push(sql);
+        if (this.rejectOn && sql.includes(this.rejectOn)) throw new Error('injected query failure');
         if (this.gateOn && sql.includes(this.gateOn)) await this.gate.promise;
         const out = (rows: Record<string, unknown>[], rc?: number) => ({ rows, rowCount: rc ?? rows.length });
         if (sql.includes('SHOW transaction_isolation')) return out([{ transaction_isolation: 'serializable' }]);
@@ -341,7 +344,7 @@ class GatedPg implements PgTransactor {
       },
     };
     try { const r = await fn(exec); this.committed = true; return r; }
-    catch (e) { this.committed = false; throw e; }
+    catch (e) { this.committed = false; this.discarded = true; throw e; } // (R12) discard the connection on error
   }
 }
 const gatedOutbox = (db: GatedPg) => new PgDurableOutbox<Raw, Clean>(db, __unsafeMintReadyTokenForTests(db, 'public'), { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'quarantine' });
@@ -387,5 +390,22 @@ describe('(R11) capability-scoped executor / structured scope', () => {
     expect(h.sequence).toBe(1);
     expect(db.insertRan).toBe(true);
     expect(db.committed).toBe(true);
+  });
+
+  it('(e) a NEVER-RESOLVING query is bounded by the scope deadline; the tx rolls back and the connection is discarded', async () => {
+    const db = new GatedPg(); db.gateOn = 'FROM ha_outbox_fence'; // gate is never resolved
+    const outbox = new PgDurableOutbox<Raw, Clean>(db, __unsafeMintReadyTokenForTests(db, 'public'), { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'quarantine', scopeDeadlineMs: 50 });
+    const p = outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'x' }, fenceToken: 0n }));
+    await expect(p).rejects.toThrow(/deadline/);
+    expect(db.committed).toBe(false);   // never committed
+    expect(db.discarded).toBe(true);    // connection discarded, not reused
+  });
+
+  it('(f) a FAST unawaited REJECTION is retained and fails the scope (not lost); the tx rolls back', async () => {
+    const db = new GatedPg(); db.rejectOn = 'INSERT INTO ha_outbox_rows';
+    const outbox = gatedOutbox(db);
+    const p = outbox.withOutboxTx(async (_tx, scoped) => { void scoped.query('INSERT INTO ha_outbox_rows (stream_id) VALUES ($1)', ['x']).catch(() => {}); return 'x'; });
+    await expect(p).rejects.toThrow(/rejected — rolling back|in-flight|scope/);
+    expect(db.committed).toBe(false);   // the fast rejection was observed -> rollback, not a false commit
   });
 });

@@ -84,24 +84,32 @@ class EvilDefaultPg implements PgTransactor {
   }
 }
 
+// (R12) A conforming transactor: bounds queries (statement_timeout), VERIFIES the
+// COMMIT command tag (an aborted tx silently turns COMMIT into ROLLBACK), and
+// DISCARDS the connection on any error/timeout so a poisoned connection is never
+// reused. (A production impl would also set a socket-level timeout.)
 class RealPg implements PgTransactor {
   constructor(private readonly level: 'SERIALIZABLE' | 'READ COMMITTED') {}
   async transaction<T>(fn: (exec: PgExecutor) => Promise<T>): Promise<T> {
     for (let attempt = 0; ; attempt++) {
       const client = await pool.connect();
+      let errored = false;
       try {
         await client.query(`BEGIN ISOLATION LEVEL ${this.level}`);
+        await client.query("SET LOCAL statement_timeout = '30000'"); // bound queries at the connection layer
         const exec: PgExecutor = { query: async (sql, params) => { const r = await client.query(sql, params as unknown[]); return { rows: r.rows, rowCount: r.rowCount ?? 0 }; } };
         const result = await fn(exec);
-        await client.query('COMMIT');
+        const c = await client.query('COMMIT');
+        if ((c as { command?: string }).command !== 'COMMIT') { errored = true; throw new Error(`COMMIT did not commit (aborted tx -> ${(c as { command?: string }).command})`); }
         return result;
       } catch (e) {
+        errored = true;
         await client.query('ROLLBACK').catch(() => {});
         const code = (e as { code?: string }).code;
-        if ((code === '40001' || code === '40P01') && attempt < 50) continue; // finally releases
+        if ((code === '40001' || code === '40P01') && attempt < 50) continue; // finally discards; loop retries with a fresh client
         throw e;
       } finally {
-        client.release();
+        client.release(errored ? new Error('discard poisoned connection') : undefined);
       }
     }
   }
