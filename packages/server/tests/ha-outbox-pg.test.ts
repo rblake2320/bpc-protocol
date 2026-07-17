@@ -47,7 +47,7 @@ class MemoryPg implements PgTransactor {
   private clone(s: State): State {
     return { fence: new Map(s.fence), src: new Map([...s.src].map(([k, v]) => [k, { ...v }])), rcv: new Map([...s.rcv].map(([k, v]) => [k, { ...v }])), rows: s.rows.map((r) => ({ ...r })), applied: s.applied.map((a) => ({ ...a })), lease: new Map([...s.lease].map(([k, v]) => [k, { ...v }])), quar: s.quar.map((q) => ({ ...q })), version: s.version };
   }
-  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>): Promise<T> {
+  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>, _opts?: { signal?: AbortSignal }): Promise<T> {
     const work = this.clone(this.state);
     const result = await fn(makeExec(work, this.isolation));
     if (this.crashBeforeCommit) { this.crashBeforeCommit = false; throw new Error('crash before commit'); }
@@ -325,12 +325,20 @@ class GatedPg implements PgTransactor {
   gateOn: string | null = null;
   rejectOn: string | null = null;
   gate = deferred();
-  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>): Promise<T> {
+  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>, opts?: { signal?: AbortSignal }): Promise<T> {
+    const signal = opts?.signal;
     const exec: PgExecutor = {
       query: async (sql: string) => {
         this.executed.push(sql);
         if (this.rejectOn && sql.includes(this.rejectOn)) throw new Error('injected query failure');
-        if (this.gateOn && sql.includes(this.gateOn)) await this.gate.promise;
+        if (this.gateOn && sql.includes(this.gateOn)) {
+          // honor the abort signal: on deadline the transactor cancels the query
+          await new Promise<void>((resolve, reject) => {
+            if (signal?.aborted) return reject(signal.reason as Error);
+            signal?.addEventListener('abort', () => reject(signal.reason as Error), { once: true });
+            this.gate.promise.then(resolve);
+          });
+        }
         const out = (rows: Record<string, unknown>[], rc?: number) => ({ rows, rowCount: rc ?? rows.length });
         if (sql.includes('SHOW transaction_isolation')) return out([{ transaction_isolation: 'serializable' }]);
         if (sql.includes('set_config')) return out([{ set_config: 'public' }]);
@@ -407,5 +415,22 @@ describe('(R11) capability-scoped executor / structured scope', () => {
     const p = outbox.withOutboxTx(async (_tx, scoped) => { void scoped.query('INSERT INTO ha_outbox_rows (stream_id) VALUES ($1)', ['x']).catch(() => {}); return 'x'; });
     await expect(p).rejects.toThrow(/rejected — rolling back|in-flight|scope/);
     expect(db.committed).toBe(false);   // the fast rejection was observed -> rollback, not a false commit
+  });
+
+  it('(g/R13) the deadline covers enterCriticalTx: a hung isolation/pin query is bounded', async () => {
+    const db = new GatedPg(); db.gateOn = 'SHOW transaction_isolation'; // the FIRST critical query, before any bound-tx work
+    const outbox = new PgDurableOutbox<Raw, Clean>(db, __unsafeMintReadyTokenForTests(db, 'public'), { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'quarantine', scopeDeadlineMs: 50 });
+    const p = outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'x' }, fenceToken: 0n }));
+    await expect(p).rejects.toThrow(/deadline/);
+    expect(db.committed).toBe(false);
+    expect(db.discarded).toBe(true);
+  });
+
+  it('(h/R13/MED) scopeDeadlineMs is centrally validated (finite integer, 1..2^31-1) for outbox AND receiver', async () => {
+    const db = new GatedPg(); const ready = __unsafeMintReadyTokenForTests(db, 'public');
+    for (const bad of [0, -1, 1.5, 2_147_483_648, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => new PgDurableOutbox<Raw, Clean>(db, ready, { streamId: SID, sanitizer, maxPendingRows: 1, backpressure: 'quarantine', scopeDeadlineMs: bad })).toThrow(/scopeDeadlineMs/);
+      expect(() => new PgReceiverCheckpoint<Clean>(db, SID, sanitizer, applier, ready, undefined, bad)).toThrow(/scopeDeadlineMs/);
+    }
   });
 });

@@ -84,15 +84,22 @@ class EvilDefaultPg implements PgTransactor {
   }
 }
 
-// (R12) A conforming transactor: bounds queries (statement_timeout), VERIFIES the
-// COMMIT command tag (an aborted tx silently turns COMMIT into ROLLBACK), and
-// DISCARDS the connection on any error/timeout so a poisoned connection is never
-// reused. (A production impl would also set a socket-level timeout.)
+// (R12/R13) A conforming transactor: bounds queries (statement_timeout), VERIFIES
+// the COMMIT command tag (an aborted tx silently turns COMMIT into ROLLBACK),
+// HONORS opts.signal (on abort it DESTROYS the connection immediately — closing
+// the socket breaks a hung in-flight query — instead of unbounded-awaiting
+// ROLLBACK), and DISCARDS the connection on any error/timeout so a poisoned
+// connection is never reused. (A production impl would also issue a PostgreSQL
+// CancelRequest on a side connection and set a socket-level timeout.)
 class RealPg implements PgTransactor {
   constructor(private readonly level: 'SERIALIZABLE' | 'READ COMMITTED') {}
-  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>): Promise<T> {
+  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>, opts?: { signal?: AbortSignal }): Promise<T> {
+    const signal = opts?.signal;
     for (let attempt = 0; ; attempt++) {
       const client = await pool.connect();
+      let released = false;
+      const discard = () => { if (!released) { released = true; try { client.release(new Error('discard poisoned/aborted connection')); } catch { /* already gone */ } } };
+      if (signal) { if (signal.aborted) discard(); else signal.addEventListener('abort', discard, { once: true }); }
       let errored = false;
       try {
         await client.query(`BEGIN ISOLATION LEVEL ${this.level}`);
@@ -104,12 +111,14 @@ class RealPg implements PgTransactor {
         return result;
       } catch (e) {
         errored = true;
-        await client.query('ROLLBACK').catch(() => {});
+        // bounded rollback — never unbounded-await ROLLBACK on a hung/aborted connection
+        await Promise.race([client.query('ROLLBACK').catch(() => {}), new Promise((r) => setTimeout(r, 1000))]);
         const code = (e as { code?: string }).code;
-        if ((code === '40001' || code === '40P01') && attempt < 50) continue; // finally discards; loop retries with a fresh client
+        if ((code === '40001' || code === '40P01') && attempt < 50) { discard(); continue; }
         throw e;
       } finally {
-        client.release(errored ? new Error('discard poisoned connection') : undefined);
+        if (signal) signal.removeEventListener('abort', discard);
+        if (errored) discard(); else if (!released) { released = true; client.release(); }
       }
     }
   }

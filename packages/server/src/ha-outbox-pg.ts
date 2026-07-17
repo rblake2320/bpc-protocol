@@ -79,10 +79,13 @@ export interface PgExecutor {
  *    `ROLLBACK` — an aborted tx turns COMMIT into a silent rollback) and surface a
  *    failure if it did not;
  *  - DISCARD (not reuse/return to the pool) any connection whose tx errored, timed
- *    out, or failed to commit, so a poisoned/hung connection is never reused.
+ *    out, or failed to commit, so a poisoned/hung connection is never reused;
+ *  - HONOR `opts.signal`: on abort, CANCEL the in-flight query (e.g. a PostgreSQL
+ *    CancelRequest) and DESTROY the connection promptly WITHOUT unbounded-awaiting
+ *    ROLLBACK — the server aborts the tx when the connection drops.
  */
 export interface PgTransactor {
-  transaction<T>(fn: (exec: PgExecutor) => Promise<T>): Promise<T>;
+  transaction<T>(fn: (exec: PgExecutor) => Promise<T>, opts?: { signal?: AbortSignal }): Promise<T>;
 }
 
 // The opaque DurableTx carries no public members; its executor AND the identity
@@ -112,22 +115,45 @@ function execOfBound(tx: PgTx, db: PgTransactor, schema: string): PgExecutor {
   return st.scoped;
 }
 
-/** Default upper bound on a single bound-tx scope (body + drain). A transactor
- *  should ALSO bound queries at the connection layer (statement/socket timeout)
- *  and discard a connection on error; this deadline guarantees the mechanism
- *  layer never pins a tx indefinitely even if a query never resolves. */
+/** Default upper bound on a single transaction scope. */
 const DEFAULT_SCOPE_DEADLINE_MS = 30_000;
+/** setTimeout clamps delays above this (~24.8 days) to ~1ms, silently defeating a
+ *  deadline; reject any value outside a finite 1..2^31-1 ms integer. */
+const MAX_TIMER_MS = 2_147_483_647;
 
-/** A rejecting deadline promise + a canceller (so the timer never leaks). */
-function scopeDeadline(ms: number): { promise: Promise<never>; cancel: () => void } {
+function validateDeadlineMs(ms: number, label: string): number {
+  if (!Number.isInteger(ms) || ms < 1 || ms > MAX_TIMER_MS) {
+    throw new ContractValidationError(`${label} must be an integer in [1, ${MAX_TIMER_MS}] ms`);
+  }
+  return ms;
+}
+
+/**
+ * (R12/R13) Run `run(signal)` under a bounded scope deadline. On timeout the
+ * AbortController is aborted — so a conforming `PgTransactor` (which receives the
+ * signal) can CANCEL the in-flight query and DESTROY the connection — AND the
+ * returned promise rejects promptly (the mechanism layer never awaits a hung
+ * connection). The timer is always cleared.
+ *
+ * BOUNDARY: this bounds the MECHANISM's await and signals abort. End-to-end
+ * availability under a network-hung connection depends on the transactor honoring
+ * the signal (cancel + destroy). This slice ships the contract + signal, not a
+ * production driver, so availability under partition remains an OPEN item (with
+ * #16), not a closed guarantee.
+ */
+function runScoped<T>(ms: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout>;
-  const promise = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new ContractValidationError(`DurableTx scope deadline exceeded (${ms}ms) — rolling back; the transactor must discard this connection`)),
-      ms,
-    );
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new ContractValidationError(`transaction scope deadline exceeded (${ms}ms) — aborting; the transactor must cancel the in-flight query and discard this connection`);
+      controller.abort(err);
+      reject(err);
+    }, ms);
   });
-  return { promise, cancel: () => clearTimeout(timer) };
+  const p = run(controller.signal);
+  p.catch(() => {}); // if the deadline wins the race, swallow p's late settlement
+  return Promise.race([p, deadline]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -151,7 +177,6 @@ async function withBoundTx<T>(
   exec: PgExecutor,
   db: PgTransactor,
   schema: string,
-  deadlineMs: number,
   body: (tx: PgTx, scoped: PgExecutor) => Promise<T>,
 ): Promise<T> {
   const tx = Object.freeze({}) as unknown as PgTx;
@@ -177,25 +202,22 @@ async function withBoundTx<T>(
     },
   };
   TX_STATE.set(tx as unknown as object, { db, schema, scoped });
-  const dl = scopeDeadline(deadlineMs);
-  const run = (async () => {
+  try {
     const result = await body(tx, scoped);
     closing = true; // deny any NEW query from here
     // SNAPSHOT before draining: any query still running when body returned was
     // launched-but-not-awaited by body — unsafe, must roll back (R11). A query the
     // body properly awaited has already settled, so it is not counted here.
     const hadUnawaitedInFlight = pending > 0;
-    await Promise.allSettled(settlements); // drain launched queries (bounded by the deadline race)
+    // Drain launched queries. If one never settles, the OUTER runScoped deadline
+    // fires, aborts the signal, the transactor destroys the connection, the hung
+    // query rejects, and this settles — the mechanism never awaits unboundedly.
+    await Promise.allSettled(settlements);
     if (rejectionSeen) throw new ContractValidationError(`a query launched in this DurableTx scope rejected — rolling back: ${String((firstRejection as { message?: string })?.message ?? firstRejection)}`);
     if (hadUnawaitedInFlight) throw new ContractValidationError('DurableTx scope ended with unawaited in-flight queries — rolling back');
     return result;
-  })();
-  run.catch(() => {}); // if the deadline wins the race, swallow run's late settlement
-  try {
-    return await Promise.race([run, dl.promise]);
   } finally {
     closing = true;
-    dl.cancel();
     TX_STATE.delete(tx as unknown as object); // revoke — no use after this scope
   }
 }
@@ -606,21 +628,22 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
     if (!Number.isSafeInteger(opts.maxPendingRows) || opts.maxPendingRows <= 0) {
       throw new ContractValidationError('maxPendingRows must be a positive safe integer');
     }
-    this.scopeDeadlineMs = opts.scopeDeadlineMs ?? DEFAULT_SCOPE_DEADLINE_MS;
-    if (!Number.isSafeInteger(this.scopeDeadlineMs) || this.scopeDeadlineMs <= 0) throw new ContractValidationError('scopeDeadlineMs must be a positive safe integer');
+    this.scopeDeadlineMs = validateDeadlineMs(opts.scopeDeadlineMs ?? DEFAULT_SCOPE_DEADLINE_MS, 'scopeDeadlineMs');
     this.schema = requireReady(ready, db); // (R8) reject a forged/foreign-db token
     this.sanitizer = opts.sanitizer;
   }
 
   /** Open a durable tx and run `fn` with the bound handle. The caller performs
-   *  its authoritative mutation and `appendInTx` inside `fn`; both commit atomically. */
+   *  its authoritative mutation and `appendInTx` inside `fn`; both commit atomically.
+   *  (R13) The deadline wraps the WHOLE transaction — including enterCriticalTx —
+   *  and aborts the transactor's signal on timeout. */
   async withOutboxTx<T>(fn: (tx: PgTx, exec: PgExecutor) => Promise<T>): Promise<T> {
-    return this.db.transaction(async (exec) => {
+    return runScoped(this.scopeDeadlineMs, (signal) => this.db.transaction(async (exec) => {
       await enterCriticalTx(exec, this.schema);
       // hand the caller ONLY the capability-scoped proxy (never the raw exec), so
       // their own mutations are also liveness-checked and drained/rolled back.
-      return withBoundTx(exec, this.db, this.schema, this.scopeDeadlineMs, (tx, scoped) => fn(tx, scoped));
-    });
+      return withBoundTx(exec, this.db, this.schema, (tx, scoped) => fn(tx, scoped));
+    }, { signal }));
   }
 
   async appendInTx(
@@ -923,14 +946,16 @@ export class PgReceiverCheckpoint<Clean> implements ReceiverCheckpoint<Clean, Pg
     private readonly applier: MutationApplier<Clean>,
     ready: SchemaReadyToken,
     epochAuthorizer: EpochTransitionAuthorizer = { async authorizeTransition() { throw new ContractValidationError('epoch transition not authorized in this slice'); } },
-    private readonly scopeDeadlineMs: number = DEFAULT_SCOPE_DEADLINE_MS,
-  ) { this.schema = requireReady(ready, db); this.sanitizer = sanitizer; this.epochAuthorizer = epochAuthorizer; }
+    scopeDeadlineMs: number = DEFAULT_SCOPE_DEADLINE_MS,
+  ) { this.schema = requireReady(ready, db); this.sanitizer = sanitizer; this.epochAuthorizer = epochAuthorizer; this.scopeDeadlineMs = validateDeadlineMs(scopeDeadlineMs, 'scopeDeadlineMs'); }
+  private readonly scopeDeadlineMs: number;
 
   /** (R9) The safe public entry: opens the receiver's OWN serializable tx on its
    *  OWN (token-bound) transactor and applies. No external tx/executor can be
-   *  injected, so a record can never be applied against a foreign database. */
+   *  injected, so a record can never be applied against a foreign database.
+   *  (R13) deadline-bounded + abort-signalled over the whole tx. */
   async verifyAndApplyDelivered(record: OutboxRecord<Clean>): Promise<ReceiverDecision> {
-    return this.db.transaction((exec) => withBoundTx(exec, this.db, this.schema, this.scopeDeadlineMs, (tx) => this.verifyAndApplyInTx(tx, record)));
+    return runScoped(this.scopeDeadlineMs, (signal) => this.db.transaction((exec) => withBoundTx(exec, this.db, this.schema, (tx) => this.verifyAndApplyInTx(tx, record)), { signal }));
   }
 
   async verifyAndApplyInTx(tx: PgTx, record: OutboxRecord<Clean>): Promise<ReceiverDecision> {
