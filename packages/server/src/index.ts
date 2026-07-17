@@ -87,16 +87,27 @@ export type {
   RedisContinuityOptions,
 } from './redis-continuity.js';
 export {
+  CANON_MAX_DEPTH,
+  CANON_MAX_NODES,
+  ContractValidationError,
   HA_OUTBOX_CONTRACT_VERSION,
   HA_OUTBOX_DIGEST_DOMAIN,
-  canonicalJSON,
+  ID_PATTERN,
+  OutboxBackpressureError,
+  StaleFenceError,
+  assertHeaderConformant,
   canonicalOpDigest,
+  canonicalize,
   idempotencyKeyOf,
 } from './ha-outbox-contract.js';
 export type {
+  ContractVersion,
   DurableOutbox,
   DurableTx,
+  EpochBoundary,
+  FenceToken,
   IdempotencyKey,
+  MutationSanitizer,
   OutboxPublisher,
   OutboxRecord,
   OutboxRecordHeader,
@@ -104,6 +115,7 @@ export type {
   PublisherBackpressure,
   ReceiverCheckpoint,
   ReceiverDecision,
+  SanitizedMutation,
 } from './ha-outbox-contract.js';
 export {
   RedisContinuityConfigurationError,
