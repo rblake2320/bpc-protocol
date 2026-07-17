@@ -16,7 +16,7 @@
  * gated on a live server). Issue #16 stays OPEN until the two-node
  * PostgreSQL(+Redis) failover/split-brain drill passes with recorded RPO/RTO.
  */
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
   ContractValidationError,
   OutboxBackpressureError,
@@ -202,21 +202,67 @@ CREATE TABLE IF NOT EXISTS ha_outbox_applied (
   op_digest     text NOT NULL CHECK (op_digest ~ '^[0-9a-f]{64}$'),
   PRIMARY KEY (stream_id, source_epoch, sequence)
 );
--- Version stamp runs LAST, after every table exists. Stamp v2 ONLY on a
--- genuinely fresh schema: meta empty AND the v2-specific structures
--- (quarantined_at column, publisher-lease table) present. Never auto-bumps an
--- existing meta row (ON CONFLICT DO NOTHING) and never stamps an OLD layout that
--- predates these structures (CREATE IF NOT EXISTS does not add missing columns),
--- so applying this DDL over a v1 database leaves it UN-stamped and
--- assertSchemaVersion fails. Advancing an existing install is the explicit
--- migrateSchemaToCurrent path.
-INSERT INTO ha_outbox_meta (id, schema_version)
-SELECT 1, ${HA_OUTBOX_SCHEMA_VERSION}
-WHERE NOT EXISTS (SELECT 1 FROM ha_outbox_meta)
-  AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'ha_outbox_rows' AND column_name = 'quarantined_at')
-  AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'ha_outbox_publisher_lease')
-ON CONFLICT (id) DO NOTHING;
+-- NOTE: the DDL NEVER stamps the version. Stamping happens only through
+-- provisionSchemaVersion() / migrateSchemaToCurrent(), each of which runs a full
+-- catalog attestation (attestSchema) in the SAME serializable tx first, so a
+-- malformed/partial/foreign-schema layout can never be labelled a valid version.
 `;
+
+/** Tables that make up the HA-outbox schema (attestation scope). */
+const HA_OUTBOX_TABLES = [
+  'ha_outbox_meta', 'ha_outbox_fence', 'ha_outbox_source_checkpoint',
+  'ha_outbox_receiver_checkpoint', 'ha_outbox_rows', 'ha_outbox_publisher_lease',
+  'ha_outbox_quarantine', 'ha_outbox_applied',
+] as const;
+
+/**
+ * (R5/HIGH) Pinned manifest of the EXACT expected schema in the CURRENT schema:
+ * every table's columns (name, type, nullability, default), every PK/CHECK/
+ * unique/FK constraint definition, and every index definition. Computed over a
+ * known-good v2 provisioning and constant-time compared at attestation. Any
+ * deviation — a missing/altered column, a weakened/removed CHECK, a wrong PK, a
+ * missing/wrong partial index, or same-named objects in a different schema —
+ * changes the digest and fails closed. PostgreSQL-major-version specific (catalog
+ * rendering): a supported-PG bump requires recomputing this via schemaManifest().
+ */
+export const HA_OUTBOX_SCHEMA_MANIFEST = '19a34450ba8312a54e87ef22f04c524caad255fcca13b7026be9a2e552631218';
+
+/** Canonical fingerprint of the live schema in `current_schema()`. Deterministic
+ *  (no oids/timestamps); identical normalization to the pinned manifest. */
+export async function schemaManifest(exec: PgExecutor): Promise<string> {
+  const tables = HA_OUTBOX_TABLES as unknown as string[];
+  const cols = (await exec.query(
+    `SELECT table_name, column_name, udt_name, is_nullable, coalesce(column_default, '') AS cd
+     FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ANY($1)`,
+    [tables],
+  )).rows;
+  const cons = (await exec.query(
+    `SELECT rel.relname AS t, c.contype, pg_get_constraintdef(c.oid) AS def
+     FROM pg_constraint c JOIN pg_class rel ON rel.oid = c.conrelid JOIN pg_namespace n ON n.oid = rel.relnamespace
+     WHERE n.nspname = current_schema() AND rel.relname = ANY($1) AND c.contype IN ('p','c','u','f')`,
+    [tables],
+  )).rows;
+  const idx = (await exec.query(
+    `SELECT tablename AS t, indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema() AND tablename = ANY($1)`,
+    [tables],
+  )).rows;
+  const stripSchema = (s: string) => s.replace(/ ON \w+\./, ' ON ');
+  const parts: string[] = [];
+  for (const r of cols) parts.push(`COL|${r.table_name}|${r.column_name}|${r.udt_name}|${r.is_nullable}|${r.cd}`);
+  for (const r of cons) parts.push(`CON|${r.t}|${r.contype}|${r.def}`);
+  for (const r of idx) parts.push(`IDX|${r.t}|${r.indexname}|${stripSchema(String(r.indexdef))}`);
+  parts.sort();
+  return createHash('sha256').update(parts.join('\n'), 'utf8').digest('hex');
+}
+
+/** (R5/HIGH) Attest the live schema exactly matches the pinned manifest, or fail
+ *  closed. Scoped to current_schema() (no cross-schema same-name spoof). */
+export async function attestSchema(exec: PgExecutor): Promise<void> {
+  const found = await schemaManifest(exec);
+  if (!digestEquals(found, HA_OUTBOX_SCHEMA_MANIFEST)) {
+    throw new ContractValidationError('ha_outbox schema attestation failed: live catalog does not match the expected manifest');
+  }
+}
 
 /** (MED) Fail closed unless the live schema matches the version this build
  *  expects. Prevents running new code against an un-migrated database. */
@@ -228,20 +274,35 @@ export async function assertSchemaVersion(db: PgTransactor): Promise<void> {
 }
 
 /**
- * (R4/HIGH) EXPLICIT version advance — the ONLY path that may bump an existing
- * meta row. Applying the DDL never advances an existing install; advancing
- * requires this migration, which first validates the v2 structures are present
- * (a structural migration must have added them) and only then, atomically under
- * SERIALIZABLE, sets the version. A caller that runs this against an old layout
- * without the v2 structures is rejected — the version can never race ahead of
- * the actual columns/constraints.
+ * (R5/HIGH) FRESH provisioning: stamp the current version ONLY on a genuinely
+ * fresh, fully-attested schema — full catalog attestation THEN a stamp that
+ * inserts a meta row only if none exists, all in one serializable tx. Never
+ * bumps an existing meta row; never stamps a malformed/partial/foreign layout.
+ */
+export async function provisionSchemaVersion(db: PgTransactor): Promise<void> {
+  await db.transaction(async (exec) => {
+    await assertSerializable(exec);
+    await attestSchema(exec);
+    await exec.query(
+      `INSERT INTO ha_outbox_meta (id, schema_version)
+       SELECT 1, ${HA_OUTBOX_SCHEMA_VERSION} WHERE NOT EXISTS (SELECT 1 FROM ha_outbox_meta)
+       ON CONFLICT (id) DO NOTHING`,
+    );
+  });
+}
+
+/**
+ * (R4/R5/HIGH) EXPLICIT version advance — the ONLY path that may bump an existing
+ * meta row. Runs a FULL catalog attestation (attestSchema) in the SAME
+ * serializable tx and only then advances the version. A malformed/partial/
+ * foreign-schema layout — even one that superficially has the right column names
+ * or a same-named table in another schema — fails attestation and the version
+ * can never race ahead of the actual columns/constraints/indexes.
  */
 export async function migrateSchemaToCurrent(db: PgTransactor): Promise<void> {
   await db.transaction(async (exec) => {
     await assertSerializable(exec);
-    const col = (await exec.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'ha_outbox_rows' AND column_name = 'quarantined_at'")).rows;
-    const lease = (await exec.query("SELECT 1 FROM information_schema.tables WHERE table_name = 'ha_outbox_publisher_lease'")).rows;
-    if (!col.length || !lease.length) throw new ContractValidationError('cannot advance schema version: v2 structures are not present (run the structural migration first)');
+    await attestSchema(exec);
     const res = await exec.query(
       `INSERT INTO ha_outbox_meta (id, schema_version) VALUES (1, ${HA_OUTBOX_SCHEMA_VERSION})
        ON CONFLICT (id) DO UPDATE SET schema_version = EXCLUDED.schema_version`,
@@ -527,7 +588,17 @@ export class PgDurablePublisher<Clean> {
              VALUES ($1,$2,$3,$4,$5) ON CONFLICT (stream_id, source_epoch, sequence) DO NOTHING`,
             [this.streamId, sourceEpoch, sequence, storedDigest, receipt.decision],
           );
-          if (ins.rowCount !== 1 && ins.rowCount !== 0) throw new ContractValidationError('quarantine insert affected unexpected row count');
+          if (ins.rowCount === 0) {
+            // (R5/HIGH2) a preexisting quarantine row must EXACTLY match this record's
+            // digest + decision — a planted/lying row cannot stand in for real evidence.
+            const ex = (await exec.query('SELECT op_digest, decision FROM ha_outbox_quarantine WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3 FOR UPDATE', [this.streamId, sourceEpoch, sequence])).rows;
+            if (!ex.length) throw new ContractValidationError('quarantine conflict without an existing row');
+            if (!digestEquals(String(ex[0].op_digest), storedDigest) || String(ex[0].decision) !== receipt.decision) {
+              throw new ContractValidationError('quarantine record conflict: existing digest/decision differ from this record');
+            }
+          } else if (ins.rowCount !== 1) {
+            throw new ContractValidationError('quarantine insert affected unexpected row count');
+          }
           const mark = await exec.query(
             'UPDATE ha_outbox_rows SET quarantined_at = now() WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3 AND acked_at IS NULL AND quarantined_at IS NULL',
             [this.streamId, sourceEpoch, sequence],

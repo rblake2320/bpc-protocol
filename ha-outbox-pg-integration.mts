@@ -26,15 +26,19 @@ import assert from 'node:assert/strict';
 import pg from 'pg';
 import {
   HA_OUTBOX_PG_SCHEMA,
+  HA_OUTBOX_SCHEMA_MANIFEST,
   HA_OUTBOX_SCHEMA_VERSION,
   PgDurableOutbox,
   PgDurablePublisher,
   PgReceiverCheckpoint,
   assertSchemaVersion,
+  attestSchema,
   canonicalOpDigest,
   ContractValidationError,
   createBoundTx,
   migrateSchemaToCurrent,
+  provisionSchemaVersion,
+  schemaManifest,
 } from './packages/server/src/index.ts';
 import type {
   AckReceipt,
@@ -97,9 +101,14 @@ const verifier: AckReceiptVerifier = {
 };
 const mkOutbox = (db: PgTransactor, streamId: string) => new PgDurableOutbox<Raw, Clean>(db, { streamId, sanitizer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' });
 
-async function resetSchema(): Promise<void> {
-  await pool.query('DROP TABLE IF EXISTS ha_outbox_rows, ha_outbox_applied, ha_outbox_fence, ha_outbox_source_checkpoint, ha_outbox_receiver_checkpoint, ha_outbox_publisher_lease, ha_outbox_quarantine, ha_outbox_meta CASCADE');
+async function applyDDL(): Promise<void> {
   for (const stmt of HA_OUTBOX_PG_SCHEMA.split(';').map((s) => s.trim()).filter(Boolean)) await pool.query(stmt);
+}
+async function resetSchema(): Promise<void> {
+  await pool.query('DROP SCHEMA IF EXISTS shadow CASCADE');
+  await pool.query('DROP TABLE IF EXISTS ha_outbox_rows, ha_outbox_applied, ha_outbox_fence, ha_outbox_source_checkpoint, ha_outbox_receiver_checkpoint, ha_outbox_publisher_lease, ha_outbox_quarantine, ha_outbox_meta CASCADE');
+  await applyDDL();
+  await provisionSchemaVersion(serial); // attests the fresh schema, then stamps v2
 }
 async function provision(streamId: string, epoch = 'e1'): Promise<void> {
   await pool.query('INSERT INTO ha_outbox_fence (stream_id, fence_token) VALUES ($1,0)', [streamId]);
@@ -264,30 +273,70 @@ async function main(): Promise<void> {
     await assert.rejects(() => pool.query('INSERT INTO ha_outbox_rows (stream_id, source_epoch, sequence, fence_token, op_digest, mutation) VALUES ($1,$2,1,1.5,$3,$4)', [sid, 'e1', good, '{}']), /check constraint|violates/i);
   });
 
-  await check('(R4/HIGH) DDL never auto-bumps meta; migration is the only advance path; incompatible layout is refused', async () => {
-    const applyDDL = async () => { for (const stmt of HA_OUTBOX_PG_SCHEMA.split(';').map((s) => s.trim()).filter(Boolean)) await pool.query(stmt); };
-    // Case A — an install with v2 tables but meta still at v1 (code upgraded, version not yet advanced).
-    // resetSchema() already built v2 + stamped 2; force it back to 1 and re-apply the DDL.
+  await check('(R5) live schema manifest matches the pinned manifest', async () => {
+    const live = await serial.transaction((e) => schemaManifest(e));
+    assert.equal(live, HA_OUTBOX_SCHEMA_MANIFEST, 'pinned HA_OUTBOX_SCHEMA_MANIFEST is stale — recompute for this PG major');
+  });
+
+  await check('(R5/HIGH1) attestation rejects weakened CHECK, missing index, and other malformed tables', async () => {
+    // fresh schema attests fine
+    await serial.transaction((e) => attestSchema(e));
+    // (a) quarantined_at present but the op_digest CHECK removed -> attestation catches it
+    await pool.query(`DO $$ DECLARE r record; BEGIN
+      FOR r IN SELECT conname FROM pg_constraint c JOIN pg_class rel ON rel.oid=c.conrelid
+               WHERE rel.relname='ha_outbox_rows' AND c.contype='c' AND pg_get_constraintdef(c.oid) LIKE '%op_digest%'
+      LOOP EXECUTE 'ALTER TABLE ha_outbox_rows DROP CONSTRAINT '||quote_ident(r.conname); END LOOP; END $$;`);
+    await assert.rejects(() => serial.transaction((e) => attestSchema(e)), /attestation failed/);
+    await assert.rejects(() => migrateSchemaToCurrent(serial), /attestation failed/, 'migration must not stamp a weakened schema');
+
+    // (b) missing/wrong partial deliverable index
+    await resetSchema();
+    await pool.query('DROP INDEX ha_outbox_rows_deliverable');
+    await assert.rejects(() => serial.transaction((e) => attestSchema(e)), /attestation failed/);
+
+    // (c) a malformed OTHER table (altered default on the source checkpoint)
+    await resetSchema();
+    await pool.query('ALTER TABLE ha_outbox_source_checkpoint ALTER COLUMN sequence DROP DEFAULT');
+    await assert.rejects(() => serial.transaction((e) => attestSchema(e)), /attestation failed/);
+  });
+
+  await check('(R5/HIGH1) attestation is scoped to current_schema (same-name objects elsewhere cannot spoof or pollute)', async () => {
+    // a same-named table in another schema does NOT rescue a broken current schema…
+    await pool.query('CREATE SCHEMA shadow');
+    await pool.query('CREATE TABLE shadow.ha_outbox_rows (stream_id text, source_epoch text, sequence bigint, fence_token numeric, op_digest text CHECK (op_digest ~ \'^[0-9a-f]{64}$\'), mutation jsonb)');
+    await pool.query(`DO $$ DECLARE r record; BEGIN
+      FOR r IN SELECT conname FROM pg_constraint c JOIN pg_class rel ON rel.oid=c.conrelid JOIN pg_namespace n ON n.oid=rel.relnamespace
+               WHERE n.nspname='public' AND rel.relname='ha_outbox_rows' AND c.contype='c' AND pg_get_constraintdef(c.oid) LIKE '%op_digest%'
+      LOOP EXECUTE 'ALTER TABLE public.ha_outbox_rows DROP CONSTRAINT '||quote_ident(r.conname); END LOOP; END $$;`);
+    await assert.rejects(() => serial.transaction((e) => attestSchema(e)), /attestation failed/, 'broken current schema must fail even with a good same-name table elsewhere');
+    // …and a malformed same-named table elsewhere does NOT break a good current schema
+    await resetSchema();
+    await pool.query('CREATE SCHEMA shadow');
+    await pool.query('CREATE TABLE shadow.ha_outbox_rows (bogus int)');
+    await serial.transaction((e) => attestSchema(e)); // still attests OK
+  });
+
+  await check('(R5) DDL never auto-bumps meta; only attested migration advances', async () => {
     await pool.query('UPDATE ha_outbox_meta SET schema_version = 1 WHERE id = 1');
     await applyDDL();
     assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), 1, 'DDL must NOT auto-bump an existing meta row');
     await assert.rejects(() => assertSchemaVersion(serial), /schema version mismatch/);
-    // Only the explicit migration advances it — and only because the v2 structures are present.
-    await migrateSchemaToCurrent(serial);
+    await migrateSchemaToCurrent(serial); // attests OK -> advances
     assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), HA_OUTBOX_SCHEMA_VERSION);
     await assertSchemaVersion(serial);
+  });
 
-    // Case B — an OLD/incompatible ha_outbox_rows (no quarantined_at): applying the v2
-    // DDL fails closed (partial index needs the column) rather than silently stamping v2.
-    await pool.query('DROP TABLE IF EXISTS ha_outbox_rows, ha_outbox_applied, ha_outbox_fence, ha_outbox_source_checkpoint, ha_outbox_receiver_checkpoint, ha_outbox_publisher_lease, ha_outbox_quarantine, ha_outbox_meta CASCADE');
-    await pool.query('CREATE TABLE ha_outbox_rows (stream_id text, source_epoch text, sequence bigint, fence_token numeric, op_digest text, mutation jsonb, PRIMARY KEY(stream_id, source_epoch, sequence))');
-    await assert.rejects(applyDDL, /column .* does not exist|quarantined_at|42703/i, 'v2 DDL must not silently provision over an incompatible layout');
-    // the meta table may get created, but NO version row is ever stamped (seed runs last, never reached)
-    assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM ha_outbox_meta')).rows[0].n), 0, 'no meta row stamped over incompatible layout');
-    await assert.rejects(() => assertSchemaVersion(serial), /not provisioned/);
-    // migration also refuses when the v2 structures are absent
-    await pool.query('INSERT INTO ha_outbox_meta (id, schema_version) VALUES (1, 1)');
-    await assert.rejects(() => migrateSchemaToCurrent(serial), /v2 structures are not present/, 'migration must refuse to advance an old layout');
+  await check('(R5/HIGH2) quarantine conflict with a mismatched preexisting row fails closed', async () => {
+    const sid = 'sc:qconf/v1'; await provision(sid);
+    const ob = mkOutbox(serial, sid);
+    await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'p0' }, fenceToken: 0n }));
+    // plant a LYING quarantine row for (sid,e1,1): different digest + different decision
+    await pool.query("INSERT INTO ha_outbox_quarantine (stream_id, source_epoch, sequence, op_digest, decision) VALUES ($1,'e1',1,$2,'reject-stale')", [sid, 'b'.repeat(64)]);
+    const forkPub = new PgDurablePublisher<Clean>(serial, sid, { async deliverAndAwaitAck(r) { return receiptFor(r, 'reject-fork'); } }, 'quarantine', sanitizer, verifier, { leaseMs: 30_000 });
+    await assert.rejects(() => forkPub.drainOnce(), /quarantine record conflict/);
+    // the source row must NOT have been quarantined on a lying record
+    assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM ha_outbox_rows WHERE stream_id=$1 AND quarantined_at IS NOT NULL', [sid])).rows[0].n), 0);
+    assert.equal(await unacked(sid), 1);
   });
 
   await check('(R4) slow delivery + lease expiry/steal -> no double-apply, no loss, in order', async () => {
