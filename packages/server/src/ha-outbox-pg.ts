@@ -11,6 +11,7 @@
  * until the real two-node PostgreSQL(+Redis) failover/split-brain drill passes
  * with recorded RPO/RTO. No release-claim expansion.
  */
+import { timingSafeEqual } from 'node:crypto';
 import {
   ContractValidationError,
   OutboxBackpressureError,
@@ -61,6 +62,20 @@ function execOf(tx: PgTx): PgExecutor {
   return e;
 }
 
+/** Constant-time equality for two 64-hex digests (equal length by construction). */
+function digestEquals(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
+}
+
+/** Parse a DB numeric/bigint into a contract-safe non-negative JS integer, or
+ *  throw — never silently truncate an unsafe bigint via Number(). */
+function safeSeq(v: unknown, label: string): number {
+  const b = BigInt(String(v));
+  if (b < 0n || b > BigInt(Number.MAX_SAFE_INTEGER)) throw new ContractValidationError(`${label} out of safe-integer range`);
+  return Number(b);
+}
+
 /** Mint a `DurableTx<PgBackend>` bound to a live executor. The backend is the
  *  trusted minter of tx handles (the contract's brand is unforgeable by outside
  *  callers); a caller running its own `db.transaction` uses this to obtain a
@@ -97,6 +112,15 @@ CREATE TABLE IF NOT EXISTS ha_outbox_rows (
 );
 CREATE INDEX IF NOT EXISTS ha_outbox_rows_unacked
   ON ha_outbox_rows (stream_id, sequence) WHERE acked_at IS NULL;
+-- Receiver-side durable applied history (independent of the source outbox
+-- table) so duplicate/fork/stale decisions survive on the receiver.
+CREATE TABLE IF NOT EXISTS ha_outbox_applied (
+  stream_id     text NOT NULL,
+  source_epoch  text NOT NULL,
+  sequence      bigint NOT NULL,
+  op_digest     text NOT NULL,
+  PRIMARY KEY (stream_id, source_epoch, sequence)
+);
 `;
 
 export interface PgOutboxOptions<Raw, Clean> {
@@ -141,7 +165,8 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
     // (h) validate the presented fence token against the authoritative persisted
     // token under a row lock; stale token fails closed.
     const fenceRows = (await exec.query('SELECT fence_token FROM ha_outbox_fence WHERE stream_id = $1 FOR UPDATE', [streamId])).rows;
-    const persistedFence = fenceRows.length ? BigInt(String(fenceRows[0].fence_token)) : 0n;
+    if (!fenceRows.length) throw new ContractValidationError('no authoritative fence row — stream not provisioned (fail closed)');
+    const persistedFence = BigInt(String(fenceRows[0].fence_token));
     if (input.fenceToken !== persistedFence) throw new StaleFenceError(input.fenceToken, persistedFence);
 
     // (11) admission INSIDE the tx: over the bound → abort the mutation.
@@ -175,15 +200,28 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
  * injected transport, and records the ACK durably. Never sheds; a transport
  * failure leaves the row unacked for retry.
  */
-export interface OutboxTransport {
-  deliver(record: OutboxRecord<unknown>): Promise<void>;
+/** (#4) Record-bound acknowledgement the receiver returns to prove it durably
+ *  applied (or idempotently accepted) THIS exact record. */
+export interface AckReceipt {
+  streamId: string;
+  sourceEpoch: string;
+  sequence: number;
+  opDigest: string;
 }
-export class PgDurablePublisher {
+/** Transport delivers a record and returns the receiver's durable ACK receipt.
+ *  A throw (or a receipt that does not match) leaves the row unacked (at-least-
+ *  once retry) — the row is NEVER acked on call-completion alone. */
+export interface OutboxTransport {
+  deliverAndAwaitAck(record: OutboxRecord<unknown>): Promise<AckReceipt>;
+}
+export class PgDurablePublisher<Clean> {
   constructor(
     private readonly db: PgTransactor,
     private readonly streamId: string,
     private readonly transport: OutboxTransport,
     readonly backpressure: PublisherBackpressure,
+    /** (#5) sanitizer to revalidate each DB row before publishing. */
+    private readonly sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'assertSanitized'>,
   ) {}
 
   async drainOnce(): Promise<{ published: number; acked: number }> {
@@ -194,14 +232,24 @@ export class PgDurablePublisher {
       )).rows;
       let published = 0, acked = 0;
       for (const r of rows) {
-        const record: OutboxRecord<unknown> = {
-          contractVersion: '1', streamId: this.streamId, sourceEpoch: String(r.source_epoch),
-          sequence: Number(r.sequence), fenceToken: String(r.fence_token), opDigest: String(r.op_digest),
-          mutation: r.mutation as SanitizedMutation<unknown>,
-        };
-        await this.transport.deliver(record); // throw → row stays unacked (retry), never dropped
+        const sourceEpoch = String(r.source_epoch);
+        const sequence = safeSeq(r.sequence, 'row.sequence');
+        const storedDigest = String(r.op_digest);
+        const mutation = r.mutation as SanitizedMutation<Clean>;
+        // (#5) fail closed on a corrupted/tampered stored row: revalidate the
+        // sanitizer AND recompute the digest before publishing.
+        this.sanitizer.assertSanitized(mutation);
+        const recomputed = canonicalOpDigest<Clean>({ streamId: this.streamId, sourceEpoch, sequence, fenceToken: String(r.fence_token), mutation });
+        if (!digestEquals(recomputed, storedDigest)) throw new ContractValidationError(`corrupted outbox row: digest mismatch at ${this.streamId}/${sourceEpoch}/${sequence}`);
+
+        const record: OutboxRecord<unknown> = { contractVersion: '1', streamId: this.streamId, sourceEpoch, sequence, fenceToken: String(r.fence_token), opDigest: storedDigest, mutation };
+        const receipt = await this.transport.deliverAndAwaitAck(record); // throw → row stays unacked (retry)
         published++;
-        await exec.query('UPDATE ha_outbox_rows SET published_at = now(), acked_at = now() WHERE stream_id=$1 AND source_epoch=$2 AND sequence=$3', [this.streamId, record.sourceEpoch, record.sequence]);
+        // (#4) only ACK when the receipt is record-bound and matches exactly.
+        if (receipt.streamId !== this.streamId || receipt.sourceEpoch !== sourceEpoch || receipt.sequence !== sequence || !digestEquals(receipt.opDigest, storedDigest)) {
+          throw new ContractValidationError('ACK receipt does not match the delivered record — not acking');
+        }
+        await exec.query('UPDATE ha_outbox_rows SET published_at = now(), acked_at = now() WHERE stream_id=$1 AND source_epoch=$2 AND sequence=$3', [this.streamId, sourceEpoch, sequence]);
         acked++;
       }
       return { published, acked };
@@ -233,34 +281,42 @@ export class PgReceiverCheckpoint<Clean> implements ReceiverCheckpoint<Clean, Pg
     if (record.streamId !== this.streamId) throw new ContractValidationError('streamId mismatch for this receiver');
     assertHeaderConformant(record);
 
-    // record-bound fence vs authoritative persisted token (locked).
-    const fenceRows = (await exec.query('SELECT fence_token FROM ha_outbox_fence WHERE stream_id = $1 FOR UPDATE', [record.streamId])).rows;
-    const persistedFence = fenceRows.length ? BigInt(String(fenceRows[0].fence_token)) : 0n;
-    if (BigInt(record.fenceToken) < persistedFence) return 'reject-fence';
-
-    // sanitizer re-check on the receiver.
+    // (5→#1) sanitizer re-check, THEN recompute the digest from the record's own
+    // fields + mutation and constant-time compare. A payload changed while the
+    // opDigest was preserved is rejected before any classification/apply.
     try { this.sanitizer.assertSanitized(record.mutation); }
     catch { return 'reject-unsanitized'; }
+    const recomputed = canonicalOpDigest<Clean>({
+      streamId: record.streamId, sourceEpoch: record.sourceEpoch, sequence: record.sequence,
+      fenceToken: record.fenceToken, mutation: record.mutation,
+    });
+    if (!digestEquals(recomputed, record.opDigest)) return 'reject-fork';
 
-    const cpRows = (await exec.query('SELECT source_epoch, sequence, last_digest FROM ha_outbox_checkpoint WHERE stream_id = $1 FOR UPDATE', [record.streamId])).rows;
+    // (#2) record-bound fence vs authoritative persisted token: EXACT equality.
+    // A future token is rejected; a missing fence row fails closed.
+    const fenceRows = (await exec.query('SELECT fence_token FROM ha_outbox_fence WHERE stream_id = $1 FOR UPDATE', [record.streamId])).rows;
+    if (!fenceRows.length) return 'reject-fence';
+    if (BigInt(record.fenceToken) !== BigInt(String(fenceRows[0].fence_token))) return 'reject-fence';
+
+    const cpRows = (await exec.query('SELECT source_epoch, sequence FROM ha_outbox_checkpoint WHERE stream_id = $1 FOR UPDATE', [record.streamId])).rows;
     if (!cpRows.length) throw new ContractValidationError('receiver stream not provisioned');
     const cpEpoch = String(cpRows[0].source_epoch);
-    const cpSeq = Number(cpRows[0].sequence);
-    const cpLastDigest = String(cpRows[0].last_digest);
+    const cpSeq = safeSeq(cpRows[0].sequence, 'checkpoint.sequence');
 
     if (record.sourceEpoch !== cpEpoch) return 'reject-epoch';
     if (record.sequence <= cpSeq) {
-      // (c) duplicate: same key AND identical digest at that position → idempotent.
-      if (record.sequence === cpSeq && record.opDigest === cpLastDigest) return 'duplicate-ok';
-      const dupe = (await exec.query('SELECT op_digest FROM ha_outbox_rows WHERE stream_id=$1 AND source_epoch=$2 AND sequence=$3', [record.streamId, record.sourceEpoch, record.sequence])).rows;
-      if (dupe.length && String(dupe[0].op_digest) === record.opDigest) return 'duplicate-ok';
-      if (dupe.length && String(dupe[0].op_digest) !== record.opDigest) return 'reject-fork';
+      // (#3) duplicate/fork decided from the DURABLE receiver-applied history,
+      // never the source outbox table (empty on an independent receiver).
+      const prior = (await exec.query('SELECT op_digest FROM ha_outbox_applied WHERE stream_id=$1 AND source_epoch=$2 AND sequence=$3', [record.streamId, record.sourceEpoch, record.sequence])).rows;
+      if (prior.length && digestEquals(String(prior[0].op_digest), record.opDigest)) return 'duplicate-ok';
+      if (prior.length) return 'reject-fork';
       return 'reject-stale';
     }
     if (record.sequence > cpSeq + 1) return 'reject-gap';
 
-    // fresh, in-order → apply + advance checkpoint atomically.
+    // fresh, in-order → apply + record durable applied-history + advance checkpoint, atomically.
     await this.applier.applyInTx(exec, record);
+    await exec.query('INSERT INTO ha_outbox_applied (stream_id, source_epoch, sequence, op_digest) VALUES ($1,$2,$3,$4)', [record.streamId, record.sourceEpoch, record.sequence, record.opDigest]);
     await exec.query('UPDATE ha_outbox_checkpoint SET sequence=$2, last_digest=$3 WHERE stream_id=$1', [record.streamId, record.sequence, record.opDigest]);
     return 'applied';
   }
