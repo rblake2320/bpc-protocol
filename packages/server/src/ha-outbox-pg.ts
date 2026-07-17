@@ -80,47 +80,75 @@ export interface PgTransactor {
 // (the class calls `this.db.transaction`, so the recorded `db` is the REAL one
 // that produced the executor). There is no public minter, so a caller cannot wrap
 // a foreign executor and feed it to another object bound to a different db.
-interface BoundTxState { exec: PgExecutor; db: PgTransactor; schema: string }
+interface BoundTxState { db: PgTransactor; schema: string; scoped: PgExecutor }
 const TX_STATE = new WeakMap<object, BoundTxState>();
 
 function boundStateOf(tx: PgTx): BoundTxState {
   const st = TX_STATE.get(tx as unknown as object);
-  if (!st) throw new ContractValidationError('DurableTx not bound to a PostgreSQL transaction (forged or foreign tx)');
+  if (!st) throw new ContractValidationError('DurableTx not bound to a PostgreSQL transaction (forged, foreign, or used after its scope)');
   return st;
 }
 
-/** (R9/R10/HIGH) Return the executor of a bound tx ONLY if it was produced by
- *  THIS object's exact transactor + schema. Any object that accepts a
- *  caller-supplied tx MUST use this (never bare execOf) so a tx minted for a
- *  different db/schema can never drive an operation here — validated BEFORE any
- *  query. */
+/** (R9/R10/R11/HIGH) Return a CAPABILITY-SCOPED executor of a bound tx, ONLY if
+ *  that tx was produced by THIS object's exact transactor + schema. The returned
+ *  executor is a proxy that RE-CHECKS the tx is still active on EVERY query — so
+ *  a capability captured once cannot drive a later query after the tx scope ends
+ *  (the async-retention bypass). Callers never receive the raw executor. */
 function execOfBound(tx: PgTx, db: PgTransactor, schema: string): PgExecutor {
   const st = boundStateOf(tx);
   if (st.db !== db) throw new ContractValidationError('DurableTx is bound to a different transactor than this object');
   if (st.schema !== schema) throw new ContractValidationError('DurableTx is bound to a different schema than this object');
-  return st.exec;
+  return st.scoped;
 }
 
 /**
- * (R10/HIGH) Mint a bound `DurableTx` that is ACTIVE only for the duration of
- * `body`, then REVOKED in `finally` — whether body returns, throws, or the tx
- * commits/rolls back. A handle retained past this scope is absent from TX_STATE,
- * so any later `appendInTx`/receiver call with it is rejected before any query
- * (a stale handle can never drive an operation on a released/reused pooled
- * connection). This is the ONLY minter; only transactor-owning methods call it,
- * so the recorded db is the one that actually produced `exec`.
+ * (R10/R11/HIGH) Run `body` with a bound `DurableTx` under a STRUCTURED capability
+ * scope. Callers never receive the raw executor — only a proxy that:
+ *   - rejects any query once the scope is closing or the tx is revoked (stops a
+ *     capability captured once from issuing LATER queries), and
+ *   - tracks every in-flight query promise.
+ * When `body` settles, the scope closes. If any query is still in-flight (a query
+ * was launched but not awaited by `body` — e.g. an unawaited appendInTx), the
+ * scope DRAINS those queries (bounded by their own completion) and then THROWS,
+ * forcing the surrounding `db.transaction` to ROLL BACK rather than commit — so a
+ * mutation that had already started can never commit after the scope returned.
+ * The tx handle is revoked in `finally` regardless.
  */
 async function withBoundTx<T>(
   exec: PgExecutor,
   db: PgTransactor,
   schema: string,
-  body: (tx: PgTx) => Promise<T>,
+  body: (tx: PgTx, scoped: PgExecutor) => Promise<T>,
 ): Promise<T> {
   const tx = Object.freeze({}) as unknown as PgTx;
-  TX_STATE.set(tx as unknown as object, { exec, db, schema });
+  let closing = false;
+  const inflight = new Set<Promise<unknown>>();
+  const scoped: PgExecutor = {
+    query(sql, params) {
+      if (closing || !TX_STATE.has(tx as unknown as object)) {
+        throw new ContractValidationError('DurableTx query issued outside its active transaction scope');
+      }
+      let tracked: Promise<{ rows: Record<string, unknown>[]; rowCount: number }>;
+      tracked = exec.query(sql, params).finally(() => { inflight.delete(tracked); });
+      inflight.add(tracked);
+      return tracked;
+    },
+  };
+  TX_STATE.set(tx as unknown as object, { db, schema, scoped });
   try {
-    return await body(tx);
+    const result = await body(tx, scoped);
+    closing = true;
+    if (inflight.size > 0) {
+      // body returned/threw while queries it launched were still running: unsafe.
+      // Drain them (bounded by their own settle) so the connection is quiescent,
+      // then fail the tx so db.transaction ROLLS BACK — no post-scope commit.
+      await Promise.allSettled([...inflight]);
+      throw new ContractValidationError('DurableTx scope ended with unawaited in-flight queries — rolling back to prevent a post-scope commit');
+    }
+    return result;
   } finally {
+    closing = true;
+    if (inflight.size > 0) await Promise.allSettled([...inflight]); // drain before revoke on the error path too
     TX_STATE.delete(tx as unknown as object); // revoke — no use after this scope
   }
 }
@@ -537,7 +565,9 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
   async withOutboxTx<T>(fn: (tx: PgTx, exec: PgExecutor) => Promise<T>): Promise<T> {
     return this.db.transaction(async (exec) => {
       await enterCriticalTx(exec, this.schema);
-      return withBoundTx(exec, this.db, this.schema, (tx) => fn(tx, exec));
+      // hand the caller ONLY the capability-scoped proxy (never the raw exec), so
+      // their own mutations are also liveness-checked and drained/rolled back.
+      return withBoundTx(exec, this.db, this.schema, (tx, scoped) => fn(tx, scoped));
     });
   }
 

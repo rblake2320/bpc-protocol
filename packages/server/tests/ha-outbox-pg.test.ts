@@ -305,3 +305,87 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
     expect(t2).toBeGreaterThan(t1); expect(await fence.current('f/v1')).toBe(t2);
   });
 });
+
+/**
+ * (R11) STRUCTURED-SCOPE regression: the capability-scoped executor must reject
+ * queries after its transaction scope ends AND force a rollback if a mutation was
+ * launched but not awaited. A controllable transactor gates a chosen query so the
+ * interleaving is deterministic (no timing luck).
+ */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => { resolve = r; });
+  return { promise, resolve };
+}
+class GatedPg implements PgTransactor {
+  executed: string[] = [];
+  committed: boolean | null = null;
+  insertRan = false;
+  gateOn: string | null = null;
+  gate = deferred();
+  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>): Promise<T> {
+    const exec: PgExecutor = {
+      query: async (sql: string) => {
+        this.executed.push(sql);
+        if (this.gateOn && sql.includes(this.gateOn)) await this.gate.promise;
+        const out = (rows: Record<string, unknown>[], rc?: number) => ({ rows, rowCount: rc ?? rows.length });
+        if (sql.includes('SHOW transaction_isolation')) return out([{ transaction_isolation: 'serializable' }]);
+        if (sql.includes('set_config')) return out([{ set_config: 'public' }]);
+        if (sql.includes('current_schema()')) return out([{ s: 'public' }]);
+        if (sql.includes('FROM ha_outbox_fence')) return out([{ fence_token: '0' }]);
+        if (sql.includes('count(*)')) return out([{ n: '0' }]);
+        if (sql.includes('FROM ha_outbox_source_checkpoint')) return out([{ source_epoch: 'e1', sequence: 0 }]);
+        if (sql.includes('INSERT INTO ha_outbox_rows')) { this.insertRan = true; return out([{}], 1); }
+        if (sql.includes('UPDATE ha_outbox_source_checkpoint')) return out([{}], 1);
+        return out([]);
+      },
+    };
+    try { const r = await fn(exec); this.committed = true; return r; }
+    catch (e) { this.committed = false; throw e; }
+  }
+}
+const gatedOutbox = (db: GatedPg) => new PgDurableOutbox<Raw, Clean>(db, __unsafeMintReadyTokenForTests(db, 'public'), { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'quarantine' });
+const tick = () => new Promise<void>((r) => setTimeout(r, 10));
+
+describe('(R11) capability-scoped executor / structured scope', () => {
+  it('(a) a blocked read then a LATER query is denied; the tx rolls back; no mutation runs', async () => {
+    const db = new GatedPg(); db.gateOn = 'FROM ha_outbox_fence';
+    const outbox = gatedOutbox(db);
+    let captured: unknown;
+    const p = outbox.withOutboxTx(async (tx) => { void outbox.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'x' }, fenceToken: 0n }).catch((e) => { captured = e; }); return 'x'; });
+    await tick();            // appendInTx is parked on the gated fence read; the callback has returned
+    db.gate.resolve();       // release the read
+    await expect(p).rejects.toThrow(/in-flight|scope/);
+    expect(String(captured)).toMatch(/outside its active/);
+    expect(db.insertRan).toBe(false);   // the INSERT never ran (denied after scope closed)
+    expect(db.committed).toBe(false);   // and the tx rolled back
+  });
+
+  it('(b) a FIRST mutation launched unawaited runs but CANNOT commit — the tx rolls back', async () => {
+    const db = new GatedPg(); db.gateOn = 'INSERT INTO ha_outbox_rows';
+    const outbox = gatedOutbox(db);
+    const p = outbox.withOutboxTx(async (_tx, scoped) => { void scoped.query('INSERT INTO ha_outbox_rows (stream_id) VALUES ($1)', ['x']); return 'x'; });
+    await tick();            // the INSERT is in-flight (gated); the callback has returned
+    db.gate.resolve();       // let the INSERT actually execute on the connection
+    await expect(p).rejects.toThrow(/in-flight|scope/);
+    expect(db.insertRan).toBe(true);    // the mutation DID execute…
+    expect(db.committed).toBe(false);   // …but the scope forced a ROLLBACK — never committed
+  });
+
+  it('(c) the callback only ever gets the scoped proxy; it is dead after the scope (raw exec never exposed)', async () => {
+    const db = new GatedPg();
+    const outbox = gatedOutbox(db);
+    let scopedRef: PgExecutor | undefined;
+    await outbox.withOutboxTx(async (_tx, scoped) => { scopedRef = scoped; return 'ok'; });
+    expect(() => scopedRef!.query('SELECT 1')).toThrow(/outside its active/);
+  });
+
+  it('(d) the normal fully-awaited path commits', async () => {
+    const db = new GatedPg();
+    const outbox = gatedOutbox(db);
+    const h = await outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'x' }, fenceToken: 0n }));
+    expect(h.sequence).toBe(1);
+    expect(db.insertRan).toBe(true);
+    expect(db.committed).toBe(true);
+  });
+});
