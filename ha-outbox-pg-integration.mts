@@ -34,6 +34,7 @@ import {
   canonicalOpDigest,
   ContractValidationError,
   createBoundTx,
+  migrateSchemaToCurrent,
 } from './packages/server/src/index.ts';
 import type {
   AckReceipt,
@@ -261,6 +262,51 @@ async function main(): Promise<void> {
     await assert.rejects(() => pool.query('INSERT INTO ha_outbox_rows (stream_id, source_epoch, sequence, fence_token, op_digest, mutation) VALUES ($1,$2,0,0,$3,$4)', [sid, 'e1', good, '{}']), /check constraint|violates/i);
     await assert.rejects(() => pool.query('INSERT INTO ha_outbox_rows (stream_id, source_epoch, sequence, fence_token, op_digest, mutation) VALUES ($1,$2,1,0,$3,$4)', [sid, 'e1', 'NOTHEX', '{}']), /check constraint|violates/i);
     await assert.rejects(() => pool.query('INSERT INTO ha_outbox_rows (stream_id, source_epoch, sequence, fence_token, op_digest, mutation) VALUES ($1,$2,1,1.5,$3,$4)', [sid, 'e1', good, '{}']), /check constraint|violates/i);
+  });
+
+  await check('(R4/HIGH) DDL never auto-bumps meta; migration is the only advance path; incompatible layout is refused', async () => {
+    const applyDDL = async () => { for (const stmt of HA_OUTBOX_PG_SCHEMA.split(';').map((s) => s.trim()).filter(Boolean)) await pool.query(stmt); };
+    // Case A — an install with v2 tables but meta still at v1 (code upgraded, version not yet advanced).
+    // resetSchema() already built v2 + stamped 2; force it back to 1 and re-apply the DDL.
+    await pool.query('UPDATE ha_outbox_meta SET schema_version = 1 WHERE id = 1');
+    await applyDDL();
+    assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), 1, 'DDL must NOT auto-bump an existing meta row');
+    await assert.rejects(() => assertSchemaVersion(serial), /schema version mismatch/);
+    // Only the explicit migration advances it — and only because the v2 structures are present.
+    await migrateSchemaToCurrent(serial);
+    assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), HA_OUTBOX_SCHEMA_VERSION);
+    await assertSchemaVersion(serial);
+
+    // Case B — an OLD/incompatible ha_outbox_rows (no quarantined_at): applying the v2
+    // DDL fails closed (partial index needs the column) rather than silently stamping v2.
+    await pool.query('DROP TABLE IF EXISTS ha_outbox_rows, ha_outbox_applied, ha_outbox_fence, ha_outbox_source_checkpoint, ha_outbox_receiver_checkpoint, ha_outbox_publisher_lease, ha_outbox_quarantine, ha_outbox_meta CASCADE');
+    await pool.query('CREATE TABLE ha_outbox_rows (stream_id text, source_epoch text, sequence bigint, fence_token numeric, op_digest text, mutation jsonb, PRIMARY KEY(stream_id, source_epoch, sequence))');
+    await assert.rejects(applyDDL, /column .* does not exist|quarantined_at|42703/i, 'v2 DDL must not silently provision over an incompatible layout');
+    // the meta table may get created, but NO version row is ever stamped (seed runs last, never reached)
+    assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM ha_outbox_meta')).rows[0].n), 0, 'no meta row stamped over incompatible layout');
+    await assert.rejects(() => assertSchemaVersion(serial), /not provisioned/);
+    // migration also refuses when the v2 structures are absent
+    await pool.query('INSERT INTO ha_outbox_meta (id, schema_version) VALUES (1, 1)');
+    await assert.rejects(() => migrateSchemaToCurrent(serial), /v2 structures are not present/, 'migration must refuse to advance an old layout');
+  });
+
+  await check('(R4) slow delivery + lease expiry/steal -> no double-apply, no loss, in order', async () => {
+    const sid = 'sc:steal/v1'; await provision(sid); const N = 8;
+    const ob = mkOutbox(serial, sid);
+    for (let i = 0; i < N; i++) await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'p' + i }, fenceToken: 0n }));
+    const receiver = new PgReceiverCheckpoint<Clean>(sid, sanitizer, applierRecording);
+    const slow: OutboxTransport = { async deliverAndAwaitAck(record) {
+      await new Promise((r) => setTimeout(r, 120)); // slow delivery > lease -> lease can be stolen mid-flight
+      const d = await serial.transaction((e) => receiver.verifyAndApplyInTx(createBoundTx(e), record as OutboxRecord<Clean>));
+      return receiptFor(record, d);
+    } };
+    const mkPub = () => new PgDurablePublisher<Clean>(serial, sid, slow, 'quarantine', sanitizer, verifier, { leaseMs: 100 }); // short lease
+    const loop = async () => { for (let i = 0; i < 100; i++) { try { await mkPub().drainOnce(); } catch (e) { if (!/lease/i.test(String(e))) throw e; } if ((await unacked(sid)) === 0) break; await new Promise((r) => setTimeout(r, 15)); } };
+    await Promise.all([loop(), loop()]);
+    // idempotent receiver: each sequence applied EXACTLY once, in order, despite stolen leases + redelivery
+    assert.deepEqual(appliedOrder, Array.from({ length: N }, (_, i) => i + 1), 'lease steal caused double-apply or out-of-order');
+    assert.equal(await unacked(sid), 0, 'lease steal lost rows');
+    assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM ha_outbox_quarantine WHERE stream_id=$1', [sid])).rows[0].n), 0);
   });
 
   console.log(`\n# ${passed} checks passed`);

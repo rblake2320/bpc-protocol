@@ -163,6 +163,7 @@ export {
   PgReceiverCheckpoint,
   assertSchemaVersion,
   createBoundTx,
+  migrateSchemaToCurrent,
 } from './ha-outbox-pg.js';
 export type {
   AckReceipt,

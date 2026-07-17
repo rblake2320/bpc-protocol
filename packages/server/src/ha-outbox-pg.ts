@@ -141,8 +141,6 @@ CREATE TABLE IF NOT EXISTS ha_outbox_meta (
   id             integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
   schema_version integer NOT NULL CHECK (schema_version >= 1)
 );
-INSERT INTO ha_outbox_meta (id, schema_version) VALUES (1, ${HA_OUTBOX_SCHEMA_VERSION})
-  ON CONFLICT (id) DO UPDATE SET schema_version = EXCLUDED.schema_version;
 CREATE TABLE IF NOT EXISTS ha_outbox_fence (
   stream_id     text PRIMARY KEY CHECK (length(stream_id) BETWEEN 1 AND 512),
   fence_token   numeric NOT NULL DEFAULT 0 CHECK (fence_token >= 0 AND scale(fence_token) = 0 AND fence_token < ${FENCE_MAX_EXCLUSIVE})
@@ -204,6 +202,20 @@ CREATE TABLE IF NOT EXISTS ha_outbox_applied (
   op_digest     text NOT NULL CHECK (op_digest ~ '^[0-9a-f]{64}$'),
   PRIMARY KEY (stream_id, source_epoch, sequence)
 );
+-- Version stamp runs LAST, after every table exists. Stamp v2 ONLY on a
+-- genuinely fresh schema: meta empty AND the v2-specific structures
+-- (quarantined_at column, publisher-lease table) present. Never auto-bumps an
+-- existing meta row (ON CONFLICT DO NOTHING) and never stamps an OLD layout that
+-- predates these structures (CREATE IF NOT EXISTS does not add missing columns),
+-- so applying this DDL over a v1 database leaves it UN-stamped and
+-- assertSchemaVersion fails. Advancing an existing install is the explicit
+-- migrateSchemaToCurrent path.
+INSERT INTO ha_outbox_meta (id, schema_version)
+SELECT 1, ${HA_OUTBOX_SCHEMA_VERSION}
+WHERE NOT EXISTS (SELECT 1 FROM ha_outbox_meta)
+  AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'ha_outbox_rows' AND column_name = 'quarantined_at')
+  AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'ha_outbox_publisher_lease')
+ON CONFLICT (id) DO NOTHING;
 `;
 
 /** (MED) Fail closed unless the live schema matches the version this build
@@ -213,6 +225,29 @@ export async function assertSchemaVersion(db: PgTransactor): Promise<void> {
   if (!rows.length) throw new ContractValidationError('ha_outbox schema is not provisioned (no meta row)');
   const found = safeSeq(rows[0].schema_version, 'schema_version');
   if (found !== HA_OUTBOX_SCHEMA_VERSION) throw new ContractValidationError(`ha_outbox schema version mismatch: db=${found} expected=${HA_OUTBOX_SCHEMA_VERSION}`);
+}
+
+/**
+ * (R4/HIGH) EXPLICIT version advance — the ONLY path that may bump an existing
+ * meta row. Applying the DDL never advances an existing install; advancing
+ * requires this migration, which first validates the v2 structures are present
+ * (a structural migration must have added them) and only then, atomically under
+ * SERIALIZABLE, sets the version. A caller that runs this against an old layout
+ * without the v2 structures is rejected — the version can never race ahead of
+ * the actual columns/constraints.
+ */
+export async function migrateSchemaToCurrent(db: PgTransactor): Promise<void> {
+  await db.transaction(async (exec) => {
+    await assertSerializable(exec);
+    const col = (await exec.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'ha_outbox_rows' AND column_name = 'quarantined_at'")).rows;
+    const lease = (await exec.query("SELECT 1 FROM information_schema.tables WHERE table_name = 'ha_outbox_publisher_lease'")).rows;
+    if (!col.length || !lease.length) throw new ContractValidationError('cannot advance schema version: v2 structures are not present (run the structural migration first)');
+    const res = await exec.query(
+      `INSERT INTO ha_outbox_meta (id, schema_version) VALUES (1, ${HA_OUTBOX_SCHEMA_VERSION})
+       ON CONFLICT (id) DO UPDATE SET schema_version = EXCLUDED.schema_version`,
+    );
+    affectedOne(res, 'schema version advance');
+  });
 }
 
 export interface PgOutboxOptions<Raw, Clean> {
@@ -330,8 +365,12 @@ export interface OutboxTransport {
 const ACK_DECISIONS: ReadonlySet<ReceiverDecision> = new Set<ReceiverDecision>(['applied', 'duplicate-ok']);
 /** Transient rejections → release the lease and retry later (no advance). */
 const TRANSIENT_DECISIONS: ReadonlySet<ReceiverDecision> = new Set<ReceiverDecision>(['reject-gap', 'reject-fence']);
-// Everything else (reject-fork / reject-stale / reject-unsanitized / reject-epoch)
-// is a terminal divergence → quarantine + halt, never ACK, never drop.
+/** Terminal divergence → quarantine + halt, never ACK, never drop. */
+const TERMINAL_DECISIONS: ReadonlySet<ReceiverDecision> = new Set<ReceiverDecision>(['reject-fork', 'reject-stale', 'reject-unsanitized', 'reject-epoch']);
+/** (R4/MED) The full closed set of decisions the source will interpret. A
+ *  receipt whose decision is outside this set is rejected fail-closed — an
+ *  unknown/forged decision is never silently treated as terminal or acked. */
+const KNOWN_DECISIONS: ReadonlySet<ReceiverDecision> = new Set<ReceiverDecision>([...ACK_DECISIONS, ...TRANSIENT_DECISIONS, ...TERMINAL_DECISIONS]);
 
 export interface PgPublisherOptions {
   /** Publisher lease duration in ms; a held-but-idle stream is reclaimable after. */
@@ -453,6 +492,9 @@ export class PgDurablePublisher<Clean> {
         if (receipt.streamId !== this.streamId || receipt.sourceEpoch !== sourceEpoch || receipt.sequence !== sequence || !digestEquals(receipt.opDigest, storedDigest)) {
           throw new ContractValidationError('ACK receipt does not match the delivered record — not acking');
         }
+        // (R4/MED) closed-set decision: an unknown/forged decision is fail-closed,
+        // never silently treated as terminal (or acked).
+        if (!KNOWN_DECISIONS.has(receipt.decision)) throw new ContractValidationError(`unknown receiver decision: ${String(receipt.decision)}`);
 
         if (ACK_DECISIONS.has(receipt.decision)) {
           // (H1) durable ownership → ACK exactly this row, then advance.

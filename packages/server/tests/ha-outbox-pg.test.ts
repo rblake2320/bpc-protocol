@@ -252,6 +252,14 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
     await expect(swapped.drainOnce()).rejects.toThrow(/signature|decision/i);
     expect(db.rowsOf(SID)[0].acked_at).toBeNull();
   });
+  it('(R4) an unknown/forged receiver decision is fail-closed — not acked, not quarantined', async () => {
+    await seed(1);
+    const passAll: AckReceiptVerifier = { async verify() {} };
+    const pub = pubFor({ async deliverAndAwaitAck(r) { return { ...receiptFor(r, 'applied'), decision: 'totally-bogus' as ReceiverDecision }; } }, passAll);
+    await expect(pub.drainOnce()).rejects.toThrow(/unknown receiver decision/);
+    const row = db.rowsOf(SID)[0];
+    expect(row.acked_at).toBeNull(); expect(row.quarantined_at).toBeNull();
+  });
   it('(#4) a mismatched-tuple receipt is denied even if it passes signature verify', async () => {
     await seed(1);
     const passAll: AckReceiptVerifier = { async verify() {} };
