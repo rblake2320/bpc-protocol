@@ -163,11 +163,14 @@ export {
   createBoundTx,
 } from './ha-outbox-pg.js';
 export type {
+  AckReceipt,
+  AckReceiptVerifier,
   MutationApplier,
   OutboxTransport,
   PgBackend,
   PgExecutor,
   PgOutboxOptions,
+  PgPublisherOptions,
   PgTransactor,
   PgTx,
 } from './ha-outbox-pg.js';
