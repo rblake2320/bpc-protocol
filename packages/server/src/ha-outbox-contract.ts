@@ -331,7 +331,7 @@ export interface EpochTransitionRecord {
   fromEpochIndex: number;
   /** new epoch — MUST differ from fromEpoch. */
   toEpoch: string;
-  /** monotonic index of `toEpoch` — MUST be strictly greater (forward-only). */
+  /** monotonic index of `toEpoch` — MUST equal fromEpochIndex + 1 (no skips). */
   toEpochIndex: number;
   /** durable snapshot sequence the new epoch's tail continues from. */
   snapshotSequence: number;
@@ -380,11 +380,13 @@ export function assertEpochTransitionConformant(r: EpochTransitionRecord): void 
 }
 
 /** (4) Injected authority that decides whether an epoch transition is
- *  authorized (governed boundary / signed capability). MUST throw if the
- *  decision cannot be made so callers fail closed. `authorized` is thus a
- *  structural hook, not prose. */
+ *  authorized (governed boundary / signed capability). Fail-closed by TYPE:
+ *  returns `void` on authorization and MUST THROW if unauthorized OR if the
+ *  decision cannot be made (unavailable) — there is no boolean a caller could
+ *  ignore. `transitionEpochInTx` MUST call `authorizeTransition` AND
+ *  `assertEpochTransitionConformant` before any state change. */
 export interface EpochTransitionAuthorizer {
-  authorizeTransition(record: EpochTransitionRecord): Promise<boolean>;
+  authorizeTransition(record: EpochTransitionRecord): Promise<void>;
 }
 
 // ── (5)(7) Backend-bound transaction handle (NO default brand) ────────────────
@@ -472,10 +474,12 @@ export interface ReceiverCheckpoint<Clean, TBackend> {
   verifyAndApplyInTx(tx: DurableTx<TBackend>, record: OutboxRecord<Clean>): Promise<ReceiverDecision>;
   /**
    * (9) Authorized, forward-only epoch transition, atomic under the fence.
-   * Idempotent by (streamId, toEpoch): a re-applied record with the SAME
-   * transitionDigest is a no-op; the same toEpoch with a different digest is a
-   * fork (rejected). Rejects unless fromEpoch/fromEpochIndex equals the current
-   * durable epoch and toEpochIndex is strictly greater.
+   * MUST call `authorizeTransition` (throws if unauthorized/unavailable) AND
+   * `assertEpochTransitionConformant` (exact digest recompute) BEFORE any state
+   * change. Idempotent by (streamId, toEpoch): a re-applied record with the
+   * SAME transitionDigest is a no-op; the same toEpoch with a different digest
+   * is a fork (rejected). Rejects unless fromEpoch/fromEpochIndex equals the
+   * current durable epoch and toEpochIndex == fromEpochIndex + 1 (no skips).
    */
   transitionEpochInTx(tx: DurableTx<TBackend>, record: EpochTransitionRecord): Promise<'transitioned' | 'duplicate-ok' | 'reject-fork' | 'reject-stale-epoch' | 'reject-fence'>;
 }
