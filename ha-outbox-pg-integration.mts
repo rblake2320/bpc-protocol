@@ -60,6 +60,25 @@ if (!connectionString) {
 }
 const { Pool } = pg;
 const pool = new Pool({ connectionString, max: 16 });
+const SCHEMA = 'public'; // the pinned schema all operations bind to
+
+/** A transactor whose connections DEFAULT their search_path to a hostile schema,
+ *  simulating a pooled connection that resolves unqualified names elsewhere. The
+ *  impl must re-pin to its configured schema in every critical tx regardless. */
+class EvilDefaultPg implements PgTransactor {
+  constructor(private readonly evilSchema: string) {}
+  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>): Promise<T> {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      await client.query(`SET LOCAL search_path TO ${this.evilSchema}`); // hostile default
+      const exec: PgExecutor = { query: async (sql, params) => { const r = await client.query(sql, params as unknown[]); return { rows: r.rows, rowCount: r.rowCount ?? 0 }; } };
+      const result = await fn(exec);
+      await client.query('COMMIT');
+      return result;
+    } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e; } finally { client.release(); }
+  }
+}
 
 class RealPg implements PgTransactor {
   constructor(private readonly level: 'SERIALIZABLE' | 'READ COMMITTED') {}
@@ -100,7 +119,7 @@ const verifier: AckReceiptVerifier = {
     if (receipt.signature !== sign(record, receipt.decision)) throw new ContractValidationError('bad ACK signature (decision not covered)');
   },
 };
-const mkOutbox = (db: PgTransactor, streamId: string) => new PgDurableOutbox<Raw, Clean>(db, { streamId, sanitizer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' });
+const mkOutbox = (db: PgTransactor, streamId: string) => new PgDurableOutbox<Raw, Clean>(db, { streamId, sanitizer, schema: SCHEMA, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' });
 
 async function applyDDL(): Promise<void> {
   for (const stmt of HA_OUTBOX_PG_SCHEMA.split(';').map((s) => s.trim()).filter(Boolean)) await pool.query(stmt);
@@ -109,7 +128,7 @@ async function resetSchema(): Promise<void> {
   await pool.query('DROP SCHEMA IF EXISTS shadow CASCADE');
   await pool.query('DROP TABLE IF EXISTS ha_outbox_rows, ha_outbox_applied, ha_outbox_fence, ha_outbox_source_checkpoint, ha_outbox_receiver_checkpoint, ha_outbox_publisher_lease, ha_outbox_quarantine, ha_outbox_meta CASCADE');
   await applyDDL();
-  await provisionSchemaVersion(serial); // attests the fresh schema, then stamps v2
+  await provisionSchemaVersion(serial, SCHEMA); // attests the fresh schema, then stamps v2
 }
 async function provision(streamId: string, epoch = 'e1'): Promise<void> {
   await pool.query('INSERT INTO ha_outbox_fence (stream_id, fence_token) VALUES ($1,0)', [streamId]);
@@ -122,7 +141,7 @@ const unacked = async (sid: string) => Number((await pool.query('SELECT count(*)
  *  serializable tx and returns a signed receipt carrying the receiver decision.
  *  Every decision is recorded (with the sequence, in real delivery order). */
 function receiverTransport(streamId: string, decisions: Array<{ seq: number; decision: ReceiverDecision }>): OutboxTransport {
-  const receiver = new PgReceiverCheckpoint<Clean>(streamId, sanitizer, applierRecording);
+  const receiver = new PgReceiverCheckpoint<Clean>(streamId, sanitizer, applierRecording, SCHEMA);
   return {
     async deliverAndAwaitAck(record) {
       const decision = await serial.transaction((e) => receiver.verifyAndApplyInTx(createBoundTx(e), record as OutboxRecord<Clean>));
@@ -175,8 +194,8 @@ async function main(): Promise<void> {
     for (let i = 0; i < N; i++) await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'p' + i }, fenceToken: 0n }));
     const decisions: Array<{ seq: number; decision: ReceiverDecision }> = [];
     const transport = receiverTransport(sid, decisions);
-    const pubA = new PgDurablePublisher<Clean>(serial, sid, transport, 'quarantine', sanitizer, verifier, { leaseMs: 30_000 });
-    const pubB = new PgDurablePublisher<Clean>(serial, sid, transport, 'quarantine', sanitizer, verifier, { leaseMs: 30_000 });
+    const pubA = new PgDurablePublisher<Clean>(serial, sid, transport, 'quarantine', sanitizer, verifier, SCHEMA, { leaseMs: 30_000 });
+    const pubB = new PgDurablePublisher<Clean>(serial, sid, transport, 'quarantine', sanitizer, verifier, SCHEMA, { leaseMs: 30_000 });
     for (let round = 0; round < 40; round++) {
       await Promise.all([pubA.drainOnce(), pubB.drainOnce()]);
       if ((await unacked(sid)) === 0) break;
@@ -194,7 +213,7 @@ async function main(): Promise<void> {
     const ob = mkOutbox(serial, sid);
     for (let i = 0; i < N; i++) await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'p' + i }, fenceToken: 0n }));
     const decisions: Array<{ seq: number; decision: ReceiverDecision }> = [];
-    const receiver = new PgReceiverCheckpoint<Clean>(sid, sanitizer, applierRecording);
+    const receiver = new PgReceiverCheckpoint<Clean>(sid, sanitizer, applierRecording, SCHEMA);
     let deliveredByA = 0;
     // Publisher A: short lease, stops (throws) after delivering 4
     const transportA: OutboxTransport = { async deliverAndAwaitAck(record) {
@@ -204,13 +223,13 @@ async function main(): Promise<void> {
       decisions.push({ seq: record.sequence, decision: d });
       return receiptFor(record, d);
     } };
-    const pubA = new PgDurablePublisher<Clean>(serial, sid, transportA, 'quarantine', sanitizer, verifier, { leaseMs: 200 });
+    const pubA = new PgDurablePublisher<Clean>(serial, sid, transportA, 'quarantine', sanitizer, verifier, SCHEMA, { leaseMs: 200 });
     await assert.rejects(() => pubA.drainOnce(), /publisher A stopped/);
     // wait for A's lease to expire, then B finishes the rest
     await new Promise((r) => setTimeout(r, 300));
     const transportB = receiverTransport(sid, decisions);
     // rebind B's receiver to the shared applied-order recorder (already global)
-    const pubB = new PgDurablePublisher<Clean>(serial, sid, transportB, 'quarantine', sanitizer, verifier, { leaseMs: 30_000 });
+    const pubB = new PgDurablePublisher<Clean>(serial, sid, transportB, 'quarantine', sanitizer, verifier, SCHEMA, { leaseMs: 30_000 });
     for (let round = 0; round < 20; round++) { await pubB.drainOnce(); if ((await unacked(sid)) === 0) break; }
     assert.ok(!decisions.some((d) => d.decision === 'reject-gap'), 'gap during hand-off');
     assert.deepEqual(appliedOrder, Array.from({ length: N }, (_, i) => i + 1), 'hand-off applied out of order');
@@ -223,7 +242,7 @@ async function main(): Promise<void> {
     for (let i = 0; i < 3; i++) await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'p' + i }, fenceToken: 0n }));
     // transport forces a terminal reject-fork on seq 1
     const transport: OutboxTransport = { async deliverAndAwaitAck(record) { return receiptFor(record, record.sequence === 1 ? 'reject-fork' : 'applied'); } };
-    const pub = new PgDurablePublisher<Clean>(serial, sid, transport, 'quarantine', sanitizer, verifier, { leaseMs: 30_000 });
+    const pub = new PgDurablePublisher<Clean>(serial, sid, transport, 'quarantine', sanitizer, verifier, SCHEMA, { leaseMs: 30_000 });
     const res = await pub.drainOnce();
     assert.equal(res.quarantined, 1); assert.equal(res.acked, 0); assert.equal(res.published, 1);
     assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM ha_outbox_quarantine WHERE stream_id=$1', [sid])).rows[0].n), 1);
@@ -235,12 +254,12 @@ async function main(): Promise<void> {
     const sid = 'sc:transient/v1'; await provision(sid);
     const ob = mkOutbox(serial, sid);
     await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'p0' }, fenceToken: 0n }));
-    const transientPub = new PgDurablePublisher<Clean>(serial, sid, { async deliverAndAwaitAck(r) { return receiptFor(r, 'reject-fence'); } }, 'quarantine', sanitizer, verifier, { leaseMs: 30_000 });
+    const transientPub = new PgDurablePublisher<Clean>(serial, sid, { async deliverAndAwaitAck(r) { return receiptFor(r, 'reject-fence'); } }, 'quarantine', sanitizer, verifier, SCHEMA, { leaseMs: 30_000 });
     const t = await transientPub.drainOnce();
     assert.equal(t.acked, 0); assert.equal(t.retriable, true);
     assert.equal(await unacked(sid), 1, 'transient reject must not consume the row');
     // now deliver applied and confirm exactly-once
-    const okPub = new PgDurablePublisher<Clean>(serial, sid, { async deliverAndAwaitAck(r) { return receiptFor(r, 'applied'); } }, 'quarantine', sanitizer, verifier, { leaseMs: 30_000 });
+    const okPub = new PgDurablePublisher<Clean>(serial, sid, { async deliverAndAwaitAck(r) { return receiptFor(r, 'applied'); } }, 'quarantine', sanitizer, verifier, SCHEMA, { leaseMs: 30_000 });
     assert.equal((await okPub.drainOnce()).acked, 1);
     assert.equal(await unacked(sid), 0);
     // stale guarded ack affects zero rows
@@ -254,10 +273,10 @@ async function main(): Promise<void> {
     const dig = (seq: number, m: Clean) => canonicalOpDigest<Clean>({ streamId: sid, sourceEpoch: 'e1', sequence: seq, fenceToken: '0', mutation: m as SanitizedMutation<Clean> });
     const rec = (seq: number, m: Clean): OutboxRecord<Clean> => ({ contractVersion: '1', streamId: sid, sourceEpoch: 'e1', sequence: seq, fenceToken: '0', opDigest: dig(seq, m), mutation: m as SanitizedMutation<Clean> });
     const applyWith = (rcv: PgReceiverCheckpoint<Clean>, r: OutboxRecord<Clean>) => serial.transaction((e) => rcv.verifyAndApplyInTx(createBoundTx(e), r));
-    const r1 = new PgReceiverCheckpoint<Clean>(sid, sanitizer, applierRecording);
+    const r1 = new PgReceiverCheckpoint<Clean>(sid, sanitizer, applierRecording, SCHEMA);
     assert.equal(await applyWith(r1, rec(1, { pairId: 'a' })), 'applied');
     assert.equal(await applyWith(r1, rec(2, { pairId: 'b' })), 'applied');
-    const r2 = new PgReceiverCheckpoint<Clean>(sid, sanitizer, applierRecording); // restart
+    const r2 = new PgReceiverCheckpoint<Clean>(sid, sanitizer, applierRecording, SCHEMA); // restart
     assert.equal(await applyWith(r2, rec(1, { pairId: 'a' })), 'duplicate-ok');
     assert.equal(await applyWith(r2, rec(1, { pairId: 'FORK' })), 'reject-fork');
     assert.equal(Number((await pool.query('SELECT sequence FROM ha_outbox_receiver_checkpoint WHERE stream_id=$1', [sid])).rows[0].sequence), 2);
@@ -288,7 +307,7 @@ async function main(): Promise<void> {
                WHERE rel.relname='ha_outbox_rows' AND c.contype='c' AND pg_get_constraintdef(c.oid) LIKE '%op_digest%'
       LOOP EXECUTE 'ALTER TABLE ha_outbox_rows DROP CONSTRAINT '||quote_ident(r.conname); END LOOP; END $$;`);
     await assert.rejects(() => serial.transaction((e) => attestSchema(e)), /attestation failed/);
-    await assert.rejects(() => migrateSchemaToCurrent(serial), /attestation failed/, 'migration must not stamp a weakened schema');
+    await assert.rejects(() => migrateSchemaToCurrent(serial, SCHEMA), /attestation failed/, 'migration must not stamp a weakened schema');
 
     // (b) missing/wrong partial deliverable index
     await resetSchema();
@@ -322,7 +341,7 @@ async function main(): Promise<void> {
     await applyDDL();
     assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), 1, 'DDL must NOT auto-bump an existing meta row');
     await assert.rejects(() => assertSchemaVersion(serial), /schema version mismatch/);
-    await migrateSchemaToCurrent(serial); // attests OK -> advances
+    await migrateSchemaToCurrent(serial, SCHEMA); // attests OK -> advances
     assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), HA_OUTBOX_SCHEMA_VERSION);
     await assertSchemaVersion(serial);
   });
@@ -333,17 +352,36 @@ async function main(): Promise<void> {
     await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'keepme' }, fenceToken: 0n }));
     // simulate a future version sharing this exact catalog (semantic-only revision / pre-staged marker)
     await pool.query('UPDATE ha_outbox_meta SET schema_version = 3 WHERE id = 1');
-    await assert.rejects(() => migrateSchemaToCurrent(serial), /refusing to downgrade/);
+    await assert.rejects(() => migrateSchemaToCurrent(serial, SCHEMA), /refusing to downgrade/);
     assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), 3, 'future version must be preserved');
     assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM ha_outbox_rows WHERE stream_id=$1', [sid])).rows[0].n), 1, 'data must be preserved on refused downgrade');
     // being already-current is a clean no-op
     await pool.query('UPDATE ha_outbox_meta SET schema_version = $1 WHERE id = 1', [HA_OUTBOX_SCHEMA_VERSION]);
-    await migrateSchemaToCurrent(serial);
+    await migrateSchemaToCurrent(serial, SCHEMA);
     assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), HA_OUTBOX_SCHEMA_VERSION);
   });
 
+  await check('(R7/HIGH1) operations bind to the configured schema even under a hostile pooled search_path', async () => {
+    // good HA schema lives in public (SCHEMA); a malformed same-name set lives in evil
+    await pool.query('CREATE SCHEMA evil');
+    await pool.query('CREATE TABLE evil.ha_outbox_rows (bogus int)');
+    const sid = 'sc:pin/v1'; await provision(sid);
+    // a publisher whose CONNECTIONS default search_path to evil, but configured schema = public
+    const evilDb = new EvilDefaultPg('evil');
+    const boundOutbox = new PgDurableOutbox<Raw, Clean>(evilDb, { streamId: sid, sanitizer, schema: SCHEMA, maxPendingRows: 100, backpressure: 'quarantine' });
+    // the append must land in PUBLIC (the pinned schema), not evil — proven by the row appearing in public
+    const h = await boundOutbox.withOutboxTx((tx) => boundOutbox.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'p0' }, fenceToken: 0n }));
+    assert.equal(h.sequence, 1);
+    assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM public.ha_outbox_rows WHERE stream_id=$1', [sid])).rows[0].n), 1, 'operation must bind to the pinned schema, not the hostile default');
+    // readiness for the good schema does not make an operation configured for evil pass
+    await assertSchemaReady(serial, SCHEMA); // public is ready
+    await assert.rejects(() => assertSchemaReady(serial, 'evil'), /attestation failed|schema context/, 'readiness must be per-configured-schema and fail closed for a malformed schema');
+    // a configured schema that does not exist fails closed (no silent fallback)
+    await assert.rejects(() => assertSchemaReady(serial, 'nonexistent_schema'), /schema context mismatch/);
+  });
+
   await check('(R6/HIGH2) assertSchemaReady catches post-stamp structural drift (version-only check does not)', async () => {
-    await assertSchemaReady(serial); // fresh + stamped -> ready
+    await assertSchemaReady(serial, SCHEMA); // fresh + stamped -> ready
     // validly stamped v2, then drop a CHECK while leaving meta = 2
     await pool.query(`DO $$ DECLARE r record; BEGIN
       FOR r IN SELECT conname FROM pg_constraint c JOIN pg_class rel ON rel.oid=c.conrelid
@@ -351,12 +389,12 @@ async function main(): Promise<void> {
       LOOP EXECUTE 'ALTER TABLE ha_outbox_rows DROP CONSTRAINT '||quote_ident(r.conname); END LOOP; END $$;`);
     assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), HA_OUTBOX_SCHEMA_VERSION);
     await assertSchemaVersion(serial); // version-only check still passes (the bypass)
-    await assert.rejects(() => assertSchemaReady(serial), /attestation failed/, 'readiness gate must catch structural drift');
+    await assert.rejects(() => assertSchemaReady(serial, SCHEMA), /attestation failed/, 'readiness gate must catch structural drift');
     // dropping a table too
     await resetSchema();
-    await assertSchemaReady(serial);
+    await assertSchemaReady(serial, SCHEMA);
     await pool.query('DROP INDEX ha_outbox_rows_deliverable');
-    await assert.rejects(() => assertSchemaReady(serial), /attestation failed/);
+    await assert.rejects(() => assertSchemaReady(serial, SCHEMA), /attestation failed/);
   });
 
   await check('(R5/HIGH2) quarantine conflict with a mismatched preexisting row fails closed', async () => {
@@ -365,7 +403,7 @@ async function main(): Promise<void> {
     await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'p0' }, fenceToken: 0n }));
     // plant a LYING quarantine row for (sid,e1,1): different digest + different decision
     await pool.query("INSERT INTO ha_outbox_quarantine (stream_id, source_epoch, sequence, op_digest, decision) VALUES ($1,'e1',1,$2,'reject-stale')", [sid, 'b'.repeat(64)]);
-    const forkPub = new PgDurablePublisher<Clean>(serial, sid, { async deliverAndAwaitAck(r) { return receiptFor(r, 'reject-fork'); } }, 'quarantine', sanitizer, verifier, { leaseMs: 30_000 });
+    const forkPub = new PgDurablePublisher<Clean>(serial, sid, { async deliverAndAwaitAck(r) { return receiptFor(r, 'reject-fork'); } }, 'quarantine', sanitizer, verifier, SCHEMA, { leaseMs: 30_000 });
     await assert.rejects(() => forkPub.drainOnce(), /quarantine record conflict/);
     // the source row must NOT have been quarantined on a lying record
     assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM ha_outbox_rows WHERE stream_id=$1 AND quarantined_at IS NOT NULL', [sid])).rows[0].n), 0);
@@ -376,13 +414,13 @@ async function main(): Promise<void> {
     const sid = 'sc:steal/v1'; await provision(sid); const N = 8;
     const ob = mkOutbox(serial, sid);
     for (let i = 0; i < N; i++) await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'p' + i }, fenceToken: 0n }));
-    const receiver = new PgReceiverCheckpoint<Clean>(sid, sanitizer, applierRecording);
+    const receiver = new PgReceiverCheckpoint<Clean>(sid, sanitizer, applierRecording, SCHEMA);
     const slow: OutboxTransport = { async deliverAndAwaitAck(record) {
       await new Promise((r) => setTimeout(r, 120)); // slow delivery > lease -> lease can be stolen mid-flight
       const d = await serial.transaction((e) => receiver.verifyAndApplyInTx(createBoundTx(e), record as OutboxRecord<Clean>));
       return receiptFor(record, d);
     } };
-    const mkPub = () => new PgDurablePublisher<Clean>(serial, sid, slow, 'quarantine', sanitizer, verifier, { leaseMs: 100 }); // short lease
+    const mkPub = () => new PgDurablePublisher<Clean>(serial, sid, slow, 'quarantine', sanitizer, verifier, SCHEMA, { leaseMs: 100 }); // short lease
     const loop = async () => { for (let i = 0; i < 100; i++) { try { await mkPub().drainOnce(); } catch (e) { if (!/lease/i.test(String(e))) throw e; } if ((await unacked(sid)) === 0) break; await new Promise((r) => setTimeout(r, 15)); } };
     await Promise.all([loop(), loop()]);
     // idempotent receiver: each sequence applied EXACTLY once, in order, despite stolen leases + redelivery

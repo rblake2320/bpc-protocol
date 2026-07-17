@@ -12,9 +12,18 @@
  * BOUNDARY: this file is the mechanism + its adversarial LOGIC tests (snapshot
  * fake). It makes NO crash-durable-HA claim on its own, and the fake CANNOT
  * establish lock/isolation/lease/concurrency behavior — those are proven only
- * by the real-PostgreSQL concurrency suite (tests/ha-outbox-pg.realpg.test.ts,
- * gated on a live server). Issue #16 stays OPEN until the two-node
+ * by the real-PostgreSQL integration (ha-outbox-pg-integration.mts, run in CI
+ * via `npm run test:postgres:ha`, which THROWS if BPC_TEST_POSTGRES_URL is unset
+ * so it cannot silently skip). Issue #16 stays OPEN until the two-node
  * PostgreSQL(+Redis) failover/split-brain drill passes with recorded RPO/RTO.
+ *
+ * STARTUP CONTRACT: callers MUST invoke `assertSchemaReady(db, schema)` at
+ * startup (full manifest attestation + version, in the pinned schema) before
+ * constructing/using these classes, and pass the SAME `schema` to every
+ * constructor. Direct construction does NOT itself attest — there is no
+ * constructor-level unforgeable readiness token in this slice (a possible
+ * hardening), so a caller that skips the startup gate can operate against an
+ * un-attested schema. This is a documented boundary, not a silent gap; #16 open.
  */
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
@@ -102,6 +111,32 @@ async function assertSerializable(exec: PgExecutor): Promise<void> {
   const rows = (await exec.query('SHOW transaction_isolation')).rows;
   const level = String(rows[0]?.transaction_isolation ?? '').toLowerCase();
   if (level !== 'serializable') throw new ContractValidationError(`critical tx requires SERIALIZABLE isolation; got '${level}'`);
+}
+
+/** A validated PostgreSQL schema identifier (lowercase-anchored, no injection). */
+function assertSchemaIdentifier(schema: string): void {
+  if (!/^[A-Za-z_][A-Za-z0-9_$]{0,62}$/.test(schema)) throw new ContractValidationError(`invalid schema identifier: ${schema}`);
+}
+
+/**
+ * (R7/HIGH1) PIN the schema identity for THIS tx. A pooled connection may carry
+ * any default search_path, so every critical tx sets search_path to the
+ * configured schema (LOCAL, parameterized — no injection) and asserts
+ * current_schema() is exactly that schema. All later unqualified operational SQL
+ * — and the manifest attestation — therefore resolve in the SAME pinned schema;
+ * readiness for schema A can never bind operations that land in schema B.
+ */
+async function pinSchema(exec: PgExecutor, schema: string): Promise<void> {
+  assertSchemaIdentifier(schema);
+  await exec.query('SELECT set_config($1, $2, true)', ['search_path', schema]);
+  const cur = (await exec.query('SELECT current_schema() AS s')).rows[0]?.s;
+  if (cur !== schema) throw new ContractValidationError(`schema context mismatch: current_schema=${String(cur)} pinned=${schema}`);
+}
+
+/** Enter a critical tx: SERIALIZABLE + pinned schema identity, together. */
+async function enterCriticalTx(exec: PgExecutor, schema: string): Promise<void> {
+  await assertSerializable(exec);
+  await pinSchema(exec, schema);
 }
 
 /** Mint a `DurableTx<PgBackend>` bound to a live executor. The backend is the
@@ -283,9 +318,9 @@ export async function assertSchemaVersion(db: PgTransactor): Promise<void> {
  * that was validly stamped v2 and later mutated fails here even though
  * assertSchemaVersion alone would pass.
  */
-export async function assertSchemaReady(db: PgTransactor): Promise<void> {
+export async function assertSchemaReady(db: PgTransactor, schema: string): Promise<void> {
   await db.transaction(async (exec) => {
-    await assertSerializable(exec);
+    await enterCriticalTx(exec, schema);
     await attestSchema(exec);
     const rows = (await exec.query('SELECT schema_version FROM ha_outbox_meta WHERE id = 1')).rows;
     if (!rows.length) throw new ContractValidationError('ha_outbox schema is not provisioned (no meta row)');
@@ -295,36 +330,42 @@ export async function assertSchemaReady(db: PgTransactor): Promise<void> {
 }
 
 /**
- * (R5/HIGH) FRESH provisioning: stamp the current version ONLY on a genuinely
- * fresh, fully-attested schema — full catalog attestation THEN a stamp that
- * inserts a meta row only if none exists, all in one serializable tx. Never
- * bumps an existing meta row; never stamps a malformed/partial/foreign layout.
+ * (R5/R7/HIGH2) FRESH provisioning in the PINNED schema: attest the fully-fresh
+ * catalog, then stamp the current version with a PLAIN insert whose effect is
+ * asserted (affectedOne). An existing meta row at exactly the current version is
+ * an explicit idempotent no-op; ANY other existing row (a future marker, a lower
+ * version, or multiple authority rows) is REJECTED — fresh provisioning never
+ * silently succeeds against a non-fresh database. Ends by asserting readiness.
  */
-export async function provisionSchemaVersion(db: PgTransactor): Promise<void> {
+export async function provisionSchemaVersion(db: PgTransactor, schema: string): Promise<void> {
   await db.transaction(async (exec) => {
-    await assertSerializable(exec);
+    await enterCriticalTx(exec, schema);
     await attestSchema(exec);
-    await exec.query(
-      `INSERT INTO ha_outbox_meta (id, schema_version)
-       SELECT 1, ${HA_OUTBOX_SCHEMA_VERSION} WHERE NOT EXISTS (SELECT 1 FROM ha_outbox_meta)
-       ON CONFLICT (id) DO NOTHING`,
-    );
+    const rows = (await exec.query('SELECT schema_version FROM ha_outbox_meta FOR UPDATE')).rows;
+    if (rows.length > 1) throw new ContractValidationError('multiple schema-version authority rows');
+    if (rows.length === 1) {
+      const cur = safeSeq(rows[0].schema_version, 'schema_version');
+      if (cur === HA_OUTBOX_SCHEMA_VERSION) return; // idempotent: already provisioned at current
+      throw new ContractValidationError(`fresh provisioning refused: meta already at version ${cur}`);
+    }
+    const res = await exec.query(`INSERT INTO ha_outbox_meta (id, schema_version) VALUES (1, ${HA_OUTBOX_SCHEMA_VERSION})`);
+    affectedOne(res, 'fresh schema provision');
   });
 }
 
 /**
- * (R4/R5/R6/HIGH) EXPLICIT version advance — the ONLY path that may bump an
- * existing meta row. Runs a FULL catalog attestation (attestSchema) in the SAME
- * serializable tx, then advances FORWARD-ONLY: it reads the current version under
- * lock and only stamps when meta is absent OR at a lower supported version.
+ * (R4/R5/R6/R7/HIGH) EXPLICIT version advance in the PINNED schema — the ONLY
+ * path that may bump an existing meta row. Runs a FULL catalog attestation in the
+ * SAME serializable tx, then advances FORWARD-ONLY: it reads the current version
+ * under lock and only stamps when meta is absent OR at a lower supported version.
  * A version already at current is a no-op; a FUTURE version (> this build — e.g.
  * a semantic-only revision or a pre-staged marker sharing this catalog) is
  * REFUSED, never silently downgraded. A malformed/partial/foreign-schema layout
  * fails attestation, so the version can never race ahead of the real structure.
  */
-export async function migrateSchemaToCurrent(db: PgTransactor): Promise<void> {
+export async function migrateSchemaToCurrent(db: PgTransactor, schema: string): Promise<void> {
   await db.transaction(async (exec) => {
-    await assertSerializable(exec);
+    await enterCriticalTx(exec, schema);
     await attestSchema(exec);
     // read current authority under lock (meta PK + id=1 CHECK guarantee <= 1 row;
     // still assert it defensively so multiple/foreign authority rows fail closed).
@@ -346,6 +387,9 @@ export async function migrateSchemaToCurrent(db: PgTransactor): Promise<void> {
 export interface PgOutboxOptions<Raw, Clean> {
   streamId: string;
   sanitizer: MutationSanitizer<Raw, Clean>;
+  /** (R7) the configured schema this outbox is pinned to — every critical tx
+   *  SET LOCAL search_paths to it and asserts current_schema() matches. */
+  schema: string;
   /** Max unpublished/unacked rows before admission fails closed. */
   maxPendingRows: number;
   /** Backpressure policy surfaced to the publisher contract. */
@@ -360,10 +404,13 @@ export interface PgOutboxOptions<Raw, Clean> {
  */
 export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, PgBackend> {
   readonly sanitizer: MutationSanitizer<Raw, Clean>;
+  private readonly schema: string;
   constructor(private readonly db: PgTransactor, private readonly opts: PgOutboxOptions<Raw, Clean>) {
     if (!Number.isSafeInteger(opts.maxPendingRows) || opts.maxPendingRows <= 0) {
       throw new ContractValidationError('maxPendingRows must be a positive safe integer');
     }
+    assertSchemaIdentifier(opts.schema);
+    this.schema = opts.schema;
     this.sanitizer = opts.sanitizer;
   }
 
@@ -371,7 +418,7 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
    *  its authoritative mutation and `appendInTx` inside `fn`; both commit atomically. */
   async withOutboxTx<T>(fn: (tx: PgTx, exec: PgExecutor) => Promise<T>): Promise<T> {
     return this.db.transaction(async (exec) => {
-      await assertSerializable(exec);
+      await enterCriticalTx(exec, this.schema);
       return fn(createBoundTx(exec), exec);
     });
   }
@@ -505,6 +552,7 @@ export interface DrainResult {
  */
 export class PgDurablePublisher<Clean> {
   private readonly leaseMs: number;
+  private readonly schema: string;
   constructor(
     private readonly db: PgTransactor,
     private readonly streamId: string,
@@ -514,16 +562,20 @@ export class PgDurablePublisher<Clean> {
     private readonly sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'assertSanitized'>,
     /** (HIGH2) verifier for the receiver's signed decision receipt — REQUIRED. */
     private readonly ackVerifier: AckReceiptVerifier,
+    /** (R7) the configured schema this publisher is pinned to. */
+    schema: string,
     opts: PgPublisherOptions = { leaseMs: 30_000 },
   ) {
     if (!Number.isSafeInteger(opts.leaseMs) || opts.leaseMs <= 0) throw new ContractValidationError('leaseMs must be a positive safe integer');
+    assertSchemaIdentifier(schema);
+    this.schema = schema;
     this.leaseMs = opts.leaseMs;
   }
 
   /** Acquire the per-stream lease (steal only if expired). Returns true if held. */
   private async acquireLease(leaseToken: string): Promise<boolean> {
     return this.db.transaction(async (exec) => {
-      await assertSerializable(exec);
+      await enterCriticalTx(exec, this.schema);
       const res = await exec.query(
         `INSERT INTO ha_outbox_publisher_lease (stream_id, lease_token, lease_until)
          VALUES ($1, $2, now() + ($3::text || ' milliseconds')::interval)
@@ -539,7 +591,7 @@ export class PgDurablePublisher<Clean> {
 
   private async releaseLease(leaseToken: string): Promise<void> {
     await this.db.transaction(async (exec) => {
-      await assertSerializable(exec);
+      await enterCriticalTx(exec, this.schema);
       await exec.query('UPDATE ha_outbox_publisher_lease SET lease_token = NULL, lease_until = NULL WHERE stream_id = $1 AND lease_token = $2', [this.streamId, leaseToken]);
     });
   }
@@ -547,7 +599,7 @@ export class PgDurablePublisher<Clean> {
   /** Read the lowest deliverable row while re-asserting lease ownership. */
   private async nextDeliverable(leaseToken: string): Promise<Record<string, unknown> | null> {
     return this.db.transaction(async (exec) => {
-      await assertSerializable(exec);
+      await enterCriticalTx(exec, this.schema);
       const lease = (await exec.query('SELECT lease_token FROM ha_outbox_publisher_lease WHERE stream_id = $1 FOR UPDATE', [this.streamId])).rows;
       if (!lease.length || lease[0].lease_token !== leaseToken) throw new ContractValidationError('publisher lease lost — aborting drain');
       const rows = (await exec.query(
@@ -592,7 +644,7 @@ export class PgDurablePublisher<Clean> {
         if (ACK_DECISIONS.has(receipt.decision)) {
           // (H1) durable ownership → ACK exactly this row, then advance.
           await this.db.transaction(async (exec) => {
-            await assertSerializable(exec);
+            await enterCriticalTx(exec, this.schema);
             const lease = (await exec.query('SELECT lease_token FROM ha_outbox_publisher_lease WHERE stream_id = $1 FOR UPDATE', [this.streamId])).rows;
             if (!lease.length || lease[0].lease_token !== leaseToken) throw new ContractValidationError('publisher lease lost — not acking');
             const res = await exec.query(
@@ -612,7 +664,7 @@ export class PgDurablePublisher<Clean> {
         }
         // (H1) terminal NACK → quarantine + halt. Never ACK, never drop.
         await this.db.transaction(async (exec) => {
-          await assertSerializable(exec);
+          await enterCriticalTx(exec, this.schema);
           const lease = (await exec.query('SELECT lease_token FROM ha_outbox_publisher_lease WHERE stream_id = $1 FOR UPDATE', [this.streamId])).rows;
           if (!lease.length || lease[0].lease_token !== leaseToken) throw new ContractValidationError('publisher lease lost — not quarantining');
           const ins = await exec.query(
@@ -660,16 +712,19 @@ export interface MutationApplier<Clean> {
 export class PgReceiverCheckpoint<Clean> implements ReceiverCheckpoint<Clean, PgBackend> {
   readonly sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'assertSanitized'>;
   readonly epochAuthorizer: EpochTransitionAuthorizer;
+  private readonly schema: string;
   constructor(
     private readonly streamId: string,
     sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'assertSanitized'>,
     private readonly applier: MutationApplier<Clean>,
+    /** (R7) the configured schema this receiver is pinned to. */
+    schema: string,
     epochAuthorizer: EpochTransitionAuthorizer = { async authorizeTransition() { throw new ContractValidationError('epoch transition not authorized in this slice'); } },
-  ) { this.sanitizer = sanitizer; this.epochAuthorizer = epochAuthorizer; }
+  ) { assertSchemaIdentifier(schema); this.schema = schema; this.sanitizer = sanitizer; this.epochAuthorizer = epochAuthorizer; }
 
   async verifyAndApplyInTx(tx: PgTx, record: OutboxRecord<Clean>): Promise<ReceiverDecision> {
     const exec = execOf(tx);
-    await assertSerializable(exec);
+    await enterCriticalTx(exec, this.schema);
     if (record.streamId !== this.streamId) throw new ContractValidationError('streamId mismatch for this receiver');
     assertHeaderConformant(record);
 
@@ -724,10 +779,11 @@ export class PgReceiverCheckpoint<Clean> implements ReceiverCheckpoint<Clean, Pg
 
 /** Persisted, monotonic promotion fence backed by the fence table. */
 export class PgPromotionFence implements PromotionFence {
-  constructor(private readonly db: PgTransactor) {}
+  private readonly schema: string;
+  constructor(private readonly db: PgTransactor, schema: string) { assertSchemaIdentifier(schema); this.schema = schema; }
   async acquire(streamId: string): Promise<FenceToken> {
     return this.db.transaction(async (exec) => {
-      await assertSerializable(exec);
+      await enterCriticalTx(exec, this.schema);
       const res = await exec.query(
         `INSERT INTO ha_outbox_fence (stream_id, fence_token) VALUES ($1, 1)
          ON CONFLICT (stream_id) DO UPDATE SET fence_token = ha_outbox_fence.fence_token + 1
@@ -737,7 +793,10 @@ export class PgPromotionFence implements PromotionFence {
     });
   }
   async current(streamId: string): Promise<FenceToken> {
-    const rows = (await this.db.transaction((exec) => exec.query('SELECT fence_token FROM ha_outbox_fence WHERE stream_id = $1', [streamId]))).rows;
+    const rows = (await this.db.transaction(async (exec) => {
+      await enterCriticalTx(exec, this.schema);
+      return exec.query('SELECT fence_token FROM ha_outbox_fence WHERE stream_id = $1', [streamId]);
+    })).rows;
     return rows.length ? BigInt(String(rows[0].fence_token)) : 0n;
   }
 }
