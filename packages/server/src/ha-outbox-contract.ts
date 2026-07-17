@@ -39,6 +39,17 @@ export const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$/;
 /** Bounds for canonicalization (DoS-safe, deterministic). */
 export const CANON_MAX_DEPTH = 64;
 export const CANON_MAX_NODES = 10_000;
+/** Per-string and total canonical UTF-8 byte bounds — kept far below the u32
+ *  length-prefix ceiling so a single huge string cannot overflow the framing
+ *  or DoS the hash. */
+export const CANON_MAX_STRING_BYTES = 1 << 16; // 65,536
+export const CANON_MAX_TOTAL_BYTES = 1 << 20;  // 1,048,576
+/** u32 length-prefix ceiling (fields must be strictly below this). */
+const U32_CEIL = 0x1_0000_0000;
+/** Canonical fence token: non-negative decimal, no leading zeros. */
+export const FENCE_TOKEN_PATTERN = /^(0|[1-9][0-9]{0,38})$/;
+/** opDigest: 64 lowercase hex. */
+const HEX64 = /^[0-9a-f]{64}$/;
 
 export class ContractValidationError extends Error {
   readonly code = 'ha_outbox_contract_validation';
@@ -67,7 +78,29 @@ const JCS_STRING_ESCAPE: Record<string, string> = {
   '"': '\\"', '\\': '\\\\', '\b': '\\b', '\f': '\\f', '\n': '\\n', '\r': '\\r', '\t': '\\t',
 };
 
+/** Reject strings containing a lone/unpaired UTF-16 surrogate. Otherwise UTF-8
+ *  encoding would replace it with U+FFFD, so two distinct strings could hash
+ *  identically. Applies to values AND object keys. */
+function assertNoLoneSurrogate(s: string): void {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const n = s.charCodeAt(i + 1);
+      if (!(n >= 0xdc00 && n <= 0xdfff)) throw new ContractValidationError('lone high surrogate is not canonicalizable');
+      i++; // valid pair
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      throw new ContractValidationError('lone low surrogate is not canonicalizable');
+    }
+  }
+}
+
+function utf8Len(s: string): number {
+  return Buffer.byteLength(s, 'utf8');
+}
+
 function jcsString(s: string): string {
+  assertNoLoneSurrogate(s);
+  if (utf8Len(s) > CANON_MAX_STRING_BYTES) throw new ContractValidationError('string exceeds CANON_MAX_STRING_BYTES');
   let out = '"';
   for (const ch of s) {
     const code = ch.codePointAt(0)!;
@@ -109,7 +142,6 @@ export function canonicalize(value: unknown): string {
       case 'symbol': throw new ContractValidationError('symbol is not canonicalizable');
     }
     if (Array.isArray(v)) {
-      // reject sparse arrays (holes)
       for (let i = 0; i < v.length; i++) {
         if (!(i in v)) throw new ContractValidationError('sparse array (hole) is not canonicalizable');
       }
@@ -117,51 +149,76 @@ export function canonicalize(value: unknown): string {
     }
     if (typeof v === 'object') {
       if (!isPlainObject(v)) throw new ContractValidationError('only plain objects are canonicalizable (no Date/Map/Set/class)');
-      const obj = v as Record<string, unknown>;
-      if (Object.prototype.hasOwnProperty.call(obj, '__proto__')) {
-        throw new ContractValidationError('__proto__ key is rejected');
+      // (3) reject own symbol keys and any accessor / non-data properties;
+      // reading a getter would execute code and break determinism.
+      if (Object.getOwnPropertySymbols(v).length > 0) throw new ContractValidationError('symbol keys are not canonicalizable');
+      const names = Object.getOwnPropertyNames(v);
+      for (const k of names) {
+        const d = Object.getOwnPropertyDescriptor(v, k)!;
+        if (!('value' in d)) throw new ContractValidationError(`accessor/non-data property '${k}' is not canonicalizable`);
+        if (k === '__proto__') throw new ContractValidationError('__proto__ key is rejected');
       }
-      // JCS: sort by UTF-16 code units (default JS string comparison).
-      const keys = Object.keys(obj).sort();
-      return '{' + keys.map((k) => jcsString(k) + ':' + walk(obj[k], depth + 1)).join(',') + '}';
+      const obj = v as Record<string, unknown>;
+      const keys = names.sort(); // JCS: UTF-16 code-unit order
+      return '{' + keys.map((k) => (assertNoLoneSurrogate(k), jcsString(k) + ':' + walk(obj[k], depth + 1))).join(',') + '}';
     }
     throw new ContractValidationError('value is not canonicalizable');
   };
-  return walk(value, 0);
+  const out = walk(value, 0);
+  // (2) total byte bound (per-string bound is enforced in jcsString).
+  if (utf8Len(out) > CANON_MAX_TOTAL_BYTES) throw new ContractValidationError('canonical form exceeds CANON_MAX_TOTAL_BYTES');
+  return out;
 }
 
 // ── (1) Length-prefixed digest framing ───────────────────────────────────────
 function u32be(n: number): Buffer {
+  // (2) reject fields at/over the u32 ceiling instead of wrapping via >>> 0.
+  if (!Number.isInteger(n) || n < 0 || n >= U32_CEIL) {
+    throw new ContractValidationError('field byte length exceeds the u32 framing ceiling');
+  }
   const b = Buffer.allocUnsafe(4);
-  b.writeUInt32BE(n >>> 0, 0);
+  b.writeUInt32BE(n, 0);
   return b;
 }
 
+/** (5) canonical decimal for the fence token bound into the digest. */
+function assertFenceToken(t: string): void {
+  if (typeof t !== 'string' || !FENCE_TOKEN_PATTERN.test(t)) {
+    throw new ContractValidationError('fenceToken must be canonical non-negative decimal (no leading zeros)');
+  }
+}
+
 /**
- * (1)(2) NORMATIVE opDigest. Each field is fed to SHA-256 as
+ * (1)(2)(5) NORMATIVE opDigest. Each field is fed to SHA-256 as
  * `u32be(utf8ByteLength(field)) || utf8(field)` in fixed order:
  *   domain, contractVersion, streamId, sourceEpoch, decimal(sequence),
- *   canonicalize(sanitizedMutation).
- * Length-prefixing removes any separator-collision ambiguity; the canonical
- * mutation is the JCS form above. The mutation MUST already be secret-stripped.
+ *   decimal(fenceToken), canonicalize(sanitizedMutation).
+ * The fence token is BOUND into the digest so a record cannot be paired with a
+ * different token. Length-prefixing removes separator-collision ambiguity. The
+ * mutation MUST already be secret-stripped.
  */
 export function canonicalOpDigest(input: {
   streamId: string;
   sourceEpoch: string;
   sequence: number;
+  fenceToken: string;
   mutation: unknown;
 }): string {
   assertId(input.streamId, 'streamId');
+  assertNoLoneSurrogate(input.streamId);
   assertId(input.sourceEpoch, 'sourceEpoch');
+  assertNoLoneSurrogate(input.sourceEpoch);
   if (!Number.isSafeInteger(input.sequence) || input.sequence < 0) {
     throw new ContractValidationError('sequence must be a non-negative safe integer');
   }
+  assertFenceToken(input.fenceToken);
   const fields = [
     HA_OUTBOX_DIGEST_DOMAIN,
     HA_OUTBOX_CONTRACT_VERSION,
     input.streamId,
     input.sourceEpoch,
     String(input.sequence),
+    input.fenceToken,
     canonicalize(input.mutation),
   ];
   const h = createHash('sha256');
@@ -175,23 +232,29 @@ export function canonicalOpDigest(input: {
 
 // ── Schema ────────────────────────────────────────────────────────────────
 
-/** (9) Branded type: a mutation that a validated protocol sanitizer produced. */
+/** (9)(10) Branded type: a mutation a validated protocol sanitizer produced.
+ *  The brand is TYPE-LEVEL only (erased at runtime); binding is enforced at
+ *  RUNTIME by the outbox/receiver invoking the sanitizer (see (10)). */
 export type SanitizedMutation<M> = M & { readonly __sanitized: unique symbol };
 
-/** (9) Each protocol MUST provide a sanitizer that strips secrets and validates
- *  the result. `sanitize` throws if the raw payload cannot be made secret-free.
- *  `assertSanitized` re-validates on the receiver before apply. */
+/** (9)(10) Each protocol MUST provide a sanitizer that strips secrets and
+ *  validates the result. `sanitize` throws if the raw payload cannot be made
+ *  secret-free. `assertSanitized` re-validates on the receiver before apply and
+ *  MUST throw on any residual secret / malformed shape. */
 export interface MutationSanitizer<Raw, Clean> {
   sanitize(raw: Raw): SanitizedMutation<Clean>;
   assertSanitized(candidate: unknown): asserts candidate is SanitizedMutation<Clean>;
 }
 
-/** (a) Every record carries the literal contractVersion and versioned streamId. */
+/** (a)(5) Every record carries literal contractVersion, versioned streamId, and
+ *  the canonical-decimal fence token bound into its digest. */
 export interface OutboxRecordHeader {
   contractVersion: ContractVersion;
   streamId: string;
   sourceEpoch: string;
   sequence: number;
+  /** (5) canonical non-negative decimal fence token, bound into opDigest. */
+  fenceToken: string;
   opDigest: string;
 }
 
@@ -210,45 +273,78 @@ export function idempotencyKeyOf(h: OutboxRecordHeader): IdempotencyKey {
   return { streamId: h.streamId, sourceEpoch: h.sourceEpoch, sequence: h.sequence };
 }
 
-/** (7) Validate a header's version + IDs; throws on any non-conformance. */
+/** (a)(4)(5) Validate a header fully; throws on any non-conformance. */
 export function assertHeaderConformant(h: OutboxRecordHeader): void {
   if (h.contractVersion !== HA_OUTBOX_CONTRACT_VERSION) {
     throw new ContractValidationError(`unsupported contractVersion ${String(h.contractVersion)}`);
   }
   assertId(h.streamId, 'streamId');
+  assertNoLoneSurrogate(h.streamId);
   assertId(h.sourceEpoch, 'sourceEpoch');
+  assertNoLoneSurrogate(h.sourceEpoch);
   if (!Number.isSafeInteger(h.sequence) || h.sequence < 0) {
     throw new ContractValidationError('sequence must be a non-negative safe integer');
   }
+  assertFenceToken(h.fenceToken);
+  if (!HEX64.test(h.opDigest)) throw new ContractValidationError('opDigest must be 64 lowercase hex');
 }
 
-// ── (8) Genesis / epoch transition / resync ─────────────────────────────────
-/** Genesis is sequence 0 of a source epoch. The first accepted mutation is
- *  sequence 1. A new sourceEpoch begins ONLY after detected loss/resync; its
- *  sequence restarts at 0 (genesis) and the receiver records the epoch order.
- *  A gap (received sequence > checkpoint+1) is never filled by assumption — it
- *  forces snapshot + tail resync under a NEW sourceEpoch. */
-export interface EpochBoundary {
+// ── (9) Sequence semantics + typed, digested, fenced epoch transition ─────────
+// Genesis = sequence 0 of a source epoch (no mutation). The first mutation is
+// sequence 1. A gap (received > checkpoint+1) is never filled by assumption; it
+// forces snapshot + tail resync under a governed FORWARD epoch transition.
+
+export interface EpochTransitionRecord {
+  contractVersion: ContractVersion;
   streamId: string;
-  /** Previous epoch this one supersedes, or null for the very first. */
-  previousEpoch: string | null;
-  newEpoch: string;
-  /** Durable snapshot the new epoch's tail continues from. */
+  /** epoch being superseded (must be the current durable epoch). */
+  fromEpoch: string;
+  /** new epoch — strictly forward; a receiver rejects a non-forward toEpoch. */
+  toEpoch: string;
+  /** durable snapshot sequence the new epoch's tail continues from. */
   snapshotSequence: number;
+  /** (5) fence token bound into the transition digest. */
+  fenceToken: string;
+  /** digest over the above (excluding this field). */
+  transitionDigest: string;
 }
 
-// ── Interfaces (type-only) ───────────────────────────────────────────────────
-
-/** (5) Opaque, backend-bound transaction handle. Callers obtain it from the
- *  backend's `withTransaction`; it is NOT constructible by callers. The brand
- *  prevents forging a `{ id }` literal. */
-export interface DurableTx {
-  readonly __durableTx: unique symbol;
+/** (9) NORMATIVE digest for an epoch transition (same length-prefixed framing). */
+export function epochTransitionDigest(input: {
+  streamId: string; fromEpoch: string; toEpoch: string; snapshotSequence: number; fenceToken: string;
+}): string {
+  assertId(input.streamId, 'streamId'); assertNoLoneSurrogate(input.streamId);
+  assertId(input.fromEpoch, 'fromEpoch'); assertNoLoneSurrogate(input.fromEpoch);
+  assertId(input.toEpoch, 'toEpoch'); assertNoLoneSurrogate(input.toEpoch);
+  if (!Number.isSafeInteger(input.snapshotSequence) || input.snapshotSequence < 0) {
+    throw new ContractValidationError('snapshotSequence must be a non-negative safe integer');
+  }
+  assertFenceToken(input.fenceToken);
+  const fields = [
+    HA_OUTBOX_DIGEST_DOMAIN + '/epoch-transition',
+    HA_OUTBOX_CONTRACT_VERSION, input.streamId, input.fromEpoch, input.toEpoch,
+    String(input.snapshotSequence), input.fenceToken,
+  ];
+  const h = createHash('sha256');
+  for (const f of fields) { const b = Buffer.from(f, 'utf8'); h.update(u32be(b.length)); h.update(b); }
+  return h.digest('hex');
 }
 
-/** (4) Monotonic fencing token. Persisted and stale-rejected by the authoritative
- *  resource; carrying it is not enough. */
+// ── (7) Backend-bound transaction handle ─────────────────────────────────────
+/** Opaque transaction handle parameterized by a BACKEND brand so a tx obtained
+ *  from backend A does not typecheck for backend B. Each backend declares its
+ *  own unique brand type; callers cannot forge one. */
+export interface DurableTx<TBackend = unknown> {
+  readonly __backend: TBackend;
+}
+
+/** (4) Monotonic fencing token. Persisted + stale-rejected by the authoritative
+ *  resource; the canonical-decimal form is what is bound into digests. */
 export type FenceToken = bigint;
+export function fenceTokenToDecimal(t: FenceToken): string {
+  if (typeof t !== 'bigint' || t < 0n) throw new ContractValidationError('fenceToken must be a non-negative bigint');
+  return t.toString(10);
+}
 
 export class StaleFenceError extends Error {
   readonly code = 'ha_outbox_stale_fence';
@@ -257,7 +353,6 @@ export class StaleFenceError extends Error {
     this.name = 'StaleFenceError';
   }
 }
-
 export class OutboxBackpressureError extends Error {
   readonly code = 'ha_outbox_backpressure';
   constructor(readonly policy: PublisherBackpressure) {
@@ -267,65 +362,115 @@ export class OutboxBackpressureError extends Error {
 }
 
 /**
- * (5)(6) The outbox ALLOCATES the sequence and enqueues WITHIN the caller's
- * durable transaction, binding sequence-allocation + mutation + outbox row
- * atomically. Admission/backpressure is enforced HERE, inside the tx: if the
- * outbox is at its declared bound, it throws OutboxBackpressureError which
- * aborts the caller's transaction — the authoritative mutation fails closed.
- * The authoritative resource persists+validates the fence token and throws
- * StaleFenceError if it is not current. Never sheds.
+ * (5)(6)(10)(11) The outbox holds the protocol's `sanitizer` and, within the
+ * caller's backend-bound transaction, sanitizes the raw mutation, allocates the
+ * sequence, binds the fence token, and enqueues the outbox row — all atomically.
+ * (10) The raw mutation is sanitized HERE (runtime binding), never trusted from
+ * the caller as pre-sanitized. (11) Admission is inside the tx: the authoritative
+ * mutation CANNOT commit without a durable admitted outbox row — at the bound it
+ * throws OutboxBackpressureError which aborts the tx; under the `quarantine`
+ * policy every mutation is refused (fail closed) until the backlog drains below
+ * the bound. Never sheds. The authoritative resource persists+validates the
+ * fence token (StaleFenceError).
  */
-export interface DurableOutbox<M = unknown> {
+export interface DurableOutbox<Raw = unknown, Clean = Raw, TBackend = unknown> {
+  readonly sanitizer: MutationSanitizer<Raw, Clean>;
   appendInTx(
-    tx: DurableTx,
-    input: { streamId: string; mutation: SanitizedMutation<M>; fenceToken: FenceToken },
+    tx: DurableTx<TBackend>,
+    input: { streamId: string; rawMutation: Raw; fenceToken: FenceToken },
   ): Promise<OutboxRecordHeader>;
 }
 
-/** (6)(g) The publisher ONLY drains committed rows: retries idempotently,
- *  records ACKs, never silently drops, never sheds. Backpressure is handled at
- *  admission (append), not here. */
+/** (6)(g)(11) The publisher ONLY drains committed rows: retries idempotently,
+ *  records ACKs, never sheds. `quarantine` = a declared fail-closed mode where
+ *  no authoritative mutation commits until the backlog drains; `fail-
+ *  authoritative-mutation` = each over-bound append aborts its own tx. */
 export type PublisherBackpressure = 'fail-authoritative-mutation' | 'quarantine';
 export interface OutboxPublisher {
   drainOnce(): Promise<{ published: number; acked: number }>;
   readonly backpressure: PublisherBackpressure;
 }
 
-/** Receiver decision returned by the single atomic operation. */
 export type ReceiverDecision =
-  | 'applied'        // fresh, in-order, verified → mutation+checkpoint committed
-  | 'duplicate-ok'   // (c) same key AND identical digest → idempotent no-op
-  | 'reject-gap'     // sequence > checkpoint+1 → resync required
-  | 'reject-fork'    // (c) same key, different digest → fork/tamper
-  | 'reject-stale'   // sequence <= checkpoint → replay/rollback
-  | 'reject-epoch'   // unknown/backward source epoch
-  | 'reject-fence';  // (4) stale fence token
+  | 'applied' | 'duplicate-ok' | 'reject-gap' | 'reject-fork'
+  | 'reject-stale' | 'reject-epoch' | 'reject-fence' | 'reject-unsanitized';
 
 /**
- * (3) ONE atomic operation that owns: the row/stream LOCK, the idempotency
- * check, digest+fence verification, the mutation apply, and the durable
- * checkpoint advance — all in a single transaction. There is deliberately NO
- * separate classify() (its TOCTOU permitted double-apply / HOTP double-consume).
- * Returns the decision it committed under lock.
+ * (3)(10) ONE atomic operation that owns the row LOCK, idempotency check,
+ * digest+fence verification, the sanitizer re-check (`assertSanitized` — rejects
+ * an unsanitized/secret-bearing record as `reject-unsanitized`), mutation apply,
+ * and durable checkpoint advance — all in one transaction. No separate classify.
  */
-export interface ReceiverCheckpoint<M = unknown> {
+export interface ReceiverCheckpoint<Clean = unknown, TBackend = unknown> {
+  readonly sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'assertSanitized'>;
   verifyAndApplyInTx(
-    tx: DurableTx,
-    record: OutboxRecord<M>,
+    tx: DurableTx<TBackend>,
+    record: OutboxRecord<Clean>,
     fenceToken: FenceToken,
   ): Promise<ReceiverDecision>;
+  /** (9) authorized, forward-only epoch transition, atomic under the fence. */
+  transitionEpochInTx(tx: DurableTx<TBackend>, record: EpochTransitionRecord): Promise<void>;
 }
 
 /**
  * (4)(h) EXTERNAL fence whose token is PERSISTED and stale-rejected by the
- * authoritative resource. Not a process-local predicate; carrying the token is
- * not enough — the outbox/receiver resource itself must reject stale tokens
- * atomically (StaleFenceError). Promotion also requires durable
- * source==receiver convergence checked by the caller.
+ * authoritative resource (StaleFenceError). Not a process-local predicate.
  */
 export interface PromotionFence {
-  /** Acquire/renew; returns a strictly monotonic token the resource persists. */
   acquire(streamId: string): Promise<FenceToken>;
-  /** The authoritative resource's current persisted token (for convergence checks). */
   current(streamId: string): Promise<FenceToken>;
+}
+
+// ── (8) TSK-specific extension (present in both repos; bpc leaves it unused) ──
+/** A signed, hash-linked stream head committed atomically with a tumbler
+ *  mutation (tsk#10). `prevHeadDigest` links to the previous head; `headDigest`
+ *  covers this record; `signature` authenticates it. */
+export interface SignedStreamHead {
+  streamId: string;
+  sequence: number;
+  prevHeadDigest: string; // 64 hex, or the genesis head
+  headDigest: string;     // 64 hex over (streamId, sequence, prevHeadDigest, opDigest)
+  signature: string;      // detached signature over headDigest (base64url)
+}
+
+/** The tumbler HOTP mutation carries a strictly-increasing counter that MUST
+ *  never be consumed twice (I2). Secret material is stripped by the sanitizer. */
+export interface TskHotpMutation {
+  tumblerId: string;
+  /** HOTP counter — strictly increasing per tumbler; never double-consumed. */
+  counter: number;
+}
+export type HotpMutationSanitizer = MutationSanitizer<TskHotpMutation, TskHotpMutation>;
+
+/** (8) Atomic tumbler apply: verify + consume HOTP counter (reject double-
+ *  consume) + append the signed/hash-linked head + advance the durable
+ *  checkpoint, ALL in one transaction. */
+export interface TskReceiverCheckpoint<TBackend = unknown>
+  extends ReceiverCheckpoint<TskHotpMutation, TBackend> {
+  verifyAndApplyTumblerInTx(
+    tx: DurableTx<TBackend>,
+    record: OutboxRecord<TskHotpMutation>,
+    head: SignedStreamHead,
+    fenceToken: FenceToken,
+  ): Promise<ReceiverDecision>;
+}
+
+/** (8) NORMATIVE head digest for the signed/hash-linked stream head. */
+export function streamHeadDigest(input: {
+  streamId: string; sequence: number; prevHeadDigest: string; opDigest: string;
+}): string {
+  assertId(input.streamId, 'streamId'); assertNoLoneSurrogate(input.streamId);
+  if (!Number.isSafeInteger(input.sequence) || input.sequence < 0) {
+    throw new ContractValidationError('sequence must be a non-negative safe integer');
+  }
+  if (!HEX64.test(input.prevHeadDigest)) throw new ContractValidationError('prevHeadDigest must be 64 lowercase hex');
+  if (!HEX64.test(input.opDigest)) throw new ContractValidationError('opDigest must be 64 lowercase hex');
+  const fields = [
+    HA_OUTBOX_DIGEST_DOMAIN + '/tsk-stream-head',
+    HA_OUTBOX_CONTRACT_VERSION, input.streamId, String(input.sequence),
+    input.prevHeadDigest, input.opDigest,
+  ];
+  const h = createHash('sha256');
+  for (const f of fields) { const b = Buffer.from(f, 'utf8'); h.update(u32be(b.length)); h.update(b); }
+  return h.digest('hex');
 }

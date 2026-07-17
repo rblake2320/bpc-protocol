@@ -52,11 +52,41 @@ fail closed · I7 backpressure fails/quarantines, never sheds · I8 metadata-onl
 replicas by default; promotion needs authorized unseal · I9 any nonzero RPO
 quarantined for the full acceptance horizon, documented.
 
+## Review-hardening (contract points continued)
+- **Canonicalization safety**: lone/unpaired UTF-16 surrogates are **rejected**
+  in values AND keys (else UTF-8 encoding folds them to U+FFFD and distinct
+  strings collide); own **symbol keys** and **accessor/non-data properties** are
+  rejected (reading a getter would execute code / break determinism); per-string
+  ≤ `CANON_MAX_STRING_BYTES`, total ≤ `CANON_MAX_TOTAL_BYTES`, and every
+  length-prefix field is strictly below the u32 ceiling (no `>>>0` wrap).
+- **(5) fence token bound**: `OutboxRecordHeader.fenceToken` (canonical decimal)
+  is included in `opDigest`, so a record cannot be re-paired with a different
+  token. `assertHeaderConformant` validates version, ids (no surrogates),
+  sequence, fence-token format, and `opDigest` = 64 **lowercase** hex.
+- **(7) backend-bound tx**: `DurableTx<TBackend>` is parameterized by a backend
+  brand — a tx from backend A does not typecheck for backend B.
+- **(9) epoch transition** is a typed, digested (`epochTransitionDigest`), fenced,
+  forward-only record (`EpochTransitionRecord`) applied by
+  `transitionEpochInTx`; genesis = sequence 0 (no mutation), first mutation =
+  sequence 1.
+- **(10) runtime sanitizer binding**: the outbox holds the `sanitizer` and
+  sanitizes the RAW mutation itself (never trusts a caller-supplied
+  pre-sanitized value); the receiver holds `assertSanitized` and rejects an
+  unsanitized/secret-bearing record as `reject-unsanitized`.
+- **(11) backpressure**: `quarantine` = a declared fail-closed mode where no
+  authoritative mutation commits until the backlog drains; the mutation cannot
+  commit without a durable admitted outbox row in the same tx.
+
 ## Per-protocol (impl PRs)
 - **bpc#16**: replaces process-local `ReplicatingPairStore` shed-oldest queue +
   process-local PromotionController (not the fence); needs the external fence.
-- **tsk#10**: HOTP counter never double-consumed + signed/hash-linked stream head
-  committed in the same tx; the existing Redis lease implements `PromotionFence`.
+- **tsk#10**: typed `TskHotpMutation` (counter never double-consumed) +
+  `SignedStreamHead` (hash-linked, signed) committed with the checkpoint in one
+  tx via `TskReceiverCheckpoint.verifyAndApplyTumblerInTx`. The existing Redis
+  lease is a **`PromotionFence` candidate ONLY**: a Redis pre-check alone cannot
+  fence PostgreSQL; conformance requires the authoritative resource to persist
+  and atomically stale-reject the fence token (`StaleFenceError`). Not an
+  implemented-fence claim until the two-node drill proves it.
 
 ## Boundary
 Unit tests of these interfaces/vectors do **not** establish crash-durable

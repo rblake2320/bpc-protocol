@@ -1,50 +1,53 @@
 {
   "contractVersion": "1",
   "digestDomain": "selfconnect/ha-outbox/v1",
-  "framing": "length-prefixed: sha256 over concat of u32be(utf8ByteLen(field)) || utf8(field) for fields [domain, version, streamId, sourceEpoch, decimal(sequence), JCS(mutation)]",
-  "canonicalization": "RFC 8785 (JCS) restricted to RFC 7493 (I-JSON); safe-integer numbers only; UTF-16 code-unit key ordering",
+  "framing": "sha256 over concat u32be(utf8len(field))||utf8(field) for [domain,version,streamId,sourceEpoch,decimal(sequence),decimal(fenceToken),JCS(mutation)]",
+  "canonicalization": "RFC8785 JCS / RFC7493 I-JSON; safe-integer numbers; UTF-16 key order; lone surrogates + symbol keys + accessors rejected; per-string<=65536 total<=1048576 bytes",
   "positive": [
     {
       "name": "bpc-pair-set",
       "streamId": "bpc:pair:default/v1",
       "sourceEpoch": "e1",
-      "sequence": 0,
+      "sequence": 1,
+      "fenceToken": "7",
       "mutation": {
         "op": "set",
         "pairId": "p1",
         "scope": "read"
       },
-      "expectedDigest": "4c5a8c428927ba27ecf42234510703df5a82003026d2ce4b108e5a73c326dd4d"
+      "expectedDigest": "e628d73ef09d114e52ce93fb034ddf5951a97a44b6069c32c304c2fbcf3c9d5a"
     },
     {
       "name": "bpc-pair-delete",
       "streamId": "bpc:pair:default/v1",
       "sourceEpoch": "e1",
-      "sequence": 1,
+      "sequence": 2,
+      "fenceToken": "7",
       "mutation": {
         "op": "delete",
         "pairId": "p1"
       },
-      "expectedDigest": "ec6bd89f7d1ebc367485e1f01f1caf872ca623839edf384c4996061b957789b1"
+      "expectedDigest": "b5deea8d41e7d3e242d5d488d55923d8b1c5e3f7df5c1896cbb4a8de0681d106"
     },
     {
       "name": "tsk-tumbler-advance",
       "streamId": "tsk:tumbler:default/v1",
       "sourceEpoch": "e7",
       "sequence": 42,
+      "fenceToken": "128",
       "mutation": {
         "op": "advance",
         "tumblerId": "t1",
-        "head": "h9",
         "counter": 100
       },
-      "expectedDigest": "3363d30f336e16c63fbd4e3708c7528214dab583afa692db08783ed440f944df"
+      "expectedDigest": "29f5bade59a228e0c89b4ccaa9bfe5f1e1f09a65313f9b17789d41aabeff94ab"
     },
     {
       "name": "unicode-nesting",
       "streamId": "s/v1",
       "sourceEpoch": "e1",
-      "sequence": 2,
+      "sequence": 3,
+      "fenceToken": "0",
       "mutation": {
         "b": 2,
         "a": 1,
@@ -54,10 +57,10 @@
             2,
             3
           ],
-          "x": "é☃"
+          "x": "é☃"
         }
       },
-      "expectedDigest": "a85dc9fa0ba41c5ec89426db10d45b84c78578a75067a53e0f61de2eb954f251"
+      "expectedDigest": "8e754cf11371fcbc5feadae57280cdfa74c90036de974d4a811a37111a0d44f7"
     }
   ],
   "tamper": [
@@ -66,32 +69,8 @@
       "base": {
         "streamId": "s/v1",
         "sourceEpoch": "e1",
-        "sequence": 3,
-        "mutation": {
-          "op": "set",
-          "pairId": "p1",
-          "scope": "read"
-        }
-      },
-      "tampered": {
-        "streamId": "s/v1",
-        "sourceEpoch": "e1",
-        "sequence": 3,
-        "mutation": {
-          "op": "set",
-          "pairId": "p1",
-          "scope": "admin"
-        }
-      },
-      "baseDigest": "7d873cd5bdc23cc0c462ad4f19273dd65e37c98e3e1d695473aac25c357e2c9b",
-      "tamperedDigest": "e78de7776bdaae9d21ade9e2e736a71045d92876e17452169cc2a5b9396abce3"
-    },
-    {
-      "name": "tamper-seq",
-      "base": {
-        "streamId": "s/v1",
-        "sourceEpoch": "e1",
-        "sequence": 3,
+        "sequence": 4,
+        "fenceToken": "5",
         "mutation": {
           "op": "set",
           "pairId": "p1",
@@ -102,21 +81,50 @@
         "streamId": "s/v1",
         "sourceEpoch": "e1",
         "sequence": 4,
+        "fenceToken": "5",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "admin"
+        }
+      },
+      "baseDigest": "40a287e7ef1a625a4ab6e84e286320889a671694629baaf0d6ebe0e9f7008748",
+      "tamperedDigest": "b21e5327edde1799971caea0510d4e1bc04a6cda7f6184b94498a18790e7c324"
+    },
+    {
+      "name": "tamper-seq",
+      "base": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 4,
+        "fenceToken": "5",
         "mutation": {
           "op": "set",
           "pairId": "p1",
           "scope": "read"
         }
       },
-      "baseDigest": "7d873cd5bdc23cc0c462ad4f19273dd65e37c98e3e1d695473aac25c357e2c9b",
-      "tamperedDigest": "1eaf36b5abd5681dc284897cea25970b07a6b1926721b7aaa5a53ea65563c8c1"
+      "tampered": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 5,
+        "fenceToken": "5",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "baseDigest": "40a287e7ef1a625a4ab6e84e286320889a671694629baaf0d6ebe0e9f7008748",
+      "tamperedDigest": "a63a8472131b37e56aa7ab1601c1c5b433f26c362ca941371f37122e2141b56e"
     },
     {
       "name": "tamper-epoch",
       "base": {
         "streamId": "s/v1",
         "sourceEpoch": "e1",
-        "sequence": 3,
+        "sequence": 4,
+        "fenceToken": "5",
         "mutation": {
           "op": "set",
           "pairId": "p1",
@@ -126,22 +134,24 @@
       "tampered": {
         "streamId": "s/v1",
         "sourceEpoch": "e2",
-        "sequence": 3,
+        "sequence": 4,
+        "fenceToken": "5",
         "mutation": {
           "op": "set",
           "pairId": "p1",
           "scope": "read"
         }
       },
-      "baseDigest": "7d873cd5bdc23cc0c462ad4f19273dd65e37c98e3e1d695473aac25c357e2c9b",
-      "tamperedDigest": "7e39aa45b18135b187944b69caac00027c49a22b46a97fcb7303ad725d131efc"
+      "baseDigest": "40a287e7ef1a625a4ab6e84e286320889a671694629baaf0d6ebe0e9f7008748",
+      "tamperedDigest": "724e1c21311f31475445124ffcac9d71208c6405f3e4b2577bd67e211baaf078"
     },
     {
       "name": "tamper-stream",
       "base": {
         "streamId": "s/v1",
         "sourceEpoch": "e1",
-        "sequence": 3,
+        "sequence": 4,
+        "fenceToken": "5",
         "mutation": {
           "op": "set",
           "pairId": "p1",
@@ -151,32 +161,54 @@
       "tampered": {
         "streamId": "other/v1",
         "sourceEpoch": "e1",
-        "sequence": 3,
+        "sequence": 4,
+        "fenceToken": "5",
         "mutation": {
           "op": "set",
           "pairId": "p1",
           "scope": "read"
         }
       },
-      "baseDigest": "7d873cd5bdc23cc0c462ad4f19273dd65e37c98e3e1d695473aac25c357e2c9b",
-      "tamperedDigest": "89e5b7b90f57cecf43b6f9e9c9f7cf9a37e246b8c897bbf0fa947db4be2c776e"
+      "baseDigest": "40a287e7ef1a625a4ab6e84e286320889a671694629baaf0d6ebe0e9f7008748",
+      "tamperedDigest": "f7cdeda93aa63eee92223bf17785dbc4a475956af39c6f935357814d0f28eb8f"
+    },
+    {
+      "name": "tamper-fence",
+      "base": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 4,
+        "fenceToken": "5",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "tampered": {
+        "streamId": "s/v1",
+        "sourceEpoch": "e1",
+        "sequence": 4,
+        "fenceToken": "6",
+        "mutation": {
+          "op": "set",
+          "pairId": "p1",
+          "scope": "read"
+        }
+      },
+      "baseDigest": "40a287e7ef1a625a4ab6e84e286320889a671694629baaf0d6ebe0e9f7008748",
+      "tamperedDigest": "09e42f23fefce0f4e572259661e691d6dccbc1780bee2ceee0426ab2d2489665"
     }
   ],
   "reject": [
     {
-      "name": "undefined-value",
+      "name": "undefined",
       "mustReject": true,
       "threw": true,
       "error": "undefined"
     },
     {
       "name": "float",
-      "mustReject": true,
-      "threw": true,
-      "error": "nonint"
-    },
-    {
-      "name": "infinity",
       "mustReject": true,
       "threw": true,
       "error": "nonint"
@@ -194,32 +226,63 @@
       "error": "nonplain"
     },
     {
-      "name": "sparse-array",
+      "name": "sparse",
       "mustReject": true,
       "threw": true,
       "error": "sparse"
     },
     {
-      "name": "bad-streamId-space",
+      "name": "lone-surrogate",
+      "mustReject": true,
+      "threw": true,
+      "error": "lone-hi"
+    },
+    {
+      "name": "bad-fence-leading-zero",
+      "mustReject": true,
+      "threw": true,
+      "error": "fence"
+    },
+    {
+      "name": "bad-streamId",
       "mustReject": true,
       "threw": true,
       "error": "id"
     },
     {
-      "name": "neg-sequence",
+      "name": "oversized-string",
       "mustReject": true,
       "threw": true,
-      "error": "seq"
+      "error": "str-bytes"
     }
   ],
+  "loneSurrogate": {
+    "rejected": true,
+    "replacementCharDigest": "32d6c95d3e4b11ff919653493f08b48738ed27f9e8c37fb48a787a566571f0b7"
+  },
   "framingNonCollision": {
-    "digestA": "f2f6294e78db7c2418811dfb918c9ec043ad476bc92bd92ce881746ef301f787",
-    "digestB": "e9f56fa1ff268989e3c7f9ef1cd68f13159977c5b756a5604ef40862d6e75508",
+    "digestA": "9ebdd3769ef8ad1595ca95b1a37626463396c722c3b6d6ee96cfc67bdb35ad6a",
+    "digestB": "6d8b5d5660ba45abf0139b52378b821248d3d656e651ef7284b1c846509baf8a",
     "mustDiffer": true
   },
   "keyOrderInvariant": {
-    "digestA": "93a98827d38c97f52db0faf39d3b3e41b5f0b56c6d3011a10414e86e33aba129",
-    "digestB": "93a98827d38c97f52db0faf39d3b3e41b5f0b56c6d3011a10414e86e33aba129",
+    "digestA": "33cd06f3051ccfaf5c39cc65869a293bc22b0e17476a98e593444a82abab9993",
+    "digestB": "33cd06f3051ccfaf5c39cc65869a293bc22b0e17476a98e593444a82abab9993",
     "mustEqual": true
+  },
+  "epochTransition": {
+    "streamId": "s/v1",
+    "fromEpoch": "e1",
+    "toEpoch": "e2",
+    "snapshotSequence": 42,
+    "fenceToken": "9",
+    "expectedDigest": "14bea36aa16791855d77822e409f1aa45066be8b6cb4a51ad1744a53a3beb86c"
+  },
+  "streamHead": {
+    "streamId": "tsk:tumbler:default/v1",
+    "sequence": 42,
+    "prevHeadDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "opDigest": "29f5bade59a228e0c89b4ccaa9bfe5f1e1f09a65313f9b17789d41aabeff94ab",
+    "expectedDigest": "e2a736adcc928346f21a6ab507b968e566a7b4b5b516c1b3d64382962614f11c"
   }
 }

@@ -89,7 +89,10 @@ export type {
 export {
   CANON_MAX_DEPTH,
   CANON_MAX_NODES,
+  CANON_MAX_STRING_BYTES,
+  CANON_MAX_TOTAL_BYTES,
   ContractValidationError,
+  FENCE_TOKEN_PATTERN,
   HA_OUTBOX_CONTRACT_VERSION,
   HA_OUTBOX_DIGEST_DOMAIN,
   ID_PATTERN,
@@ -98,14 +101,18 @@ export {
   assertHeaderConformant,
   canonicalOpDigest,
   canonicalize,
+  epochTransitionDigest,
+  fenceTokenToDecimal,
   idempotencyKeyOf,
+  streamHeadDigest,
 } from './ha-outbox-contract.js';
 export type {
   ContractVersion,
   DurableOutbox,
   DurableTx,
-  EpochBoundary,
+  EpochTransitionRecord,
   FenceToken,
+  HotpMutationSanitizer,
   IdempotencyKey,
   MutationSanitizer,
   OutboxPublisher,
@@ -116,6 +123,9 @@ export type {
   ReceiverCheckpoint,
   ReceiverDecision,
   SanitizedMutation,
+  SignedStreamHead,
+  TskHotpMutation,
+  TskReceiverCheckpoint,
 } from './ha-outbox-contract.js';
 export {
   RedisContinuityConfigurationError,
