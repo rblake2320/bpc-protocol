@@ -49,6 +49,16 @@ describe('AES-256-GCM pair payload codec', () => {
     expect(wire).not.toContain('"d"');
   });
 
+  it('sanitizes compound approval and rotation mutations without clear authority material', () => {
+    const c=codec(),p=pair(),r=registration(),streamId='bpc:pair:test/v1';
+    const approval=bpcPairMutationSanitizer.sanitize({kind:'bpc.pair.approve.v1',token:'approval-1',requestedAt:10,expectedPending:c.sealRegistration(r,{domain:'bpc-pair-payload',version:'1',streamId,kind:'bpc.pair.approve.v1',token:'approval-1',requestedAt:10}),pairId:p.id,sealed:c.sealPair(p,{domain:'bpc-pair-payload',version:'1',streamId,kind:'bpc.pair.approve.v1',pairId:p.id})});
+    const replacement={...p,id:'pair_2',requests:0,failedSigs:0,lastActive:null};
+    const rotation=bpcPairMutationSanitizer.sanitize({kind:'bpc.pair.rotate.v1',oldPairId:p.id,expectedOld:c.sealPair(p,{domain:'bpc-pair-payload',version:'1',streamId,kind:'bpc.pair.rotate.v1',pairId:p.id}),newPairId:replacement.id,sealed:c.sealPair(replacement,{domain:'bpc-pair-payload',version:'1',streamId,kind:'bpc.pair.rotate.v1',pairId:replacement.id})});
+    for(const mutation of [approval,rotation]){const wire=JSON.stringify(mutation);expect(wire).not.toContain(p.secretHash);expect(wire).not.toContain('secretHash');}
+    expect(()=>bpcPairMutationSanitizer.sanitize({...approval,unexpected:true} as never)).toThrow(/unexpected field/);
+    expect(()=>bpcPairMutationSanitizer.sanitize({...rotation,newPairId:p.id} as never)).toThrow(/identities/);
+  });
+
   it('uses a fresh nonce and rejects wrong AAD, key, tag, keyId and identity', () => {
     const c = codec(), p = pair(), aad = pairAad(p.id);
     const a = c.sealPair(p, aad), b = c.sealPair(p, aad);

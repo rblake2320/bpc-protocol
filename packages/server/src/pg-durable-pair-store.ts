@@ -28,7 +28,7 @@ import {
   type PgTransactor,
   type SchemaReadyToken,
 } from './ha-outbox-pg.js';
-import type { PairStore } from './store.js';
+import type { AtomicPairStore, PairAtomicMutation } from './store.js';
 import type { PairRegistration, StoredPair } from './types.js';
 
 const PAIR_KEYS = ['id','name','scope','mode','secretHash','pubJwk','status','created','lastActive','requests','failedSigs','cumulativeFailures','firstFailureAt','expiresAt','maxRequests','kind','canaryClass'] as const;
@@ -54,14 +54,16 @@ export interface CanonicalStoredPair extends Omit<StoredPair, 'pubJwk' | 'cumula
   cumulativeFailures?: string;
 }
 export interface SealedPairPayload { alg: 'A256GCM'; keyId: string; nonce: string; ciphertext: string; tag: string }
-interface PairSetAad { domain:'bpc-pair-payload'; version:'1'; streamId:string; kind:'bpc.pair.set.v1'; pairId:string }
-interface PendingSetAad { domain:'bpc-pair-payload'; version:'1'; streamId:string; kind:'bpc.pending.set.v1'; token:string; requestedAt:number }
+interface PairSetAad { domain:'bpc-pair-payload'; version:'1'; streamId:string; kind:'bpc.pair.set.v1'|'bpc.pair.approve.v1'|'bpc.pair.rotate.v1'; pairId:string }
+interface PendingSetAad { domain:'bpc-pair-payload'; version:'1'; streamId:string; kind:'bpc.pending.set.v1'|'bpc.pair.approve.v1'; token:string; requestedAt:number }
 
 export type BpcPairMutation =
   | { kind: 'bpc.pair.set.v1'; pairId: string; sealed: SealedPairPayload }
   | { kind: 'bpc.pair.delete.v1'; pairId: string }
   | { kind: 'bpc.pending.set.v1'; token: string; requestedAt: number; sealed: SealedPairPayload }
-  | { kind: 'bpc.pending.delete.v1'; token: string };
+  | { kind: 'bpc.pending.delete.v1'; token: string }
+  | { kind: 'bpc.pair.approve.v1'; token: string; requestedAt: number; expectedPending: SealedPairPayload; pairId: string; sealed: SealedPairPayload }
+  | { kind: 'bpc.pair.rotate.v1'; oldPairId: string; expectedOld: SealedPairPayload; newPairId: string; sealed: SealedPairPayload };
 
 export interface PairPayloadCodec {
   sealPair(pair: CanonicalStoredPair, aad: PairSetAad): SealedPairPayload;
@@ -182,12 +184,14 @@ function normalizeSealed(value: unknown): SealedPairPayload {
   return Object.freeze({ alg: 'A256GCM', keyId, nonce, ciphertext, tag });
 }
 function normalizeMutation(value: unknown): SanitizedMutation<BpcPairMutation> {
-  const root = dataObject(value, ['kind','pairId','token','requestedAt','sealed'], 'pair mutation');
+  const root = dataObject(value, ['kind','pairId','token','requestedAt','sealed','expectedPending','oldPairId','expectedOld','newPairId'], 'pair mutation');
   switch (ownValue(root,'kind')) {
     case 'bpc.pair.set.v1': { if (Object.getOwnPropertyNames(root).length !== 3) throw new ContractValidationError('pair.set shape is invalid'); const pairId=reqString(root,'pairId','pair mutation',64); if(!ID.test(pairId))throw new ContractValidationError('pairId invalid'); return Object.freeze({kind:'bpc.pair.set.v1',pairId,sealed:normalizeSealed(ownValue(root,'sealed'))}) as SanitizedMutation<BpcPairMutation>; }
     case 'bpc.pair.delete.v1': { if (Object.getOwnPropertyNames(root).length !== 2) throw new ContractValidationError('pair.delete shape is invalid'); const pairId=reqString(root,'pairId','pair mutation',64); if(!ID.test(pairId))throw new ContractValidationError('pairId invalid'); return Object.freeze({kind:'bpc.pair.delete.v1',pairId}) as SanitizedMutation<BpcPairMutation>; }
     case 'bpc.pending.set.v1': { if (Object.getOwnPropertyNames(root).length !== 4) throw new ContractValidationError('pending.set shape is invalid'); return Object.freeze({kind:'bpc.pending.set.v1',token:reqString(root,'token','pair mutation',256),requestedAt:reqInt(root,'requestedAt','pair mutation'),sealed:normalizeSealed(ownValue(root,'sealed'))}) as SanitizedMutation<BpcPairMutation>; }
     case 'bpc.pending.delete.v1': { if (Object.getOwnPropertyNames(root).length !== 2) throw new ContractValidationError('pending.delete shape is invalid'); return Object.freeze({kind:'bpc.pending.delete.v1',token:reqString(root,'token','pair mutation',256)}) as SanitizedMutation<BpcPairMutation>; }
+    case 'bpc.pair.approve.v1': { if (Object.getOwnPropertyNames(root).length !== 6) throw new ContractValidationError('pair.approve shape is invalid'); const pairId=reqString(root,'pairId','pair mutation',64);if(!ID.test(pairId))throw new ContractValidationError('pairId invalid');return Object.freeze({kind:'bpc.pair.approve.v1',token:reqString(root,'token','pair mutation',256),requestedAt:reqInt(root,'requestedAt','pair mutation'),expectedPending:normalizeSealed(ownValue(root,'expectedPending')),pairId,sealed:normalizeSealed(ownValue(root,'sealed'))}) as SanitizedMutation<BpcPairMutation>; }
+    case 'bpc.pair.rotate.v1': { if (Object.getOwnPropertyNames(root).length !== 5) throw new ContractValidationError('pair.rotate shape is invalid');const oldPairId=reqString(root,'oldPairId','pair mutation',64),newPairId=reqString(root,'newPairId','pair mutation',64);if(!ID.test(oldPairId)||!ID.test(newPairId)||oldPairId===newPairId)throw new ContractValidationError('rotation identities invalid');return Object.freeze({kind:'bpc.pair.rotate.v1',oldPairId,expectedOld:normalizeSealed(ownValue(root,'expectedOld')),newPairId,sealed:normalizeSealed(ownValue(root,'sealed'))}) as SanitizedMutation<BpcPairMutation>; }
     default: throw new ContractValidationError('unknown pair mutation kind');
   }
 }
@@ -224,11 +228,14 @@ export class Aes256GcmPairPayloadCodec implements PairPayloadCodec {
 function affectedOne(result:{rowCount:number},label:string){if(result.rowCount!==1)throw new ContractValidationError(`${label} affected ${result.rowCount}; expected 1`);}
 function affectedZeroOrOne(result:{rowCount:number},label:string){if(result.rowCount!==0&&result.rowCount!==1)throw new ContractValidationError(`${label} affected ${result.rowCount}; expected 0 or 1`);}
 async function upsertPair(exec:PgExecutor,p:CanonicalStoredPair){affectedOne(await exec.query(`INSERT INTO bpc_pairs (id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT(id) DO UPDATE SET name=$2,scope=$3,mode=$4,secret_hash=$5,pub_jwk=$6,status=$7,created=$8,last_active=$9,requests=$10,failed_sigs=$11,cumulative_failures=$12,first_failure_at=$13,max_requests=$14,kind=$15,canary_class=$16,expires_at=$17`,[p.id,p.name,p.scope,p.mode,p.secretHash,JSON.stringify(p.pubJwk),p.status,p.created,p.lastActive,p.requests,p.failedSigs,p.cumulativeFailures??null,p.firstFailureAt??null,p.maxRequests??null,p.kind??'legitimate',p.canaryClass??null,p.expiresAt??null]),'pair upsert');}
+async function insertPair(exec:PgExecutor,p:CanonicalStoredPair){affectedOne(await exec.query(`INSERT INTO bpc_pairs (id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,[p.id,p.name,p.scope,p.mode,p.secretHash,JSON.stringify(p.pubJwk),p.status,p.created,p.lastActive,p.requests,p.failedSigs,p.cumulativeFailures??null,p.firstFailureAt??null,p.maxRequests??null,p.kind??'legitimate',p.canaryClass??null,p.expiresAt??null]),'pair insert');}
 async function upsertPending(exec:PgExecutor,token:string,r:CanonicalPairRegistration,requestedAt:number){affectedOne(await exec.query('INSERT INTO bpc_pending(token,registration,requested_at) VALUES($1,$2,$3) ON CONFLICT(token) DO UPDATE SET registration=$2,requested_at=$3',[token,JSON.stringify(r),requestedAt]),'pending upsert');}
 function rowToPair(row:Record<string,unknown>):StoredPair{const canonical=normalizePair({id:String(row['id']),name:String(row['name']),scope:String(row['scope']),mode:String(row['mode']),secretHash:String(row['secret_hash']),pubJwk:row['pub_jwk'],status:String(row['status']),created:Number(row['created']),lastActive:row['last_active']==null?null:Number(row['last_active']),requests:Number(row['requests']),failedSigs:Number(row['failed_sigs']),...(row['cumulative_failures']==null?{}:{cumulativeFailures:databaseFloatToDecimal(row['cumulative_failures'])}),...(row['first_failure_at']==null?{}:{firstFailureAt:Number(row['first_failure_at'])}),...(row['max_requests']==null?{}:{maxRequests:Number(row['max_requests'])}),kind:String(row['kind']??'legitimate'),...(row['canary_class']==null?{}:{canaryClass:String(row['canary_class'])}),...(row['expires_at']==null?{}:{expiresAt:Number(row['expires_at'])})},true);return{...canonical,cumulativeFailures:canonical.cumulativeFailures===undefined?undefined:Number(canonical.cumulativeFailures)};}
+function sameCanonical(left:unknown,right:unknown):boolean{return canonicalize(left)===canonicalize(right);}
+function freezePair(pair:StoredPair):Readonly<StoredPair>{const copy=structuredClone(pair);Object.freeze(copy.pubJwk);return Object.freeze(copy);}
 
 export interface PgTransactionalPairStoreOptions { streamId:string; fenceToken:bigint; keyring:PairSealKeyring; maxPendingRows:number; backpressure?:PublisherBackpressure; scopeDeadlineMs?:number }
-export class PgTransactionalPairStore implements PairStore {
+export class PgTransactionalPairStore implements AtomicPairStore {
   private readonly outbox:PgDurableOutbox<BpcPairMutation,BpcPairMutation>;
   private readonly codec:Aes256GcmPairPayloadCodec;
   constructor(db:PgTransactor,ready:SchemaReadyToken,private readonly opts:PgTransactionalPairStoreOptions){if(typeof opts.fenceToken!=='bigint'||opts.fenceToken<0n)throw new ContractValidationError('fenceToken invalid');this.codec=new Aes256GcmPairPayloadCodec(opts.keyring.activeKeyId,opts.keyring.resolveKey);this.outbox=new PgDurableOutbox(db,ready,{streamId:opts.streamId,sanitizer:bpcPairMutationSanitizer,maxPendingRows:opts.maxPendingRows,backpressure:opts.backpressure??'fail-authoritative-mutation',scopeDeadlineMs:opts.scopeDeadlineMs});}
@@ -241,6 +248,76 @@ export class PgTransactionalPairStore implements PairStore {
   async listPending(){return this.outbox.withOutboxTx(async(_t,e)=>(await e.query('SELECT * FROM bpc_pending ORDER BY requested_at ASC')).rows.map(r=>({token:reqString({token:r['token']},'token','pending',256),registration:normalizeRegistration(r['registration']),requestedAt:reqInt({requestedAt:Number(r['requested_at'])},'requestedAt','pending')})));}
   async setPending(token:string,value:PairRegistration,requestedAt:number){if(!token||token.length>256||!Number.isSafeInteger(requestedAt)||requestedAt<0)throw new ContractValidationError('pending identity/time invalid');const registration=normalizeRegistration(value),aad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pending.set.v1' as const,token,requestedAt},sealed=this.codec.sealRegistration(registration,aad);await this.commit({kind:aad.kind,token,requestedAt,sealed},(e)=>upsertPending(e,token,registration,requestedAt));}
   async deletePending(token:string){if(!token||token.length>256)throw new ContractValidationError('token invalid');await this.commit({kind:'bpc.pending.delete.v1',token},async(e)=>affectedZeroOrOne(await e.query('DELETE FROM bpc_pending WHERE token=$1',[token]),'pending delete'));}
+  async atomicMutate(pairId:string,mutate:PairAtomicMutation):Promise<StoredPair|undefined>{
+    if(!ID.test(pairId)||typeof mutate!=='function')throw new ContractValidationError('atomic mutation input invalid');
+    return this.outbox.withOutboxTx(async(tx,e)=>{
+      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[pairId])).rows[0];
+      if(!row)return undefined;
+      const current=rowToPair(row),candidate=mutate(freezePair(current));
+      if(candidate===undefined)return structuredClone(current);
+      const next=normalizePair(candidate,false);
+      if(next.id!==pairId)throw new ContractValidationError('atomic mutation cannot change pair identity');
+      const aad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.set.v1' as const,pairId};
+      const sealed=this.codec.sealPair(next,aad);
+      await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:{kind:aad.kind,pairId,sealed},fenceToken:this.opts.fenceToken});
+      await upsertPair(e,next);
+      return rowToPair({...row,id:next.id,name:next.name,scope:next.scope,mode:next.mode,secret_hash:next.secretHash,pub_jwk:next.pubJwk,status:next.status,created:next.created,last_active:next.lastActive,requests:next.requests,failed_sigs:next.failedSigs,cumulative_failures:next.cumulativeFailures??null,first_failure_at:next.firstFailureAt??null,max_requests:next.maxRequests??null,kind:next.kind??'legitimate',canary_class:next.canaryClass??null,expires_at:next.expiresAt??null});
+    });
+  }
+  async approvePending(token:string,expected:{registration:PairRegistration;requestedAt:number},pairValue:StoredPair,maxActivePairs:number):Promise<boolean>{
+    if(!token||token.length>256||!Number.isSafeInteger(maxActivePairs)||maxActivePairs<1)throw new ContractValidationError('approval input invalid');
+    const expectedRegistration=normalizeRegistration(expected.registration),pair=normalizePair(pairValue,false);
+    if(pair.status!=='active'||pair.requests!==0||pair.failedSigs!==0||pair.lastActive!==null||!sameCanonical(registrationFromPairObject(pair as unknown as Record<string,unknown>),expectedRegistration))throw new ContractValidationError('approved pair does not match pending registration/initial state');
+    if(!Number.isSafeInteger(expected.requestedAt)||expected.requestedAt<0)throw new ContractValidationError('pending time invalid');
+    const pendingAad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.approve.v1' as const,token,requestedAt:expected.requestedAt};
+    const pairAad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.approve.v1' as const,pairId:pair.id};
+    const mutation:BpcPairMutation={kind:'bpc.pair.approve.v1',token,requestedAt:expected.requestedAt,expectedPending:this.codec.sealRegistration(expectedRegistration,pendingAad),pairId:pair.id,sealed:this.codec.sealPair(pair,pairAad)};
+    return this.outbox.withOutboxTx(async(tx,e)=>{
+      const row=(await e.query('SELECT registration,requested_at FROM bpc_pending WHERE token=$1 FOR UPDATE',[token])).rows[0];
+      if(!row)return false;
+      if(Number(row['requested_at'])!==expected.requestedAt||!sameCanonical(normalizeRegistration(row['registration']),expectedRegistration))return false;
+      const active=Number((await e.query("SELECT count(*)::text AS count FROM bpc_pairs WHERE status='active'")).rows[0]?.['count']);
+      if(!Number.isSafeInteger(active)||active>=maxActivePairs)throw new ContractValidationError(`Maximum pair capacity (${maxActivePairs}) reached`);
+      if((await e.query('SELECT 1 FROM bpc_pairs WHERE id=$1',[pair.id])).rows.length)throw new ContractValidationError('replacement pair identity already exists');
+      await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:mutation,fenceToken:this.opts.fenceToken});
+      affectedOne(await e.query('DELETE FROM bpc_pending WHERE token=$1 AND requested_at=$2',[token,expected.requestedAt]),'pending approval delete');
+      await insertPair(e,pair);
+      return true;
+    });
+  }
+  async rotatePair(expectedOldValue:StoredPair,replacementValue:StoredPair):Promise<boolean>{
+    const expectedOld=normalizePair(expectedOldValue,false),replacement=normalizePair(replacementValue,false);
+    if(expectedOld.id===replacement.id)throw new ContractValidationError('rotation identities must differ');
+    if(expectedOld.status!=='active'||replacement.status!=='active'||replacement.requests!==0||replacement.failedSigs!==0||replacement.lastActive!==null)throw new ContractValidationError('rotation state invalid');
+    const oldAad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.rotate.v1' as const,pairId:expectedOld.id};
+    const newAad={...oldAad,pairId:replacement.id};
+    const mutation:BpcPairMutation={kind:'bpc.pair.rotate.v1',oldPairId:expectedOld.id,expectedOld:this.codec.sealPair(expectedOld,oldAad),newPairId:replacement.id,sealed:this.codec.sealPair(replacement,newAad)};
+    return this.outbox.withOutboxTx(async(tx,e)=>{
+      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[expectedOld.id])).rows[0];
+      if(!row||!sameCanonical(normalizePair(rowToPair(row),false),expectedOld))return false;
+      if(expectedOld.status!=='active'||(await e.query('SELECT 1 FROM bpc_pairs WHERE id=$1',[replacement.id])).rows.length)return false;
+      await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:mutation,fenceToken:this.opts.fenceToken});
+      const rotated={...expectedOld,status:'rotated' as const};await upsertPair(e,rotated);await insertPair(e,replacement);return true;
+    });
+  }
+  async claimSuccessfulUse(pairId:string,at:number):Promise<boolean>{
+    if(!ID.test(pairId)||!Number.isSafeInteger(at)||at<0)throw new ContractValidationError('successful-use claim input invalid');
+    return this.outbox.withOutboxTx(async(tx,e)=>{
+      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[pairId])).rows[0];
+      if(!row)return false;
+      const current=rowToPair(row);
+      if(current.status!=='active')return false;
+      if(current.maxRequests&&current.maxRequests>0&&current.requests>=current.maxRequests){
+        const expired=normalizePair({...current,status:'expired'},false),aad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.set.v1' as const,pairId};
+        await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:{kind:aad.kind,pairId,sealed:this.codec.sealPair(expired,aad)},fenceToken:this.opts.fenceToken});await upsertPair(e,expired);return false;
+      }
+      const requests=current.requests+1;
+      if(!Number.isSafeInteger(requests))throw new ContractValidationError('pair request counter exhausted');
+      const next=normalizePair({...current,requests,lastActive:at,failedSigs:0,cumulativeFailures:0,firstFailureAt:null,status:current.maxRequests&&current.maxRequests>0&&requests>=current.maxRequests?'expired':current.status},false);
+      const aad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.set.v1' as const,pairId};
+      await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:{kind:aad.kind,pairId,sealed:this.codec.sealPair(next,aad)},fenceToken:this.opts.fenceToken});await upsertPair(e,next);return true;
+    });
+  }
 }
 
-export class PgPairMutationApplier implements MutationApplier<BpcPairMutation>{private readonly codec:Aes256GcmPairPayloadCodec;constructor(private readonly streamId:string,keyring:PairSealKeyring){if(!streamId||streamId.length>512)throw new ContractValidationError('streamId invalid');this.codec=new Aes256GcmPairPayloadCodec(keyring.activeKeyId,keyring.resolveKey);}async applyInTx(exec:PgExecutor,record:OutboxRecord<BpcPairMutation>){if(record.streamId!==this.streamId)throw new ContractValidationError('pair mutation stream mismatch');const m=normalizeMutation(record.mutation) as BpcPairMutation;switch(m.kind){case'bpc.pair.set.v1':await upsertPair(exec,this.codec.openPair(m.sealed,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,pairId:m.pairId}));return;case'bpc.pair.delete.v1':affectedZeroOrOne(await exec.query('DELETE FROM bpc_pairs WHERE id=$1',[m.pairId]),'pair delete');return;case'bpc.pending.set.v1':await upsertPending(exec,m.token,this.codec.openRegistration(m.sealed,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,token:m.token,requestedAt:m.requestedAt}),m.requestedAt);return;case'bpc.pending.delete.v1':affectedZeroOrOne(await exec.query('DELETE FROM bpc_pending WHERE token=$1',[m.token]),'pending delete');return;}}}
+export class PgPairMutationApplier implements MutationApplier<BpcPairMutation>{private readonly codec:Aes256GcmPairPayloadCodec;constructor(private readonly streamId:string,keyring:PairSealKeyring){if(!streamId||streamId.length>512)throw new ContractValidationError('streamId invalid');this.codec=new Aes256GcmPairPayloadCodec(keyring.activeKeyId,keyring.resolveKey);}async applyInTx(exec:PgExecutor,record:OutboxRecord<BpcPairMutation>){if(record.streamId!==this.streamId)throw new ContractValidationError('pair mutation stream mismatch');const m=normalizeMutation(record.mutation) as BpcPairMutation;switch(m.kind){case'bpc.pair.set.v1':await upsertPair(exec,this.codec.openPair(m.sealed,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,pairId:m.pairId}));return;case'bpc.pair.delete.v1':affectedZeroOrOne(await exec.query('DELETE FROM bpc_pairs WHERE id=$1',[m.pairId]),'pair delete');return;case'bpc.pending.set.v1':await upsertPending(exec,m.token,this.codec.openRegistration(m.sealed,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,token:m.token,requestedAt:m.requestedAt}),m.requestedAt);return;case'bpc.pending.delete.v1':affectedZeroOrOne(await exec.query('DELETE FROM bpc_pending WHERE token=$1',[m.token]),'pending delete');return;case'bpc.pair.approve.v1':{const pending=this.codec.openRegistration(m.expectedPending,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,token:m.token,requestedAt:m.requestedAt});const row=(await exec.query('SELECT registration,requested_at FROM bpc_pending WHERE token=$1 FOR UPDATE',[m.token])).rows[0];if(!row||Number(row['requested_at'])!==m.requestedAt||!sameCanonical(normalizeRegistration(row['registration']),pending))throw new ContractValidationError('replica pending approval precondition failed');if((await exec.query('SELECT 1 FROM bpc_pairs WHERE id=$1',[m.pairId])).rows.length)throw new ContractValidationError('replica approval pair identity already exists');affectedOne(await exec.query('DELETE FROM bpc_pending WHERE token=$1 AND requested_at=$2',[m.token,m.requestedAt]),'replica pending approval delete');await insertPair(exec,this.codec.openPair(m.sealed,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,pairId:m.pairId}));return;}case'bpc.pair.rotate.v1':{const expected=this.codec.openPair(m.expectedOld,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,pairId:m.oldPairId});const row=(await exec.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[m.oldPairId])).rows[0];if(!row||!sameCanonical(normalizePair(rowToPair(row),false),expected))throw new ContractValidationError('replica rotation precondition failed');if((await exec.query('SELECT 1 FROM bpc_pairs WHERE id=$1',[m.newPairId])).rows.length)throw new ContractValidationError('replica rotation pair identity already exists');await upsertPair(exec,{...expected,status:'rotated'});await insertPair(exec,this.codec.openPair(m.sealed,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,pairId:m.newPairId}));return;}}}}

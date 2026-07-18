@@ -257,7 +257,7 @@ export async function verifyBPCRequest(
 
   const lockoutCount = config.lockoutCount ?? 10;
   if (auth.failedSigs >= lockoutCount) {
-    registry.recordActivity(req.pairId, false, sourceIp).catch(() => {});
+    await registry.ensureLocked(req.pairId);
     if (shadowEnabled) {
       await anomaly.enterShadowState(req.pairId, sourceIp, 'failedSigs_threshold');
       const delayMs = tarpitEnabled ? await anomaly.applyTarpit(sourceIp, 'shadow') : 0;
@@ -267,8 +267,7 @@ export async function verifyBPCRequest(
   }
 
   if (auth.expiresAt && Date.now() > auth.expiresAt) {
-    pair.status = 'expired';
-    registry.get(req.pairId).then(p => { if (p) { p.status = 'expired'; } }).catch(() => {});
+    await registry.markExpired(req.pairId);
     return deny('pair_expired');
   }
   if (auth.maxRequests && auth.maxRequests > 0 && auth.requests >= auth.maxRequests) {
@@ -429,7 +428,9 @@ export async function verifyBPCRequest(
     return { ok: false, pairId: req.pairId, error: 'ghost_pair_denied', shadow: true, tarpitDelayMs: delayMs };
   }
 
-  await registry.recordActivity(req.pairId, true);
+  if (!await registry.claimSuccessfulUse(req.pairId)) {
+    return deny('pair_usage_cap_exceeded');
+  }
   await config.auditLog?.write({
     action: 'verify_pass', pairId: req.pairId,
     method: req.method, path: req.path, ip: req.ip,

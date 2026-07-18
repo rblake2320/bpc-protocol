@@ -1,0 +1,31 @@
+# Atomic Pair Registry Boundary
+
+`AtomicPairStore` is the production authority capability used by `PairRegistry`.
+It prevents lifecycle operations from being assembled from detached `get()` and
+`set()` calls.
+
+The capability provides:
+
+- single-consumer pending approval with approval-time capacity enforcement;
+- row-locked pair mutation that preserves unrelated concurrent fields;
+- atomic old-pair disable plus replacement creation during rotation;
+- atomic successful-use claims, including `maxRequests` enforcement; and
+- idempotent persisted expiry, lock, unlock, and revocation transitions.
+
+`PgTransactionalPairStore` performs these operations in SERIALIZABLE
+transactions and appends the corresponding durable outbox record in the same
+transaction. Approval and rotation use compound mutations, so a receiver cannot
+commit only half of either authority transition.
+
+Construct `PairRegistry` with `requireAtomic=true` for production. The legacy
+fallback remains for bounded single-writer adapters and is not a concurrency
+guarantee.
+
+## Bounded Claims
+
+This mechanism does not close issue #16. Multi-node failover, Redis continuity,
+snapshot/tail resynchronization, and measured RPO/RTO still require the real
+two-node drill. The in-process IP failure tracker also remains node-local; pair
+authority persistence is atomic, but cross-node IP anomaly aggregation is a
+separate concern.
+

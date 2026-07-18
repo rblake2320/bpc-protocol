@@ -693,6 +693,71 @@ async function main(): Promise<void> {
     assert.equal(Number((await pool.query('SELECT sequence FROM replica.ha_outbox_receiver_checkpoint WHERE stream_id=$1', [sid])).rows[0].sequence), 4);
   });
 
+  await check('(atomic registry) approval, capacity, mutation, usage claim, and receiver compound apply are serialized', async () => {
+    const sid='bpc:pair:registry/v1';await provision(sid);await pool.query('CREATE SCHEMA replica');await applyDDLInSchema('replica');const replicaReady=await provisionSchemaVersion(serial,'replica');await provisionInSchema('replica',sid);
+    const keyring={activeKeyId:'pair-key-1',resolveKey:()=>Buffer.alloc(32,9)};
+    const source=new PgTransactionalPairStore(serial,READY,{streamId:sid,fenceToken:0n,keyring,maxPendingRows:100});
+    const receiver=new PgReceiverCheckpoint<BpcPairMutation>(serial,sid,bpcPairMutationSanitizer,new PgPairMutationApplier(sid,keyring),replicaReady);
+    const transport:OutboxTransport={async deliverAndAwaitAck(record){const d=await receiver.verifyAndApplyDelivered(record as OutboxRecord<BpcPairMutation>);return receiptFor(record,d);}};
+    const publisher=new PgDurablePublisher<BpcPairMutation>(serial,sid,transport,'fail-authoritative-mutation',bpcPairMutationSanitizer,verifier,READY,{leaseMs:30_000});
+    const jwk={kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w'} as JsonWebKey;
+    const registration={name:'approved',scope:'read' as const,mode:'production' as const,secretHash:'s'.repeat(43),pubJwk:jwk,maxRequests:1,kind:'legitimate' as const};
+    await source.setPending('approve-1',registration,100);
+    const pair:StoredPair={id:'approved_pair',...registration,status:'active',created:101,lastActive:null,requests:0,failedSigs:0};
+    const approvals=await Promise.all([source.approvePending('approve-1',{registration,requestedAt:100},pair,1),source.approvePending('approve-1',{registration,requestedAt:100},pair,1)]);
+    assert.deepEqual(approvals.sort(),[false,true]);
+    assert.equal((await source.getPending('approve-1')),undefined);
+    assert.equal((await source.get(pair.id))?.status,'active');
+    while((await publisher.drainOnce()).attempted>0){}
+    assert.equal(Number((await pool.query("SELECT count(*)::int n FROM replica.bpc_pending WHERE token='approve-1'")).rows[0].n),0);
+    assert.equal(Number((await pool.query("SELECT count(*)::int n FROM replica.bpc_pairs WHERE id='approved_pair'")).rows[0].n),1);
+
+    await Promise.all([
+      source.atomicMutate(pair.id,(current)=>({...current,name:'renamed'})),
+      source.atomicMutate(pair.id,(current)=>({...current,scope:'admin'})),
+    ]);
+    assert.deepEqual(((await source.get(pair.id))&&{name:(await source.get(pair.id))!.name,scope:(await source.get(pair.id))!.scope}),{name:'renamed',scope:'admin'});
+    const claims=await Promise.all([source.claimSuccessfulUse(pair.id,200),source.claimSuccessfulUse(pair.id,201)]);
+    assert.equal(claims.filter(Boolean).length,1);
+    const claimedPair=await source.get(pair.id);assert.equal(claimedPair?.requests,1);assert.equal(claimedPair?.status,'expired');assert.equal(claimedPair?.lastActive,claims[0]?200:201);
+
+    const r2={...registration,name:'second'},r3={...registration,name:'third'};
+    await source.setPending('cap-2',r2,300);await source.setPending('cap-3',r3,301);
+    const capacity=await Promise.allSettled([
+      source.approvePending('cap-2',{registration:r2,requestedAt:300},{id:'cap_pair_2',...r2,status:'active',created:302,lastActive:null,requests:0,failedSigs:0},1),
+      source.approvePending('cap-3',{registration:r3,requestedAt:301},{id:'cap_pair_3',...r3,status:'active',created:303,lastActive:null,requests:0,failedSigs:0},1),
+    ]);
+    assert.equal(capacity.filter((result)=>result.status==='fulfilled').length,1,'serialized capacity must admit exactly one active approval');
+    const rotationOld=(await source.list()).find((item)=>item.status==='active');assert.ok(rotationOld);
+    const rotationNew:StoredPair={...rotationOld,id:'rotated_replacement',status:'active',created:400,lastActive:null,requests:0,failedSigs:0};
+    assert.equal(await source.rotatePair(rotationOld,rotationNew),true);
+    assert.equal(await source.rotatePair(rotationOld,{...rotationNew,id:'second_replacement'}),false,'stale rotation snapshot was accepted twice');
+    while((await publisher.drainOnce()).attempted>0){}
+    assert.equal((await source.get(rotationOld.id))?.status,'rotated');assert.equal((await source.get(rotationNew.id))?.status,'active');
+    assert.equal((await pool.query('SELECT status FROM replica.bpc_pairs WHERE id=$1',[rotationOld.id])).rows[0].status,'rotated');
+    assert.equal((await pool.query('SELECT status FROM replica.bpc_pairs WHERE id=$1',[rotationNew.id])).rows[0].status,'active');
+  });
+
+  await check('(atomic registry) receiver approval conflict rolls back pending deletion and checkpoint', async () => {
+    const sid='bpc:pair:receiver-conflict/v1';await provision(sid);await pool.query('CREATE SCHEMA replica');await applyDDLInSchema('replica');const replicaReady=await provisionSchemaVersion(serial,'replica');await provisionInSchema('replica',sid);
+    const keyring={activeKeyId:'pair-key-1',resolveKey:()=>Buffer.alloc(32,10)};
+    const source=new PgTransactionalPairStore(serial,READY,{streamId:sid,fenceToken:0n,keyring,maxPendingRows:10});
+    const receiver=new PgReceiverCheckpoint<BpcPairMutation>(serial,sid,bpcPairMutationSanitizer,new PgPairMutationApplier(sid,keyring),replicaReady);
+    const transport:OutboxTransport={async deliverAndAwaitAck(record){const d=await receiver.verifyAndApplyDelivered(record as OutboxRecord<BpcPairMutation>);return receiptFor(record,d);}};
+    const publisher=new PgDurablePublisher<BpcPairMutation>(serial,sid,transport,'fail-authoritative-mutation',bpcPairMutationSanitizer,verifier,READY,{leaseMs:30_000});
+    const jwk={kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w'} as JsonWebKey;
+    const reg={name:'conflict',scope:'read' as const,mode:'production' as const,secretHash:'s'.repeat(43),pubJwk:jwk,kind:'legitimate' as const};
+    await source.setPending('conflict-token',reg,10);assert.equal((await publisher.drainOnce()).acked,1);
+    const target:StoredPair={id:'conflict-pair',...reg,status:'active',created:11,lastActive:null,requests:0,failedSigs:0};
+    await source.approvePending('conflict-token',{registration:reg,requestedAt:10},target,10);
+    await pool.query(`INSERT INTO replica.bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,kind) VALUES($1,'planted','read','production',$2,$3,'active',1,NULL,0,0,'legitimate')`,[target.id,'s'.repeat(43),jwk]);
+    await assert.rejects(()=>publisher.drainOnce(),/identity already exists/);
+    assert.equal(Number((await pool.query("SELECT count(*)::int n FROM replica.bpc_pending WHERE token='conflict-token'")).rows[0].n),1,'receiver deleted pending before failed pair insert');
+    assert.equal((await pool.query('SELECT name FROM replica.bpc_pairs WHERE id=$1',[target.id])).rows[0].name,'planted','receiver overwrote conflicting authority');
+    assert.equal(Number((await pool.query('SELECT sequence FROM replica.ha_outbox_receiver_checkpoint WHERE stream_id=$1',[sid])).rows[0].sequence),1,'receiver checkpoint advanced across failed compound apply');
+    assert.equal(Number((await pool.query('SELECT count(*)::int n FROM ha_outbox_rows WHERE stream_id=$1 AND acked_at IS NULL',[sid])).rows[0].n),1,'source lost retryable approval row');
+  });
+
   await check('(pair authority) backpressure and stale fencing roll back the authoritative mutation', async () => {
     const sid = 'bpc:pair:rollback/v1'; await provision(sid);
     const keyring = { activeKeyId:'pair-key-1', resolveKey:() => Buffer.alloc(32, 7) };
@@ -706,6 +771,16 @@ async function main(): Promise<void> {
     await pool.query('UPDATE ha_outbox_fence SET fence_token=2 WHERE stream_id=$1', [sid]);
     await assert.rejects(() => limited.delete(base.id), /fence token.*stale|stale.*fence/i);
     assert.equal((await limited.get(base.id))?.name, 'before', 'stale writer deleted authority despite rejected outbox append');
+
+    const approvalSid='bpc:pair:approval-rollback/v1';await provision(approvalSid);
+    const approvalStore=new PgTransactionalPairStore(serial,READY,{streamId:approvalSid,fenceToken:0n,keyring,maxPendingRows:2});
+    const reg={name:'pending-safe',scope:'read' as const,mode:'production' as const,secretHash:'s'.repeat(43),pubJwk:base.pubJwk,kind:'legitimate' as const};
+    await approvalStore.setPending('pending-safe',reg,10);
+    await approvalStore.set({...base,id:'capacity-filler'});
+    const approved:StoredPair={id:'must-not-exist',...reg,status:'active',created:11,lastActive:null,requests:0,failedSigs:0};
+    await assert.rejects(()=>approvalStore.approvePending('pending-safe',{registration:reg,requestedAt:10},approved,10),/backpressure/i);
+    assert.ok(await approvalStore.getPending('pending-safe'),'failed approval lost pending authority');
+    assert.equal(await approvalStore.get(approved.id),undefined,'failed approval created a pair without its outbox mutation');
   });
 
   await check('(pair authority) governed schema precedes pg_temp and successful transactions discard session state', async () => {

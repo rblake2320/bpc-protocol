@@ -27,7 +27,7 @@
  */
 
 import { generateId } from '@bpc/core';
-import type { PairStore } from './store.js';
+import { isAtomicPairStore, type AtomicPairStore, type PairStore } from './store.js';
 import type { StoredPair, PairRegistration } from './types.js';
 
 /** Minimum secretHash length: 43 chars = 256-bit HKDF output in base64url. */
@@ -56,6 +56,7 @@ export interface RedactedPair {
 
 export class PairRegistry {
   private store: PairStore;
+  private atomicStore?: AtomicPairStore;
   private maxPairs: number;
   private lockoutCount: number;
 
@@ -72,8 +73,12 @@ export class PairRegistry {
   private ipFailureTracker = new Map<string, { count: number; windowStart: number }>();
   private readonly IP_FAILURE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 
-  constructor(store: PairStore, maxPairs = 2000, lockoutCount = 10) {
+  constructor(store: PairStore, maxPairs = 2000, lockoutCount = 10, requireAtomic = false) {
     this.store = store;
+    this.atomicStore = isAtomicPairStore(store) ? store : undefined;
+    if (requireAtomic && !this.atomicStore) {
+      throw new Error('AtomicPairStore is required for a production PairRegistry');
+    }
     this.maxPairs = maxPairs;
     this.lockoutCount = lockoutCount;
   }
@@ -136,8 +141,6 @@ export class PairRegistry {
   async approvePairing(token: string): Promise<string> {
     const pending = await this.store.getPending(token);
     if (!pending) throw new Error(`No pending approval for token: ${token}`);
-    await this.store.deletePending(token);
-
     const pairId = generateId('pair');
     const pair: StoredPair = {
       id: pairId,
@@ -151,7 +154,15 @@ export class PairRegistry {
       kind:        pending.registration.kind ?? 'legitimate',
       canaryClass: pending.registration.canaryClass,
     };
-    await this.store.set(pair);
+    if (this.atomicStore) {
+      const approved = await this.atomicStore.approvePending(token, pending, pair, this.maxPairs);
+      if (!approved) throw new Error(`Pending approval changed or was already consumed: ${token}`);
+    } else {
+      // Compatibility path for legacy, single-writer stores. Production
+      // callers should construct PairRegistry with requireAtomic=true.
+      await this.store.deletePending(token);
+      await this.store.set(pair);
+    }
     return pairId;
   }
 
@@ -235,11 +246,12 @@ export class PairRegistry {
   }
 
   async revoke(pairId: string): Promise<void> {
-    const pair = await this.store.get(pairId);
-    if (pair) {
-      pair.status = 'revoked';
-      await this.store.set(pair);
+    if (this.atomicStore) {
+      await this.atomicStore.atomicMutate(pairId, (current) => ({ ...current, status: 'revoked' }));
+      return;
     }
+    const pair = await this.store.get(pairId);
+    if (pair) await this.store.set({ ...pair, status: 'revoked' });
   }
 
   /** Full pair list — for internal/privileged use only. Never expose directly over HTTP. */
@@ -292,59 +304,123 @@ export class PairRegistry {
   async recordActivity(pairId: string, success: boolean, ip?: string): Promise<void> {
     // REG-02: Evict stale entries before doing anything else.
     this.evictStaleIpEntries();
-
-    const pair = await this.store.get(pairId);
-    if (!pair) return;
-    pair.requests++;
-    pair.lastActive = Date.now();
     if (success) {
-      // Enforce maxRequests cap: if the pair has a usage cap and it has now
-      // been reached, transition to 'expired' so all future requests are denied.
-      if (pair.maxRequests && pair.maxRequests > 0 && pair.requests >= pair.maxRequests) {
-        pair.status = 'expired';
-      }
-      // Full reset on success
-      pair.failedSigs = 0;
-      pair.cumulativeFailures = 0;
-      pair.firstFailureAt = null;
-      for (const key of this.ipFailureTracker.keys()) {
-        if (key.startsWith(`${pairId}:`)) this.ipFailureTracker.delete(key);
-      }
-    } else if (ip) {
-      // IP-aware: only lock when the SAME IP accumulates enough failures
+      await this.claimSuccessfulUse(pairId);
+      return;
+    }
+
+    const now = Date.now();
+    let ipFailures: number | undefined;
+    if (ip) {
       const ipKey = `${pairId}:${ip}`;
-      const now = Date.now();
       const tracker = this.ipFailureTracker.get(ipKey);
       if (!tracker || now - tracker.windowStart > this.IP_FAILURE_WINDOW_MS) {
         this.ipFailureTracker.set(ipKey, { count: 1, windowStart: now });
       } else {
         tracker.count++;
       }
-      const ipFailures = this.ipFailureTracker.get(ipKey)!.count;
-      pair.failedSigs = ipFailures;
-      // BPC-10: Apply cumulative decay for slow-drip detection
-      this._applyCumulativeDecay(pair);
-      if (ipFailures >= this.lockoutCount && pair.status === 'active') {
-        pair.status = 'locked';
+      ipFailures = this.ipFailureTracker.get(ipKey)!.count;
+    }
+
+    const apply = (source: Readonly<StoredPair>): StoredPair => {
+      const pair = structuredClone(source) as StoredPair;
+      if (ipFailures !== undefined) {
+        pair.failedSigs = ipFailures;
+        // BPC-10: Apply cumulative decay for slow-drip detection
+        this._applyCumulativeDecay(pair, now);
+        if (ipFailures >= this.lockoutCount && pair.status === 'active') {
+          pair.status = 'locked';
+        }
+        // Also check cumulative threshold (catches slow-drip across windows)
+        if ((pair.cumulativeFailures ?? 0) >= this.lockoutCount * 2 && pair.status === 'active') {
+          pair.status = 'locked';
+        }
+      } else {
+        // No IP provided — fallback to global counter with cumulative decay
+        pair.failedSigs++;
+        // BPC-10: Apply cumulative decay for slow-drip detection
+        this._applyCumulativeDecay(pair, now);
+        if (pair.failedSigs >= this.lockoutCount && pair.status === 'active') {
+          pair.status = 'locked';
+        }
+        // Also check cumulative threshold
+        if ((pair.cumulativeFailures ?? 0) >= this.lockoutCount * 2 && pair.status === 'active') {
+          pair.status = 'locked';
+        }
       }
-      // Also check cumulative threshold (catches slow-drip across windows)
-      if ((pair.cumulativeFailures ?? 0) >= this.lockoutCount * 2 && pair.status === 'active') {
-        pair.status = 'locked';
+      return pair;
+    };
+    if (this.atomicStore) {
+      await this.atomicStore.atomicMutate(pairId, apply);
+      return;
+    }
+    const pair = await this.store.get(pairId);
+    if (pair) await this.store.set(apply(pair));
+  }
+
+  /** Persist expiry before returning an expiry denial. */
+  async markExpired(pairId: string): Promise<void> {
+    if (this.atomicStore) {
+      await this.atomicStore.atomicMutate(pairId, (pair) =>
+        pair.status === 'active' ? { ...pair, status: 'expired' } : { ...pair });
+      return;
+    }
+    const pair = await this.store.get(pairId);
+    if (pair?.status === 'active') await this.store.set({ ...pair, status: 'expired' });
+  }
+
+  /** Idempotently persist a threshold lock before returning a lock denial. */
+  async ensureLocked(pairId: string): Promise<void> {
+    if (this.atomicStore) {
+      await this.atomicStore.atomicMutate(pairId, (pair) =>
+        pair.status === 'active' ? { ...pair, status: 'locked' } : { ...pair });
+      return;
+    }
+    const pair = await this.store.get(pairId);
+    if (pair?.status === 'active') await this.store.set({ ...pair, status: 'locked' });
+  }
+
+  /**
+   * Atomically claim one successful authorization use. A false result means
+   * the usage cap was already exhausted by a concurrent request.
+   */
+  async claimSuccessfulUse(pairId: string): Promise<boolean> {
+    if (this.atomicStore) {
+      const claimed = await this.atomicStore.claimSuccessfulUse(pairId, Date.now());
+      if (claimed) {
+        for (const key of this.ipFailureTracker.keys()) {
+          if (key.startsWith(`${pairId}:`)) this.ipFailureTracker.delete(key);
+        }
       }
-    } else {
-      // No IP provided — fallback to global counter with cumulative decay
-      pair.failedSigs++;
-      // BPC-10: Apply cumulative decay for slow-drip detection
-      this._applyCumulativeDecay(pair);
-      if (pair.failedSigs >= this.lockoutCount && pair.status === 'active') {
-        pair.status = 'locked';
+      return claimed;
+    }
+    let claimed = false;
+    const claim = (source: Readonly<StoredPair>): StoredPair => {
+      const pair = structuredClone(source) as StoredPair;
+      if (pair.status !== 'active') return pair;
+      if (pair.maxRequests && pair.maxRequests > 0 && pair.requests >= pair.maxRequests) {
+        pair.status = 'expired';
+        return pair;
       }
-      // Also check cumulative threshold
-      if ((pair.cumulativeFailures ?? 0) >= this.lockoutCount * 2 && pair.status === 'active') {
-        pair.status = 'locked';
+      claimed = true;
+      pair.requests++;
+      pair.lastActive = Date.now();
+      pair.failedSigs = 0;
+      pair.cumulativeFailures = 0;
+      pair.firstFailureAt = null;
+      if (pair.maxRequests && pair.maxRequests > 0 && pair.requests >= pair.maxRequests) {
+        pair.status = 'expired';
+      }
+      return pair;
+    };
+    const pair = await this.store.get(pairId);
+    if (pair) await this.store.set(claim(pair));
+    if (claimed) {
+      for (const key of this.ipFailureTracker.keys()) {
+        if (key.startsWith(`${pairId}:`)) this.ipFailureTracker.delete(key);
       }
     }
-    await this.store.set(pair);
+    return claimed;
   }
 
   /**
@@ -352,8 +428,7 @@ export class PairRegistry {
    * Called on every failure. Decays the cumulative score by half for each
    * full window that has elapsed since the first failure, then increments by 1.
    */
-  private _applyCumulativeDecay(pair: import('./types.js').StoredPair): void {
-    const now = Date.now();
+  private _applyCumulativeDecay(pair: import('./types.js').StoredPair, now = Date.now()): void {
     const firstFailure = pair.firstFailureAt ?? now;
     const windowsElapsed = Math.floor((now - firstFailure) / this.IP_FAILURE_WINDOW_MS);
     let cumulative = pair.cumulativeFailures ?? 0;
@@ -369,12 +444,14 @@ export class PairRegistry {
   }
 
   async unlock(pairId: string): Promise<void> {
-    const pair = await this.store.get(pairId);
-    if (pair && pair.status === 'locked') {
-      pair.status = 'active';
-      pair.failedSigs = 0;
-      await this.store.set(pair);
+    if (this.atomicStore) {
+      await this.atomicStore.atomicMutate(pairId, (pair) => pair.status === 'locked'
+        ? { ...pair, status: 'active', failedSigs: 0 }
+        : { ...pair });
+      return;
     }
+    const pair = await this.store.get(pairId);
+    if (pair?.status === 'locked') await this.store.set({ ...pair, status: 'active', failedSigs: 0 });
   }
 
   /**
@@ -397,20 +474,24 @@ export class PairRegistry {
     pairId: string,
     updates: Partial<Pick<StoredPair, 'scope' | 'expiresAt' | 'maxRequests' | 'name'>>,
   ): Promise<StoredPair | undefined> {
+    const apply = (source: Readonly<StoredPair>): StoredPair => {
+      const pair = structuredClone(source) as StoredPair;
+      if (updates.scope !== undefined) {
+        if (!ALLOWED_SCOPES.has(updates.scope)) {
+          throw new Error(`Invalid scope: ${updates.scope}. Must be one of: ${[...ALLOWED_SCOPES].join(', ')}`);
+        }
+        pair.scope = updates.scope;
+      }
+      if ('expiresAt' in updates) pair.expiresAt = updates.expiresAt;
+      if ('maxRequests' in updates) pair.maxRequests = updates.maxRequests;
+      if (updates.name !== undefined) pair.name = updates.name;
+      return pair;
+    };
+    if (this.atomicStore) return this.atomicStore.atomicMutate(pairId, apply);
     const pair = await this.store.get(pairId);
     if (!pair) return undefined;
-    if (updates.scope !== undefined) {
-      if (!ALLOWED_SCOPES.has(updates.scope)) {
-        throw new Error(`Invalid scope: ${updates.scope}. Must be one of: ${[...ALLOWED_SCOPES].join(', ')}`);
-      }
-      pair.scope = updates.scope;
-    }
-    if ('expiresAt' in updates) pair.expiresAt = updates.expiresAt;
-    if ('maxRequests' in updates) pair.maxRequests = updates.maxRequests;
-    if (updates.name !== undefined) pair.name = updates.name;
-    await this.store.set(pair);
-    // REG-01 FIX: return a deep copy so callers cannot mutate the stored record
-    // by mutating the returned object.
-    return structuredClone(pair);
+    const updated = apply(pair);
+    await this.store.set(updated);
+    return structuredClone(updated);
   }
 }

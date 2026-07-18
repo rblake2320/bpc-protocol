@@ -580,6 +580,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
     const result = await verifyBPCRequest(req, registry, nonceStore, anomaly);
     expect(result.ok).toBe(false);
     expect(result.error).toBe('pair_expired');
+    expect((await registry.get(expPairId))?.status).toBe('expired');
   });
 
   it('should expire a pair after its maxRequests cap is exhausted', async () => {
@@ -697,7 +698,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
     const raceId1 = await registry1.registerDirect({ name: 'race-1', scope: 'read', mode: 'development', secretHash: sh1, pubJwk: kp1.pubJwk });
     // Manually set failedSigs to lockoutCount without changing status
     const pair1 = await registry1.get(raceId1);
-    if (pair1) { pair1.failedSigs = 10; }
+    if (pair1) { await store1.set({ ...pair1, failedSigs: 10 }); }
     const { signedData: sd1, signature: sig1 } = await buildSignedRequest(kp1.privateKey, raceId1, 'GET', '/api/data', sh1);
     const req1 = makeReqData({ pairId: raceId1, signedData: sd1, signature: sig1, method: 'GET', path: '/api/data' });
     const result = await verifyBPCRequest(req1, registry1, nonceStore1, anomaly1, { sigWindowMs: 60_000, lockoutCount: 10, enableShadowMode: false });
@@ -715,7 +716,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
     const sh2 = await hashSecret('race-guard-secret-2');
     const raceId2 = await registry2.registerDirect({ name: 'race-2', scope: 'read', mode: 'development', secretHash: sh2, pubJwk: kp2.pubJwk });
     const pair2 = await registry2.get(raceId2);
-    if (pair2) { pair2.failedSigs = 10; }
+    if (pair2) { await store2.set({ ...pair2, failedSigs: 10 }); }
     const { signedData: sd2, signature: sig2 } = await buildSignedRequest(kp2.privateKey, raceId2, 'GET', '/api/data', sh2);
     const req2 = makeReqData({ pairId: raceId2, signedData: sd2, signature: sig2, method: 'GET', path: '/api/data' });
     const result2 = await verifyBPCRequest(req2, registry2, nonceStore2, anomaly2, { sigWindowMs: 60_000, lockoutCount: 10, enableShadowMode: true });
@@ -726,6 +727,39 @@ describe('@bpc/server — verifyBPCRequest', () => {
 });
 
 describe('@bpc/server — PairRegistry', () => {
+  it('atomically consumes one pending approval under concurrent approvers', async () => {
+    const store = new MemoryPairStore();
+    const registry = new PairRegistry(store, 10, 10, true);
+    const kp = await generateKeypair();
+    const token = await registry.requestPairing({ name:'atomic', scope:'read', mode:'production', secretHash:await hashSecret('atomic-approval'), pubJwk:kp.pubJwk });
+    const results = await Promise.allSettled([registry.approvePairing(token), registry.approvePairing(token)]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(await registry.listPending()).toHaveLength(0);
+    expect(await registry.list()).toHaveLength(1);
+  });
+
+  it('serializes capacity, lifecycle updates, and successful-use claims', async () => {
+    const store = new MemoryPairStore();
+    const registry = new PairRegistry(store, 1, 10, true);
+    const kp = await generateKeypair();
+    const registration = (name:string) => ({ name, scope:'read' as const, mode:'production' as const, secretHash:'s'.repeat(43), pubJwk:kp.pubJwk, maxRequests:1 });
+    const [a,b] = await Promise.all([registry.requestPairing(registration('a')),registry.requestPairing(registration('b'))]);
+    const approvals = await Promise.allSettled([registry.approvePairing(a),registry.approvePairing(b)]);
+    expect(approvals.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    const pairId = (approvals.find((result): result is PromiseFulfilledResult<string> => result.status === 'fulfilled'))!.value;
+    await Promise.all([registry.updatePair(pairId,{name:'renamed'}),registry.updatePair(pairId,{scope:'admin'})]);
+    expect(await registry.get(pairId)).toMatchObject({name:'renamed',scope:'admin'});
+    expect((await Promise.all([registry.claimSuccessfulUse(pairId),registry.claimSuccessfulUse(pairId)])).filter(Boolean)).toHaveLength(1);
+    expect(await registry.get(pairId)).toMatchObject({requests:1,status:'expired'});
+    await Promise.all([registry.revoke(pairId),registry.updatePair(pairId,{name:'after-revoke'})]);
+    expect(await registry.get(pairId)).toMatchObject({status:'revoked',name:'after-revoke'});
+  });
+
+  it('requires an atomic store when production enforcement is requested', () => {
+    const legacy = { get:async()=>undefined,set:async()=>{},delete:async()=>{},list:async()=>[],getPending:async()=>undefined,setPending:async()=>{},deletePending:async()=>{},listPending:async()=>[] };
+    expect(() => new PairRegistry(legacy, 10, 10, true)).toThrow(/AtomicPairStore/);
+  });
+
   it('should support approval workflow', async () => {
     const store = new MemoryPairStore();
     const registry = new PairRegistry(store);
