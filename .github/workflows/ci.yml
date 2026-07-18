@@ -30,9 +30,23 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      postgres_b:
+        image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        env:
+          POSTGRES_DB: bpc_test
+          POSTGRES_USER: bpc_test
+          POSTGRES_PASSWORD: bpc-test-only-password
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U bpc_test -d bpc_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     env:
       BPC_TEST_REDIS_URL: redis://127.0.0.1:6379
       BPC_TEST_POSTGRES_URL: postgresql://bpc_test:bpc-test-only-password@127.0.0.1:5432/bpc_test
+      BPC_TEST_POSTGRES_B_URL: postgresql://bpc_test:bpc-test-only-password@127.0.0.1:5433/bpc_test
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -55,6 +69,9 @@ jobs:
       # BPC_TEST_POSTGRES_URL is unset, so this step FAILS rather than silently
       # skipping (asserts the real-PG tests actually executed).
       - run: npm run test:postgres:ha
+      # Independent-state mechanism evidence only. The drill uses a labeled
+      # test-only in-process adapter and makes no network/HA/promotion claim.
+      - run: npm run test:postgres:two-pg
       - run: npm audit --omit=dev
 
   python:
