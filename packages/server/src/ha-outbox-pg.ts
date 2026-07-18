@@ -1145,10 +1145,50 @@ export class PgDurablePublisher<Clean> {
       const lease = (await exec.query('SELECT lease_token FROM ha_outbox_publisher_lease WHERE stream_id = $1 FOR UPDATE', [this.streamId])).rows;
       if (!lease.length || lease[0].lease_token !== leaseToken) throw new ContractValidationError('publisher lease lost — aborting drain');
       const rows = (await exec.query(
-        'SELECT source_epoch, sequence, fence_token, op_digest, mutation FROM ha_outbox_rows WHERE stream_id = $1 AND acked_at IS NULL AND quarantined_at IS NULL ORDER BY sequence ASC LIMIT 1',
+        'SELECT source_epoch, sequence, fence_token, op_digest, mutation, quarantined_at FROM ha_outbox_rows WHERE stream_id = $1 AND acked_at IS NULL ORDER BY sequence ASC LIMIT 1',
         [this.streamId],
       )).rows;
-      return rows[0] ?? null;
+      if (!rows[0] || rows[0].quarantined_at != null) return null;
+      return {
+        source_epoch: rows[0].source_epoch,
+        sequence: rows[0].sequence,
+        fence_token: rows[0].fence_token,
+        op_digest: rows[0].op_digest,
+        mutation: rows[0].mutation,
+      };
+    });
+  }
+
+  private async quarantineRecord(
+    leaseToken: string,
+    sourceEpoch: string,
+    sequence: number,
+    storedDigest: string,
+    decision: string,
+  ): Promise<void> {
+    await this.db.transaction(async (exec) => {
+      await enterCriticalTx(exec, this.schema);
+      const lease = (await exec.query('SELECT lease_token FROM ha_outbox_publisher_lease WHERE stream_id = $1 FOR UPDATE', [this.streamId])).rows;
+      if (!lease.length || lease[0].lease_token !== leaseToken) throw new ContractValidationError('publisher lease lost — not quarantining');
+      const ins = await exec.query(
+        `INSERT INTO ha_outbox_quarantine (stream_id, source_epoch, sequence, op_digest, decision)
+         VALUES ($1,$2,$3,$4,$5) ON CONFLICT (stream_id, source_epoch, sequence) DO NOTHING`,
+        [this.streamId, sourceEpoch, sequence, storedDigest, decision],
+      );
+      if (ins.rowCount === 0) {
+        const ex = (await exec.query('SELECT op_digest, decision FROM ha_outbox_quarantine WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3 FOR UPDATE', [this.streamId, sourceEpoch, sequence])).rows;
+        if (!ex.length) throw new ContractValidationError('quarantine conflict without an existing row');
+        if (!digestEquals(String(ex[0].op_digest), storedDigest) || String(ex[0].decision) !== decision) {
+          throw new ContractValidationError('quarantine record conflict: existing digest/decision differ from this record');
+        }
+      } else if (ins.rowCount !== 1) {
+        throw new ContractValidationError('quarantine insert affected unexpected row count');
+      }
+      const mark = await exec.query(
+        'UPDATE ha_outbox_rows SET quarantined_at = now() WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3 AND acked_at IS NULL AND quarantined_at IS NULL',
+        [this.streamId, sourceEpoch, sequence],
+      );
+      affectedOne(mark, 'quarantine mark');
     });
   }
 
@@ -1181,7 +1221,22 @@ export class PgDurablePublisher<Clean> {
         if (!digestEquals(recomputed, storedDigest)) throw new ContractValidationError(`corrupted outbox row: digest mismatch at ${this.streamId}/${sourceEpoch}/${sequence}`);
 
         // deliver OUTSIDE any tx — no DB lock is held across this network call.
-        const receipt = snapshotAckReceipt(await this.transport.deliverAndAwaitAck(record)); // throw → row stays, retried
+        let delivered: AckReceipt;
+        try {
+          delivered = await this.transport.deliverAndAwaitAck(record);
+        } catch (error) {
+          if (error && typeof error === 'object'
+            && (error as { retriable?: unknown }).retriable === false) {
+            await this.quarantineRecord(
+              leaseToken, sourceEpoch, sequence, storedDigest,
+              'reject-transport-terminal',
+            );
+            quarantined++;
+            break;
+          }
+          throw error;
+        }
+        const receipt = snapshotAckReceipt(delivered);
         published++;
         // (HIGH2) verify signature (must cover the decision) came from the authorized receiver…
         await this.ackVerifier.verify(receipt, record); // throw → not acked
@@ -1215,32 +1270,9 @@ export class PgDurablePublisher<Clean> {
           break;
         }
         // (H1) terminal NACK → quarantine + halt. Never ACK, never drop.
-        await this.db.transaction(async (exec) => {
-          await enterCriticalTx(exec, this.schema);
-          const lease = (await exec.query('SELECT lease_token FROM ha_outbox_publisher_lease WHERE stream_id = $1 FOR UPDATE', [this.streamId])).rows;
-          if (!lease.length || lease[0].lease_token !== leaseToken) throw new ContractValidationError('publisher lease lost — not quarantining');
-          const ins = await exec.query(
-            `INSERT INTO ha_outbox_quarantine (stream_id, source_epoch, sequence, op_digest, decision)
-             VALUES ($1,$2,$3,$4,$5) ON CONFLICT (stream_id, source_epoch, sequence) DO NOTHING`,
-            [this.streamId, sourceEpoch, sequence, storedDigest, receipt.decision],
-          );
-          if (ins.rowCount === 0) {
-            // (R5/HIGH2) a preexisting quarantine row must EXACTLY match this record's
-            // digest + decision — a planted/lying row cannot stand in for real evidence.
-            const ex = (await exec.query('SELECT op_digest, decision FROM ha_outbox_quarantine WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3 FOR UPDATE', [this.streamId, sourceEpoch, sequence])).rows;
-            if (!ex.length) throw new ContractValidationError('quarantine conflict without an existing row');
-            if (!digestEquals(String(ex[0].op_digest), storedDigest) || String(ex[0].decision) !== receipt.decision) {
-              throw new ContractValidationError('quarantine record conflict: existing digest/decision differ from this record');
-            }
-          } else if (ins.rowCount !== 1) {
-            throw new ContractValidationError('quarantine insert affected unexpected row count');
-          }
-          const mark = await exec.query(
-            'UPDATE ha_outbox_rows SET quarantined_at = now() WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3 AND acked_at IS NULL AND quarantined_at IS NULL',
-            [this.streamId, sourceEpoch, sequence],
-          );
-          affectedOne(mark, 'quarantine mark');
-        });
+        await this.quarantineRecord(
+          leaseToken, sourceEpoch, sequence, storedDigest, receipt.decision,
+        );
         quarantined++;
         break; // divergence on an ordered stream → halt the drain
       }
