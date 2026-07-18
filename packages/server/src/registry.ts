@@ -27,7 +27,7 @@
  */
 
 import { generateId } from '@bpc/core';
-import { isAtomicPairStore, type AtomicPairStore, type PairStore } from './store.js';
+import { isAtomicPairStore, type AtomicPairStore, type PairStore, type SuccessfulUseClaim } from './store.js';
 import type { StoredPair, PairRegistration } from './types.js';
 
 /** Minimum secretHash length: 43 chars = 256-bit HKDF output in base64url. */
@@ -393,26 +393,34 @@ export class PairRegistry {
    * the usage cap was already exhausted by a concurrent request.
    */
   async claimSuccessfulUse(pairId: string): Promise<boolean> {
+    return (await this.claimSuccessfulUseOutcome(pairId, Date.now())) === 'claimed';
+  }
+
+  async claimSuccessfulUseOutcome(pairId: string, at: number): Promise<SuccessfulUseClaim> {
     if (this.atomicStore) {
-      const claimed = await this.atomicStore.claimSuccessfulUse(pairId, Date.now());
-      if (claimed) {
+      const outcome = await this.atomicStore.claimSuccessfulUse(pairId, at);
+      if (outcome === 'claimed') {
         for (const key of this.ipFailureTracker.keys()) {
           if (key.startsWith(`${pairId}:`)) this.ipFailureTracker.delete(key);
         }
       }
-      return claimed;
+      return outcome;
     }
     let claimed = false;
     const claim = (source: Readonly<StoredPair>): StoredPair => {
       const pair = structuredClone(source) as StoredPair;
       if (pair.status !== 'active') return pair;
+      if (pair.expiresAt !== undefined && pair.expiresAt < at) {
+        pair.status = 'expired';
+        return pair;
+      }
       if (pair.maxRequests && pair.maxRequests > 0 && pair.requests >= pair.maxRequests) {
         pair.status = 'expired';
         return pair;
       }
       claimed = true;
       pair.requests++;
-      pair.lastActive = Date.now();
+      pair.lastActive = at;
       pair.failedSigs = 0;
       pair.cumulativeFailures = 0;
       pair.firstFailureAt = null;
@@ -428,7 +436,7 @@ export class PairRegistry {
         if (key.startsWith(`${pairId}:`)) this.ipFailureTracker.delete(key);
       }
     }
-    return claimed;
+    return claimed ? 'claimed' : pair ? (pair.expiresAt !== undefined && pair.expiresAt < at ? 'time-expired' : pair.maxRequests && pair.maxRequests > 0 && pair.requests >= pair.maxRequests ? 'usage-exhausted' : 'inactive') : 'missing';
   }
 
   /**

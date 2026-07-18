@@ -18,6 +18,11 @@ transactions and appends the corresponding durable outbox record in the same
 transaction. Approval and rotation use compound mutations, so a receiver cannot
 commit only half of either authority transition.
 
+The final successful-use claim rechecks the current `expiresAt` and usage cap
+under the same authority lock. A concurrent expiry or policy change therefore
+returns a typed denial and durably expires the pair instead of authorizing from
+the earlier verification snapshot.
+
 Construct `PairRegistry` with `requireAtomic=true` for production. The legacy
 fallback remains for bounded single-writer adapters and is not a concurrency
 guarantee.

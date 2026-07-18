@@ -429,9 +429,10 @@ export async function verifyBPCRequest(
     return { ok: false, pairId: req.pairId, error: 'ghost_pair_denied', shadow: true, tarpitDelayMs: delayMs };
   }
 
-  if (!await registry.claimSuccessfulUse(req.pairId)) {
-    return deny('pair_usage_cap_exceeded');
-  }
+  const useClaim = await registry.claimSuccessfulUseOutcome(req.pairId, Date.now());
+  if (useClaim === 'time-expired') return deny('pair_expired');
+  if (useClaim === 'usage-exhausted') return deny('pair_usage_cap_exceeded');
+  if (useClaim !== 'claimed') return deny('pair_state_changed_retry');
   await config.auditLog?.write({
     action: 'verify_pass', pairId: req.pairId,
     method: req.method, path: req.path, ip: req.ip,

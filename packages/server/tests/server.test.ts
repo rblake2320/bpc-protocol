@@ -650,6 +650,21 @@ describe('@bpc/server — verifyBPCRequest', () => {
     expect((await localRegistry.get(id))?.status).toBe('expired');
   });
 
+  it('denies when expiry elapses or is shortened after the verification snapshot but before the final claim', async () => {
+    class ExpiryRaceStore extends MemoryPairStore {
+      override async claimSuccessfulUse(id:string,at:number) {
+        await this.atomicMutate(id,(pair)=>({...pair,expiresAt:at-1}));
+        return super.claimSuccessfulUse(id,at);
+      }
+    }
+    const localStore=new ExpiryRaceStore(),localRegistry=new PairRegistry(localStore,10,10,true),localNonce=new ServerNonceStore(new MemoryNonceBackend(),120_000),localAnomaly=new AnomalyEngine(new MemoryAnomalyStore());
+    const kp=await generateKeypair(),secret=await hashSecret('expiry-race'),id=await localRegistry.registerDirect({name:'expiry-race',scope:'read',mode:'production',secretHash:secret,pubJwk:kp.pubJwk,expiresAt:Date.now()+60_000});
+    const signed=await buildSignedRequest(kp.privateKey,id,'GET','/api/data',secret);
+    const result=await verifyBPCRequest(makeReqData({pairId:id,signedData:signed.signedData,signature:signed.signature,method:'GET',path:'/api/data',bodyHash:signed.bodyHash}),localRegistry,localNonce,localAnomaly);
+    expect(result).toMatchObject({ok:false,error:'pair_expired'});
+    expect(await localRegistry.get(id)).toMatchObject({status:'expired',requests:0});
+  });
+
   it('should reject a version mismatch', async () => {
     const { signedData, signature } = await buildSignedRequest(
       keypair.privateKey, pairId, 'GET', '/api/data', secretHash,
@@ -775,6 +790,16 @@ describe('@bpc/server — PairRegistry', () => {
     await store.atomicMutate(pairId,(current)=>({...current,failedSigs:0}));
     expect(await registry.ensureLocked(pairId,10)).toBe(false);
     expect((await registry.get(pairId))?.status).toBe('active');
+  });
+
+  it('enforces approval and rotation predicates identically in the memory authority', async () => {
+    const store=new MemoryPairStore(),kp=await generateKeypair(),registration={name:'policy',scope:'read' as const,mode:'production' as const,secretHash:'s'.repeat(43),pubJwk:kp.pubJwk,maxRequests:3,kind:'ghost' as const,canaryClass:'docs' as const};
+    await store.setPending('policy-token',registration,1);
+    await expect(store.approvePending('policy-token',{registration,requestedAt:1},{id:'bad-approval',...registration,name:'other',status:'active',created:2,lastActive:null,requests:0,failedSigs:0},10)).rejects.toThrow(/does not match|initial state/);
+    expect(await store.getPending('policy-token')).toBeDefined();
+    const old={id:'old-policy',...registration,status:'active' as const,created:2,lastActive:null,requests:0,failedSigs:0};await store.set(old);
+    expect(await store.rotatePair(old,{...old,id:'bad-rotation',created:3,cumulativeFailures:0})).toBe(false);
+    expect((await store.get(old.id))?.status).toBe('active');
   });
 
   it('requires an atomic store when production enforcement is requested', () => {

@@ -70,6 +70,18 @@ describe('AES-256-GCM pair payload codec', () => {
     expect(queries).toBe(0);
   });
 
+  it('rejects compound envelope/decrypted identity mismatches before any query', async () => {
+    const c=codec(),streamId='bpc:pair:test/v1',r=registration(),p={...pair(),requests:0,failedSigs:0,lastActive:null,cumulativeFailures:undefined,firstFailureAt:undefined};let queries=0;
+    const sealedApproval=c.sealPair(p,{domain:'bpc-pair-payload',version:'1',streamId,kind:'bpc.pair.approve.v1',pairId:p.id});
+    const approval=bpcPairMutationSanitizer.sanitize({kind:'bpc.pair.approve.v1',token:'approval-1',requestedAt:10,expectedPending:c.sealRegistration(r,{domain:'bpc-pair-payload',version:'1',streamId,kind:'bpc.pair.approve.v1',token:'approval-1',requestedAt:10}),pairId:'envelope-other',sealed:sealedApproval});
+    const applier=new PgPairMutationApplier(streamId,{activeKeyId:KEY_ID,resolveKey:()=>KEY}),exec={query:async()=>{queries++;return{rows:[],rowCount:0};}};
+    await expect(applier.applyInTx(exec,{contractVersion:'1',streamId,sourceEpoch:'e1',sequence:1,fenceToken:'0',opDigest:'0'.repeat(64),mutation:approval} as OutboxRecord<BpcPairMutation>)).rejects.toThrow(/authentication|identity/);
+    const replacement={...p,id:'replacement'};
+    const rotation=bpcPairMutationSanitizer.sanitize({kind:'bpc.pair.rotate.v1',oldPairId:'envelope-old',expectedOld:c.sealPair(p,{domain:'bpc-pair-payload',version:'1',streamId,kind:'bpc.pair.rotate.v1',pairId:p.id}),newPairId:replacement.id,sealed:c.sealPair(replacement,{domain:'bpc-pair-payload',version:'1',streamId,kind:'bpc.pair.rotate.v1',pairId:replacement.id})});
+    await expect(applier.applyInTx(exec,{contractVersion:'1',streamId,sourceEpoch:'e1',sequence:2,fenceToken:'0',opDigest:'0'.repeat(64),mutation:rotation} as OutboxRecord<BpcPairMutation>)).rejects.toThrow(/authentication|identity/);
+    expect(queries).toBe(0);
+  });
+
   it('uses a fresh nonce and rejects wrong AAD, key, tag, keyId and identity', () => {
     const c = codec(), p = pair(), aad = pairAad(p.id);
     const a = c.sealPair(p, aad), b = c.sealPair(p, aad);

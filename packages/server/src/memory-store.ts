@@ -1,4 +1,4 @@
-import type { AtomicPairStore, PairAtomicMutation, NonceStoreBackend, AnomalyStore } from './store.js';
+import { hasInitialPairState, pairMatchesRegistration, rotationPolicyMatches, type AtomicPairStore, type PairAtomicMutation, type SuccessfulUseClaim, type NonceStoreBackend, type AnomalyStore } from './store.js';
 import type { StoredPair, PairRegistration } from './types.js';
 
 export class MemoryPairStore implements AtomicPairStore {
@@ -49,7 +49,7 @@ export class MemoryPairStore implements AtomicPairStore {
     return this.exclusively(() => {
       const pending = this.pending.get(token);
       if (!pending || JSON.stringify(pending) !== JSON.stringify(expected)) return false;
-      if (pair.status !== 'active' || pair.requests !== 0 || pair.failedSigs !== 0 || pair.lastActive !== null) {
+      if (!hasInitialPairState(pair) || !pairMatchesRegistration(pair, expected.registration)) {
         throw new Error('Approved pair initial state is invalid');
       }
       const active = Array.from(this.pairs.values()).filter((item) => item.status === 'active').length;
@@ -65,22 +65,26 @@ export class MemoryPairStore implements AtomicPairStore {
     return this.exclusively(() => {
       const current = this.pairs.get(expectedOld.id);
       if (!current || JSON.stringify(current) !== JSON.stringify(expectedOld)) return false;
-      const policy = (pair: StoredPair) => ({ name:pair.name,scope:pair.scope,mode:pair.mode,secretHash:pair.secretHash,expiresAt:pair.expiresAt,maxRequests:pair.maxRequests,kind:pair.kind??'legitimate',canaryClass:pair.canaryClass });
-      if (current.status !== 'active' || replacement.status !== 'active' || replacement.requests !== 0 || replacement.failedSigs !== 0 || replacement.lastActive !== null || JSON.stringify(policy(current)) !== JSON.stringify(policy(replacement)) || this.pairs.has(replacement.id)) return false;
+      if (current.status !== 'active' || !hasInitialPairState(replacement) || !rotationPolicyMatches(current,replacement) || this.pairs.has(replacement.id)) return false;
       this.pairs.set(current.id, { ...structuredClone(current), status: 'rotated' });
       this.pairs.set(replacement.id, structuredClone(replacement));
       return true;
     });
   }
 
-  async claimSuccessfulUse(pairId: string, at: number): Promise<boolean> {
+  async claimSuccessfulUse(pairId: string, at: number): Promise<SuccessfulUseClaim> {
     if (!Number.isSafeInteger(at) || at < 0) throw new Error('Successful-use timestamp is invalid');
     return this.exclusively(() => {
       const current = this.pairs.get(pairId);
-      if (!current || current.status !== 'active') return false;
+      if (!current) return 'missing';
+      if (current.status !== 'active') return 'inactive';
+      if (current.expiresAt !== undefined && current.expiresAt < at) {
+        this.pairs.set(pairId, { ...current, status: 'expired' });
+        return 'time-expired';
+      }
       if (current.maxRequests && current.maxRequests > 0 && current.requests >= current.maxRequests) {
         this.pairs.set(pairId, { ...current, status: 'expired' });
-        return false;
+        return 'usage-exhausted';
       }
       const requests = current.requests + 1;
       this.pairs.set(pairId, {
@@ -88,7 +92,7 @@ export class MemoryPairStore implements AtomicPairStore {
         cumulativeFailures: 0, firstFailureAt: null,
         status: current.maxRequests && current.maxRequests > 0 && requests >= current.maxRequests ? 'expired' : current.status,
       });
-      return true;
+      return 'claimed';
     });
   }
 

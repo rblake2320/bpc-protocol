@@ -235,7 +235,7 @@
   with an atomic claim before authorization succeeds.
 - Added concurrent memory-store tests and real PostgreSQL approval, capacity,
   CAS, usage-cap, and compound receiver evidence.
-- Validation: 314 server tests, 36 integrated PostgreSQL 16 checks, workspace
+- Validation: 317 server tests, 36 integrated PostgreSQL 16 checks, workspace
   build/tests, package-boundary suite, and dry-pack all pass.
 - Issue #16 remains open; this is single-node transactional mechanism evidence,
   not a two-node HA claim.

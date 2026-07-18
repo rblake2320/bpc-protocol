@@ -6,7 +6,7 @@ export type {
   AnomalyCounters,
 } from './types.js';
 export type { BPCRequestData, BPCServerConfig } from './middleware.js';
-export type { PairStore, AtomicPairStore, PairAtomicMutation, NonceStoreBackend, AnomalyStore } from './store.js';
+export type { PairStore, AtomicPairStore, PairAtomicMutation, SuccessfulUseClaim, NonceStoreBackend, AnomalyStore } from './store.js';
 export type { AuditLog, AuditEntry, AuditAction, AuditSeverity } from './audit.js';
 export type { RateLimiter, RateLimitResult } from './rate-limiter.js';
 export type { RotationRequest, RotationResult } from './rotation.js';
