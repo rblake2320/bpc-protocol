@@ -26,6 +26,12 @@ returns its durable terminal reason; any other policy mismatch returns a typed
 state-change denial without incrementing usage. The request is never authorized
 from a stale verification snapshot.
 
+Public-key identity is reduced synchronously to the validated P-256
+`kty`/`crv`/`x`/`y` tuple at capture, persistence, and claim comparison.
+Optional `key_ops`/`ext` metadata is validated when present but is not part of
+key identity, so absent metadata and an explicit `undefined` cannot create a
+false policy mismatch.
+
 Construct `PairRegistry` with `requireAtomic=true` for production. The legacy
 fallback remains for bounded single-writer adapters and is not a concurrency
 guarantee.

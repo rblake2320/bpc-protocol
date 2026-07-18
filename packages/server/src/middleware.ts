@@ -41,7 +41,7 @@ import type { ServerNonceStore } from './nonce-store.js';
 import type { AnomalyEngine } from './anomaly.js';
 import type { RateLimiter } from './rate-limiter.js';
 import type { AuditLog } from './audit.js';
-import type { SuccessfulUsePolicy } from './store.js';
+import { canonicalAuthorizationJwk, type SuccessfulUsePolicy } from './store.js';
 import { AuthorizationQuarantineError, type ContinuityGate } from './redis-continuity.js';
 
 export interface BPCRequestData {
@@ -138,10 +138,7 @@ interface AuthorizationContext {
  * policy inputs while the request is being verified.
  */
 function captureAuthorizationContext(pair: import('./types.js').StoredPair): AuthorizationContext {
-  const pubJwk = Object.freeze({
-    ...pair.pubJwk,
-    key_ops: pair.pubJwk.key_ops ? Object.freeze([...pair.pubJwk.key_ops]) : undefined,
-  }) as JsonWebKey;
+  const pubJwk = canonicalAuthorizationJwk(pair.pubJwk) as JsonWebKey;
 
   return Object.freeze({
     pairId: pair.id,

@@ -1,4 +1,4 @@
-import { hasInitialPairState, pairMatchesRegistration, rotationPolicyMatches, successfulUsePolicyMatches, type AtomicPairStore, type PairAtomicMutation, type SuccessfulUseClaim, type SuccessfulUsePolicy, type NonceStoreBackend, type AnomalyStore } from './store.js';
+import { canonicalAuthorizationJwk, hasInitialPairState, pairMatchesRegistration, rotationPolicyMatches, successfulUsePolicyMatches, type AtomicPairStore, type PairAtomicMutation, type SuccessfulUseClaim, type SuccessfulUsePolicy, type NonceStoreBackend, type AnomalyStore } from './store.js';
 import type { StoredPair, PairRegistration } from './types.js';
 
 export class MemoryPairStore implements AtomicPairStore {
@@ -74,7 +74,7 @@ export class MemoryPairStore implements AtomicPairStore {
 
   async claimSuccessfulUse(pairId: string, at: number, expected: SuccessfulUsePolicy): Promise<SuccessfulUseClaim> {
     if (!Number.isSafeInteger(at) || at < 0) throw new Error('Successful-use timestamp is invalid');
-    const captured = structuredClone(expected);
+    const captured = { ...structuredClone(expected), pubJwk: canonicalAuthorizationJwk(expected.pubJwk) };
     return this.exclusively(() => {
       const current = this.pairs.get(pairId);
       if (!current) return 'missing';

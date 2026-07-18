@@ -28,7 +28,7 @@ import {
   type PgTransactor,
   type SchemaReadyToken,
 } from './ha-outbox-pg.js';
-import { hasInitialPairState, pairMatchesRegistration, rotationPolicyMatches, successfulUsePolicyMatches, type AtomicPairStore, type PairAtomicMutation, type SuccessfulUseClaim, type SuccessfulUsePolicy } from './store.js';
+import { canonicalAuthorizationJwk, hasInitialPairState, pairMatchesRegistration, rotationPolicyMatches, successfulUsePolicyMatches, type AtomicPairStore, type PairAtomicMutation, type SuccessfulUseClaim, type SuccessfulUsePolicy } from './store.js';
 import type { PairRegistration, StoredPair } from './types.js';
 
 const PAIR_KEYS = ['id','name','scope','mode','secretHash','pubJwk','status','created','lastActive','requests','failedSigs','cumulativeFailures','firstFailureAt','expiresAt','maxRequests','kind','canaryClass'] as const;
@@ -119,19 +119,8 @@ function databaseFloatToDecimal(value: unknown): string {
 }
 
 function normalizeJwk(value: unknown): CanonicalPublicJwk {
-  const jwk = dataObject(value, JWK_KEYS, 'pubJwk');
-  const kty = ownValue(jwk, 'kty'), crv = ownValue(jwk, 'crv');
-  const x = ownValue(jwk, 'x'), y = ownValue(jwk, 'y');
-  if (kty !== 'EC' || crv !== 'P-256' || typeof x !== 'string' || !B64URL_256.test(x) || typeof y !== 'string' || !B64URL_256.test(y)) throw new ContractValidationError('pubJwk must be an exact public P-256 key (private d is forbidden)');
-  const keyOps = ownValue(jwk, 'key_ops');
-  if (keyOps !== undefined) {
-    if (!Array.isArray(keyOps) || utilTypes.isProxy(keyOps) || keyOps.length !== 1 || Object.getOwnPropertySymbols(keyOps).length || Object.getOwnPropertyNames(keyOps).some((key) => key !== '0' && key !== 'length')) throw new ContractValidationError('pubJwk.key_ops must be exactly ["verify"]');
-    const descriptor = Object.getOwnPropertyDescriptor(keyOps, '0');
-    if (!descriptor || !('value' in descriptor) || !descriptor.enumerable || descriptor.value !== 'verify') throw new ContractValidationError('pubJwk.key_ops must contain exactly one verify data property');
-  }
-  const ext = ownValue(jwk, 'ext');
-  if (ext !== undefined && ext !== true) throw new ContractValidationError('pubJwk.ext must be true when present');
-  return Object.freeze({ kty: 'EC', crv: 'P-256', x, y });
+  try { return canonicalAuthorizationJwk(dataObject(value, JWK_KEYS, 'pubJwk')); }
+  catch (error) { throw new ContractValidationError(error instanceof Error ? error.message : 'pubJwk is invalid'); }
 }
 function normalizeRegistration(value: unknown): CanonicalPairRegistration {
   const r = dataObject(value, REG_KEYS, 'registration');
@@ -312,7 +301,7 @@ export class PgTransactionalPairStore implements AtomicPairStore {
   }
   async claimSuccessfulUse(pairId:string,at:number,expected:SuccessfulUsePolicy):Promise<SuccessfulUseClaim>{
     if(!ID.test(pairId)||!Number.isSafeInteger(at)||at<0)throw new ContractValidationError('successful-use claim input invalid');
-    const captured=structuredClone(expected);
+    const captured={...structuredClone(expected),pubJwk:canonicalAuthorizationJwk(expected.pubJwk)};
     return this.outbox.withOutboxTx(async(tx,e)=>{
       const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[pairId])).rows[0];
       if(!row)return 'missing';

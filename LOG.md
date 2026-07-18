@@ -239,7 +239,10 @@
   snapshot and retained durable expiry/cap reasons for concurrent losers.
 - Added middleware regressions for concurrent scope mutation and the final
   usage-cap race; neither denial increments the pair's successful-use count.
-- Validation: 318 server tests, 36 integrated PostgreSQL 16 checks, workspace
+- Canonicalized public-key identity identically in middleware, memory, and
+  PostgreSQL claims; absent and explicit-undefined optional JWK metadata no
+  longer creates a false policy mismatch.
+- Validation: 318 server tests, 37 integrated PostgreSQL 16 checks, workspace
   build/tests, package-boundary suite, and dry-pack all pass.
 - Issue #16 remains open; this is single-node transactional mechanism evidence,
   not a two-node HA claim.

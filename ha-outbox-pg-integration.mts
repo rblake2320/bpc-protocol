@@ -25,6 +25,18 @@
 import assert from 'node:assert/strict';
 import pg from 'pg';
 import {
+  BPC_PROTOCOL_VERSION,
+  b64url,
+  canonicalize,
+  generateKeypair,
+  generateNonce,
+  hashSecret,
+  hmacDerive,
+  signPayload,
+  type BPCCanonicalPayload,
+} from './packages/core/src/index.ts';
+import {
+  AnomalyEngine,
   HA_OUTBOX_PG_SCHEMA,
   HA_OUTBOX_SCHEMA_MANIFEST,
   HA_OUTBOX_SCHEMA_VERSION,
@@ -34,6 +46,10 @@ import {
   PgReceiverCheckpoint,
   PgPairMutationApplier,
   PgTransactionalPairStore,
+  PairRegistry,
+  ServerNonceStore,
+  MemoryAnomalyStore,
+  MemoryNonceBackend,
   bpcPairMutationSanitizer,
   NodePostgresTransactor,
   adoptCurrentSchemaVersion,
@@ -46,6 +62,7 @@ import {
   provisionSchemaVersion,
   schemaManifest,
   successfulUsePolicy,
+  verifyBPCRequest,
 } from './packages/server/src/index.ts';
 // version-only gate is intentionally NOT in the package index (weaker gate);
 // imported from the module directly only to demonstrate the drift bypass.
@@ -65,6 +82,14 @@ import type {
   BpcPairMutation,
   StoredPair,
 } from './packages/server/src/index.ts';
+import type { BPCRequestData } from './packages/server/src/middleware.ts';
+
+async function signedRequest(privateKey:CryptoKey,pairId:string,secretHash:string):Promise<BPCRequestData>{
+  const nonce=generateNonce(),timestamp=Date.now(),method='GET',path='/api/data';
+  const bodyHash=b64url(await crypto.subtle.digest('SHA-256',new TextEncoder().encode('')));
+  const payload:BPCCanonicalPayload={body_hash:bodyHash,method,nonce,pair_id:pairId,path,secret_hmac:await hmacDerive(secretHash,nonce+timestamp),timestamp,version:BPC_PROTOCOL_VERSION};
+  return {pairId,signedData:Buffer.from(canonicalize(payload as unknown as Record<string,unknown>)).toString('base64url'),signature:await signPayload(privateKey,payload as unknown as Record<string,unknown>),method,path,bodyHash,version:BPC_PROTOCOL_VERSION};
+}
 
 const connectionString = process.env['BPC_TEST_POSTGRES_URL'] ?? process.env['HA_OUTBOX_PG_URL'];
 if (!connectionString) {
@@ -751,6 +776,36 @@ async function main(): Promise<void> {
     const expiryPolicy=successfulUsePolicy((await source.get(rotationNew.id))!);
     assert.equal(await source.claimSuccessfulUse(rotationNew.id,501,expiryPolicy),'time-expired','final claim authorized after current expiry');
     assert.deepEqual(await source.get(rotationNew.id),{...rotationNew,scope:'read-write',expiresAt:500,status:'expired'});
+  });
+
+  await check('(atomic registry) full middleware accepts canonical persisted JWKs and rejects a real key race', async () => {
+    const sid='bpc:pair:middleware-policy/v1';await provision(sid);
+    const keyring={activeKeyId:'pair-key-1',resolveKey:()=>Buffer.alloc(32,19)};
+    const source=new PgTransactionalPairStore(serial,READY,{streamId:sid,fenceToken:0n,keyring,maxPendingRows:20});
+    const registry=new PairRegistry(source,10,10,true);
+    const signing=await generateKeypair(),replacement=await generateKeypair(),secret=await hashSecret('pg-middleware-policy');
+    const baseJwk={kty:signing.pubJwk.kty!,crv:signing.pubJwk.crv!,x:signing.pubJwk.x!,y:signing.pubJwk.y!};
+    const variants:JsonWebKey[]=[baseJwk,{...baseJwk,key_ops:undefined}];
+    for(let index=0;index<variants.length;index++){
+      const id=`middleware_jwk_${index}`,pair:StoredPair={id,name:id,scope:'read',mode:'production',secretHash:secret,pubJwk:variants[index]!,status:'active',created:1,lastActive:null,requests:0,failedSigs:0};
+      await source.set(pair);
+      const result=await verifyBPCRequest(await signedRequest(signing.privateKey,id,secret),registry,new ServerNonceStore(new MemoryNonceBackend(),120_000),new AnomalyEngine(new MemoryAnomalyStore()));
+      assert.equal(result.ok,true,`canonical JWK variant ${index} was denied`);
+      assert.equal((await source.get(id))?.requests,1,`canonical JWK variant ${index} did not claim usage`);
+    }
+
+    const raceId='middleware_key_race',racePair:StoredPair={id:raceId,name:raceId,scope:'read',mode:'production',secretHash:secret,pubJwk:baseJwk,status:'active',created:1,lastActive:null,requests:0,failedSigs:0};
+    await source.set(racePair);
+    let signal!:()=>void,release!:()=>void;
+    const started=new Promise<void>((resolve)=>{signal=resolve;}),resume=new Promise<void>((resolve)=>{release=resolve;});
+    const blockingNonce=new ServerNonceStore({async checkAndConsume(){signal();await resume;return false;}},120_000);
+    const verification=verifyBPCRequest(await signedRequest(signing.privateKey,raceId,secret),registry,blockingNonce,new AnomalyEngine(new MemoryAnomalyStore()));
+    await started;
+    await source.atomicMutate(raceId,(current)=>({...current,pubJwk:replacement.pubJwk}));
+    release();
+    const denied=await verification;
+    assert.deepEqual({ok:denied.ok,error:denied.error},{ok:false,error:'pair_state_changed_retry'});
+    assert.equal((await source.get(raceId))?.requests,0,'key-race denial consumed usage');
   });
 
   await check('(atomic registry) receiver approval conflict rolls back pending deletion and checkpoint', async () => {
