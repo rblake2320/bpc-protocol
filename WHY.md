@@ -179,3 +179,18 @@ I-JSON, deep-frozen, and used exclusively after the first await. Capability
 validation still runs first so a forged or expired transaction cannot trigger
 input inspection or sanitizer behavior. This preserves the invariant that the
 stored, digested, delivered, verified, and applied values are the same bytes.
+
+## 2026-07-18: Encrypt pair authority before durable replication
+
+The BPC `secretHash` is an HMAC key used to authorize requests. Replicating it
+as ordinary JSON would turn an outbox reader into a credential holder. Pair set
+operations therefore seal the canonical authority payload with AES-256-GCM
+before the database transaction and bind the ciphertext to the mutation
+identity with authenticated additional data. Receiver opening is synchronous
+and local so no key-service await occurs while database locks are held.
+
+The pair tables and outbox are one authorization consistency boundary, so one
+catalog attestation and one readiness capability cover both. A schema-version
+advance without a structural migration would create false readiness; the v2 to
+v3 path instead copies and validates legacy data, attests the final catalog,
+and advances the marker atomically.

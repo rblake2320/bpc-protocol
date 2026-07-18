@@ -12,12 +12,16 @@ const result = (command = 'SELECT') => ({ rows: [], rowCount: 0, command });
 
 function defaultQuery(sql: string, params?: unknown[]) {
   if (sql.startsWith('BEGIN')) return Promise.resolve(result('BEGIN'));
+  if (sql.startsWith('SET LOCAL statement_timeout')) return Promise.resolve(result('SET'));
+  if (sql.startsWith('LOCK TABLE')) return Promise.resolve(result('LOCK'));
   if (sql.includes("set_config('statement_timeout'")) {
     return Promise.resolve({ rows: [{ statement_timeout: `${params?.[0]}ms` }], rowCount: 1, command: 'SELECT' });
   }
   if (sql.includes("current_setting('statement_timeout')")) {
     return Promise.resolve({ rows: [{ statement_timeout_ms: '30000' }], rowCount: 1, command: 'SELECT' });
   }
+  if (sql.includes('txid_current()')) return Promise.resolve({rows:[{txid:'tx-1'}],rowCount:1,command:'SELECT'});
+  if (sql==='DISCARD ALL') return Promise.resolve(result('DISCARD'));
   return Promise.resolve(result(sql === 'COMMIT' ? 'COMMIT' : 'SELECT'));
 }
 
@@ -37,10 +41,58 @@ describe('NodePostgresTransactor', () => {
       'BEGIN ISOLATION LEVEL SERIALIZABLE',
       "SELECT set_config('statement_timeout', $1, true) AS statement_timeout",
       "SELECT (EXTRACT(EPOCH FROM current_setting('statement_timeout')::interval) * 1000)::bigint::text AS statement_timeout_ms",
+      'SELECT txid_current()::text AS txid',
       'SELECT 1',
+      'SELECT txid_current()::text AS txid',
       'COMMIT',
+      'DISCARD ALL',
     ]);
     expect(client.release).toHaveBeenCalledWith(false);
+  });
+
+  it('acquires migration authority locks before the first SELECT/readback', async () => {
+    const client=clientWith();
+    const db=new NodePostgresTransactor({connect:async()=>client});
+    await db.transactionWithInitialExclusiveLocks([
+      {schema:'tenant_a',table:'bpc_pairs'}, {schema:'tenant_a',table:'bpc_pending'},
+    ], async(exec)=>{await exec.query('SELECT authority');});
+    expect(client.query.mock.calls.map((c)=>c[0])).toEqual([
+      'BEGIN ISOLATION LEVEL SERIALIZABLE',
+      "SET LOCAL statement_timeout = '30000ms'",
+      'LOCK TABLE "tenant_a"."bpc_pairs", "tenant_a"."bpc_pending" IN ACCESS EXCLUSIVE MODE',
+      "SELECT (EXTRACT(EPOCH FROM current_setting('statement_timeout')::interval) * 1000)::bigint::text AS statement_timeout_ms",
+      'SELECT txid_current()::text AS txid',
+      'SELECT authority',
+      'SELECT txid_current()::text AS txid',
+      'COMMIT',
+      'DISCARD ALL',
+    ]);
+  });
+
+  it('rejects empty, duplicate, or unsafe initial authority lock identifiers', async () => {
+    const db=new NodePostgresTransactor({connect:async()=>clientWith()});
+    await expect(db.transactionWithInitialExclusiveLocks([],async()=>1)).rejects.toThrow(/1\.\.16/);
+    await expect(db.transactionWithInitialExclusiveLocks([{schema:'public;drop',table:'x'}],async()=>1)).rejects.toThrow(/identifiers/);
+    await expect(db.transactionWithInitialExclusiveLocks([{schema:'Upper',table:'x'}],async()=>1)).rejects.toThrow(/identifiers/);
+    await expect(db.transactionWithInitialExclusiveLocks([{schema:'has$dollar',table:'x'}],async()=>1)).rejects.toThrow(/identifiers/);
+    await expect(db.transactionWithInitialExclusiveLocks([{schema:'public',table:'x'},{schema:'public',table:'x'}],async()=>1)).rejects.toThrow(/unique/);
+  });
+
+  it('rejects transaction/session control and multi-statements before dispatch', async () => {
+    for(const sql of [
+      'COMMIT','/* sneaky */ COMMIT','BEGIN','START TRANSACTION','ROLLBACK','ABORT',
+      'SAVEPOINT x','RELEASE SAVEPOINT x','PREPARE TRANSACTION \'x\'','SET TRANSACTION READ ONLY',
+      'RESET ALL','DISCARD ALL','CALL dangerous()','DO $$ BEGIN END $$',
+      'SELECT 1; COMMIT','COMMIT; SELECT 1',
+    ]){
+      const client=clientWith();const db=new NodePostgresTransactor({connect:async()=>client});
+      await expect(db.transaction(exec=>exec.query(sql))).rejects.toThrow(/forbids|exactly one statement/);
+      const matching=client.query.mock.calls.filter(call=>call[0]===sql).length;
+      expect(matching).toBe(sql==='ROLLBACK'?1:0); // the one ROLLBACK is adapter cleanup, not callback dispatch
+      expect(client.query).toHaveBeenCalledWith('ROLLBACK');
+    }
+    const client=clientWith();const db=new NodePostgresTransactor({connect:async()=>client});
+    await expect(db.transaction(exec=>exec.query("SELECT 'COMMIT; ROLLBACK', $$BEGIN; END$$ /* ; */"))).resolves.toBeDefined();
   });
 
   it('rolls back and destroys the connection on callback failure', async () => {
@@ -58,6 +110,25 @@ describe('NodePostgresTransactor', () => {
     }));
     const db = new NodePostgresTransactor({ connect: async () => client });
     await expect(db.transaction(async () => 1)).rejects.toThrow('COMMIT was not confirmed');
+    expect(client.release).toHaveBeenCalledWith(true);
+  });
+
+  it('classifies a changed transaction-continuity sentinel as ambiguous', async () => {
+    let sentinels=0;
+    const client=clientWith(vi.fn(async(sql:string,params?:unknown[])=>{
+      if(sql.includes('txid_current()'))return{rows:[{txid:`tx-${++sentinels}`}],rowCount:1,command:'SELECT'};
+      return defaultQuery(sql,params);
+    }));
+    const db=new NodePostgresTransactor({connect:async()=>client});
+    await expect(db.transaction(async()=>1)).rejects.toBeInstanceOf(AmbiguousCommitError);
+    expect(client.query.mock.calls.some(call=>call[0]==='COMMIT')).toBe(false);
+    expect(client.release).toHaveBeenCalledWith(true);
+  });
+
+  it('destroys a committed connection when DISCARD ALL is not confirmed', async () => {
+    const client=clientWith(vi.fn(async(sql:string,params?:unknown[])=>sql==='DISCARD ALL'?result('SELECT'):defaultQuery(sql,params)));
+    const db=new NodePostgresTransactor({connect:async()=>client});
+    await expect(db.transaction(async()=>1)).rejects.toMatchObject({name:'PostCommitReleaseError',committed:true});
     expect(client.release).toHaveBeenCalledWith(true);
   });
 

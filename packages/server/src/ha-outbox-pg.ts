@@ -161,6 +161,16 @@ export interface PgExecutor {
  */
 export interface PgTransactor {
   transaction<T>(fn: (exec: PgExecutor) => Promise<T>, opts?: { signal?: AbortSignal }): Promise<T>;
+  /**
+   * Optional migration-only entry point. The adapter must acquire the listed
+   * ACCESS EXCLUSIVE locks before any statement establishes the SERIALIZABLE
+   * snapshot. Callers fail closed when the adapter cannot provide this order.
+   */
+  transactionWithInitialExclusiveLocks?<T>(
+    relations: readonly { schema: string; table: string }[],
+    fn: (exec: PgExecutor) => Promise<T>,
+    opts?: { signal?: AbortSignal },
+  ): Promise<T>;
 }
 
 // The opaque DurableTx carries no public members; its executor AND the identity
@@ -331,7 +341,7 @@ async function assertSerializable(exec: PgExecutor): Promise<void> {
 
 /** A validated PostgreSQL schema identifier (lowercase-anchored, no injection). */
 function assertSchemaIdentifier(schema: string): void {
-  if (!/^[A-Za-z_][A-Za-z0-9_$]{0,62}$/.test(schema)) throw new ContractValidationError(`invalid schema identifier: ${schema}`);
+  if (!/^[a-z_][a-z0-9_]{0,62}$/.test(schema)) throw new ContractValidationError(`invalid schema identifier: ${schema}`);
 }
 
 /**
@@ -344,9 +354,13 @@ function assertSchemaIdentifier(schema: string): void {
  */
 async function pinSchema(exec: PgExecutor, schema: string): Promise<void> {
   assertSchemaIdentifier(schema);
-  await exec.query('SELECT set_config($1, $2, true)', ['search_path', schema]);
-  const cur = (await exec.query('SELECT current_schema() AS s')).rows[0]?.s;
+  await exec.query('SELECT set_config($1, $2, true)', ['search_path', `${schema},pg_catalog,pg_temp`]);
+  const row = (await exec.query(`SELECT current_schema() AS s,
+    (current_schemas(true))[1] AS p1,(current_schemas(true))[2] AS p2,
+    (current_schemas(true))[3] AS p3,cardinality(current_schemas(true))::int AS n`)).rows[0];
+  const cur=row?.s,n=Number(row?.n);
   if (cur !== schema) throw new ContractValidationError(`schema context mismatch: current_schema=${String(cur)} pinned=${schema}`);
+  if(row?.p1!==schema||row?.p2!=='pg_catalog'||(n!==2&&!(n===3&&typeof row?.p3==='string'&&row.p3.startsWith('pg_temp_'))))throw new ContractValidationError('schema search path was not pinned with governed authority before pg_temp');
 }
 
 /** Enter a critical tx: SERIALIZABLE + pinned schema identity, together. */
@@ -358,13 +372,80 @@ async function enterCriticalTx(exec: PgExecutor, schema: string): Promise<void> 
 /** Schema version this build provisions/expects. Bump on any DDL change;
  *  `assertSchemaVersion` fails closed on drift so a stale migration cannot be
  *  used with newer code. */
-export const HA_OUTBOX_SCHEMA_VERSION = 2 as const;
+export const HA_OUTBOX_SCHEMA_VERSION = 3 as const;
 
 // Contract fence bound: a fence token is an integer with at most 39 digits
 // (FENCE_TOKEN_PATTERN in the contract), i.e. strictly < 10^39. The DDL enforces
 // the SAME bound plus integrality (scale 0) so a fractional or oversized value
 // cannot be persisted.
 const FENCE_MAX_EXCLUSIVE = '1e39';
+const JS_SAFE_INT_SQL = '9007199254740991';
+const PUBLIC_JWK_CHECK = `
+  jsonb_typeof(pub_jwk)='object'
+  AND pub_jwk ?& ARRAY['kty','crv','x','y']
+  AND (pub_jwk - ARRAY['kty','crv','x','y','key_ops','ext']::text[])='{}'::jsonb
+  AND jsonb_typeof(pub_jwk->'kty')='string' AND pub_jwk->>'kty'='EC'
+  AND jsonb_typeof(pub_jwk->'crv')='string' AND pub_jwk->>'crv'='P-256'
+  AND jsonb_typeof(pub_jwk->'x')='string' AND pub_jwk->>'x' ~ '^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'
+  AND jsonb_typeof(pub_jwk->'y')='string' AND pub_jwk->>'y' ~ '^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'
+  AND NOT (pub_jwk ? 'd')
+  AND (NOT (pub_jwk ? 'key_ops') OR pub_jwk->'key_ops'='["verify"]'::jsonb)
+  AND (NOT (pub_jwk ? 'ext') OR pub_jwk->'ext'='true'::jsonb)
+`;
+const PENDING_REGISTRATION_CHECK = `
+  jsonb_typeof(registration)='object'
+  AND registration ?& ARRAY['name','scope','mode','secretHash','pubJwk']
+  AND (registration - ARRAY['name','scope','mode','secretHash','pubJwk','expiresAt','maxRequests','kind','canaryClass']::text[])='{}'::jsonb
+  AND jsonb_typeof(registration->'name')='string' AND length(registration->>'name') BETWEEN 1 AND 128
+  AND jsonb_typeof(registration->'scope')='string' AND registration->>'scope' IN ('read','read-write','admin')
+  AND jsonb_typeof(registration->'mode')='string' AND registration->>'mode' IN ('development','production')
+  AND jsonb_typeof(registration->'secretHash')='string' AND registration->>'secretHash' ~ '^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'
+  AND jsonb_typeof(registration->'pubJwk')='object'
+  AND registration->'pubJwk' ?& ARRAY['kty','crv','x','y']
+  AND ((registration->'pubJwk') - ARRAY['kty','crv','x','y','key_ops','ext']::text[])='{}'::jsonb
+  AND jsonb_typeof(registration->'pubJwk'->'kty')='string' AND registration->'pubJwk'->>'kty'='EC'
+  AND jsonb_typeof(registration->'pubJwk'->'crv')='string' AND registration->'pubJwk'->>'crv'='P-256'
+  AND jsonb_typeof(registration->'pubJwk'->'x')='string' AND registration->'pubJwk'->>'x' ~ '^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'
+  AND jsonb_typeof(registration->'pubJwk'->'y')='string' AND registration->'pubJwk'->>'y' ~ '^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'
+  AND NOT (registration->'pubJwk' ? 'd')
+  AND (NOT (registration->'pubJwk' ? 'key_ops') OR registration->'pubJwk'->'key_ops'='["verify"]'::jsonb)
+  AND (NOT (registration->'pubJwk' ? 'ext') OR registration->'pubJwk'->'ext'='true'::jsonb)
+  AND (NOT (registration ? 'kind') OR (jsonb_typeof(registration->'kind')='string' AND registration->>'kind' IN ('legitimate','ghost')))
+  AND (NOT (registration ? 'canaryClass') OR (jsonb_typeof(registration->'canaryClass')='string' AND registration->>'canaryClass' IN ('env_file','docs','registry_exfil')))
+  AND ((coalesce(registration->>'kind','legitimate')='ghost' AND registration ? 'canaryClass') OR (coalesce(registration->>'kind','legitimate')='legitimate' AND NOT (registration ? 'canaryClass')))
+  AND (NOT (registration ? 'expiresAt') OR (jsonb_typeof(registration->'expiresAt')='number' AND registration->>'expiresAt' ~ '^(0|[1-9][0-9]{0,15})$' AND (registration->>'expiresAt')::numeric <= ${JS_SAFE_INT_SQL}))
+  AND (NOT (registration ? 'maxRequests') OR (jsonb_typeof(registration->'maxRequests')='number' AND registration->>'maxRequests' ~ '^(0|[1-9][0-9]{0,15})$' AND (registration->>'maxRequests')::numeric <= ${JS_SAFE_INT_SQL}))
+`;
+
+/** Exact pair-authority schema governed by the combined v3 manifest. */
+export const BPC_PAIR_PG_SCHEMA = `
+CREATE TABLE IF NOT EXISTS bpc_pairs (
+  id                  text PRIMARY KEY CHECK (id ~ '^[A-Za-z0-9_-]{1,64}$'),
+  name                text NOT NULL CHECK (length(name) BETWEEN 1 AND 128),
+  scope               text NOT NULL CHECK (scope IN ('read','read-write','admin')),
+  mode                text NOT NULL CHECK (mode IN ('development','production')),
+  secret_hash         text NOT NULL CHECK (secret_hash ~ '^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'),
+  pub_jwk             jsonb NOT NULL CHECK ((${PUBLIC_JWK_CHECK}) IS TRUE),
+  status              text NOT NULL DEFAULT 'active' CHECK (status IN ('active','locked','expired','rotated','revoked')),
+  created             bigint NOT NULL CHECK (created BETWEEN 0 AND ${JS_SAFE_INT_SQL}),
+  last_active         bigint CHECK (last_active IS NULL OR last_active BETWEEN 0 AND ${JS_SAFE_INT_SQL}),
+  requests            bigint NOT NULL DEFAULT 0 CHECK (requests BETWEEN 0 AND ${JS_SAFE_INT_SQL}),
+  failed_sigs         bigint NOT NULL DEFAULT 0 CHECK (failed_sigs BETWEEN 0 AND ${JS_SAFE_INT_SQL}),
+  cumulative_failures double precision CHECK (cumulative_failures IS NULL OR (cumulative_failures >= 0 AND cumulative_failures <= '1.7976931348623157e308'::double precision)),
+  first_failure_at    bigint CHECK (first_failure_at IS NULL OR first_failure_at BETWEEN 0 AND ${JS_SAFE_INT_SQL}),
+  max_requests        bigint CHECK (max_requests IS NULL OR max_requests BETWEEN 0 AND ${JS_SAFE_INT_SQL}),
+  kind                text NOT NULL DEFAULT 'legitimate' CHECK (kind IN ('legitimate','ghost')),
+  canary_class        text CHECK (canary_class IS NULL OR canary_class IN ('env_file','docs','registry_exfil')),
+  expires_at          bigint CHECK (expires_at IS NULL OR expires_at BETWEEN 0 AND ${JS_SAFE_INT_SQL}),
+  CHECK ((kind = 'ghost' AND canary_class IS NOT NULL) OR (kind = 'legitimate' AND canary_class IS NULL))
+);
+CREATE TABLE IF NOT EXISTS bpc_pending (
+  token        text PRIMARY KEY CHECK (length(token) BETWEEN 1 AND 256),
+  registration jsonb NOT NULL CHECK ((${PENDING_REGISTRATION_CHECK}) IS TRUE),
+  requested_at bigint NOT NULL CHECK (requested_at BETWEEN 0 AND ${JS_SAFE_INT_SQL})
+);
+CREATE INDEX IF NOT EXISTS bpc_pending_requested_at ON bpc_pending (requested_at, token);
+`;
 
 /**
  * DDL for the outbox tables. Source-side and receiver-side checkpoints are
@@ -377,7 +458,7 @@ const FENCE_MAX_EXCLUSIVE = '1e39';
  *  - op_digest exactly 64 lowercase hex,
  *  - stream_id / source_epoch non-empty and bounded.
  */
-export const HA_OUTBOX_PG_SCHEMA = `
+const HA_OUTBOX_INFRA_PG_SCHEMA = `
 CREATE TABLE IF NOT EXISTS ha_outbox_meta (
   id             integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
   schema_version integer NOT NULL CHECK (schema_version >= 1)
@@ -443,8 +524,15 @@ CREATE TABLE IF NOT EXISTS ha_outbox_applied (
   op_digest     text NOT NULL CHECK (op_digest ~ '^[0-9a-f]{64}$'),
   PRIMARY KEY (stream_id, source_epoch, sequence)
 );
+`;
+
+export const HA_OUTBOX_PG_SCHEMA = `
+${HA_OUTBOX_INFRA_PG_SCHEMA}
+-- Authorization authority is attested with the outbox so one readiness token
+-- covers both sides of every transactionally-coupled pair mutation.
+${BPC_PAIR_PG_SCHEMA}
 -- NOTE: the DDL NEVER stamps the version. Stamping happens only through
--- provisionSchemaVersion() / migrateSchemaToCurrent(), each of which runs a full
+-- provisionSchemaVersion() / adoptCurrentSchemaVersion(), each of which runs a full
 -- catalog attestation (attestSchema) in the SAME serializable tx first, so a
 -- malformed/partial/foreign-schema layout can never be labelled a valid version.
 `;
@@ -453,7 +541,7 @@ CREATE TABLE IF NOT EXISTS ha_outbox_applied (
 const HA_OUTBOX_TABLES = [
   'ha_outbox_meta', 'ha_outbox_fence', 'ha_outbox_source_checkpoint',
   'ha_outbox_receiver_checkpoint', 'ha_outbox_rows', 'ha_outbox_publisher_lease',
-  'ha_outbox_quarantine', 'ha_outbox_applied',
+  'ha_outbox_quarantine', 'ha_outbox_applied', 'bpc_pairs', 'bpc_pending',
 ] as const;
 
 /**
@@ -469,7 +557,7 @@ const HA_OUTBOX_TABLES = [
  * and fails closed. PostgreSQL-major-version specific (catalog rendering): a
  * supported-PG bump requires recomputing this via schemaManifest().
  */
-export const HA_OUTBOX_SCHEMA_MANIFEST = 'ded9abb5f0c381115754bcbd676a12e27d2f8c3b5456465e76d394c00e893de3';
+export const HA_OUTBOX_SCHEMA_MANIFEST = '7af22efd9ed7828bdf2901fc9b05230cff9c3bd18d62f406305a307d40030792';
 
 /** Canonical fingerprint of the live schema in `current_schema()`. Deterministic
  *  (no oids/timestamps); identical normalization to the pinned manifest. */
@@ -574,16 +662,6 @@ function requireReady(token: SchemaReadyToken, db?: PgTransactor, expectSchema?:
 }
 
 /**
- * TEST-ONLY factory: mint a readiness token WITHOUT a live attestation, for
- * hermetic unit tests that use an in-memory fake transactor. Never use in
- * production — it bypasses the attestation the real gate performs.
- */
-export function __unsafeMintReadyTokenForTests(db: PgTransactor, schema: string): SchemaReadyToken {
-  assertSchemaIdentifier(schema);
-  return mintReadyToken({ db, schema, manifest: HA_OUTBOX_SCHEMA_MANIFEST, version: HA_OUTBOX_SCHEMA_VERSION });
-}
-
-/**
  * @internal @deprecated — version-only check. Callers MUST NOT use this as a
  * readiness gate: it does NOT detect structural drift (an ALTER/DROP that left
  * meta untouched). Use `assertSchemaReady`. Retained (unexported from the package
@@ -674,6 +752,154 @@ export async function adoptCurrentSchemaVersion(db: PgTransactor, schema: string
        ON CONFLICT (id) DO UPDATE SET schema_version = EXCLUDED.schema_version`,
     );
     affectedOne(res, 'schema version adopt');
+  });
+  return mintReadyToken({ db, schema, manifest: HA_OUTBOX_SCHEMA_MANIFEST, version: HA_OUTBOX_SCHEMA_VERSION });
+}
+
+async function executeDdlBatch(exec:PgExecutor,sql:string):Promise<void>{
+  for(const statement of sql.split(';').map(part=>part.trim()).filter(Boolean))await exec.query(statement);
+}
+
+/**
+ * One-time preparation for a standalone legacy PairStore installation that has
+ * only `bpc_pairs` and `bpc_pending`. Under authority locks it rejects unsafe
+ * relation posture or any pre-existing HA object, creates the outbox
+ * infrastructure without touching pair rows, and stamps the legacy version-2
+ * authority. `migrateLegacyPairAuthorityToV3` must run next and revalidates all
+ * legacy columns/data before advancing to v3.
+ */
+export async function prepareLegacyPairAuthorityV2ForMigration(db: PgTransactor, schema: string): Promise<void> {
+  assertSchemaIdentifier(schema);
+  const lockedTransaction=db.transactionWithInitialExclusiveLocks;
+  if(typeof lockedTransaction!=='function')throw new ContractValidationError('legacy preparation requires a transactor that locks authority before establishing its SERIALIZABLE snapshot');
+  await lockedTransaction.call(db,[{schema,table:'bpc_pairs'},{schema,table:'bpc_pending'}],async(exec)=>{
+    await enterCriticalTx(exec,schema);
+    const posture=(await exec.query(`SELECT rel.relname,rel.relkind,rel.relpersistence,rel.relrowsecurity,rel.relforcerowsecurity,
+      (SELECT count(*)::int FROM pg_trigger tg WHERE tg.tgrelid=rel.oid AND NOT tg.tgisinternal) AS triggers,
+      (SELECT count(*)::int FROM pg_policy p WHERE p.polrelid=rel.oid) AS policies,
+      (SELECT count(*)::int FROM pg_rewrite rw WHERE rw.ev_class=rel.oid) AS rules,
+      (SELECT count(*)::int FROM pg_inherits i WHERE i.inhrelid=rel.oid OR i.inhparent=rel.oid) AS inheritance
+      FROM pg_class rel JOIN pg_namespace n ON n.oid=rel.relnamespace
+      WHERE n.nspname=current_schema() AND rel.relname IN ('bpc_pairs','bpc_pending')`)).rows;
+    if(posture.length!==2||posture.some(row=>row.relkind!=='r'||row.relpersistence!=='p'||row.relrowsecurity!==false||row.relforcerowsecurity!==false||Number(row.triggers)!==0||Number(row.policies)!==0||Number(row.rules)!==0||Number(row.inheritance)!==0))throw new ContractValidationError('legacy pair preparation found unsafe relation/RLS/policy/trigger/rule/inheritance posture');
+    const infraNames=['ha_outbox_meta','ha_outbox_fence','ha_outbox_source_checkpoint','ha_outbox_receiver_checkpoint','ha_outbox_rows','ha_outbox_publisher_lease','ha_outbox_quarantine','ha_outbox_applied'];
+    const collisions=(await exec.query(`SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname=ANY($1::text[])`,[infraNames])).rows;
+    if(collisions.length)throw new ContractValidationError('legacy pair preparation requires no pre-existing HA/outbox objects');
+    await executeDdlBatch(exec,HA_OUTBOX_INFRA_PG_SCHEMA);
+    affectedOne(await exec.query('INSERT INTO ha_outbox_meta(id,schema_version) VALUES(1,2)'),'legacy schema version preparation');
+  });
+}
+
+/**
+ * One-time, forward-only migration from the legacy v2 standalone PairStore
+ * tables to the v3 attested pair-authority layout. It rebuilds both authority
+ * tables inside the same SERIALIZABLE transaction, so constraint validation,
+ * data copy, table swap, full combined-schema attestation, and version advance
+ * either all commit or all roll back. It never repairs/adopts an arbitrary
+ * layout and never downgrades a future marker.
+ */
+export async function migrateLegacyPairAuthorityToV3(db: PgTransactor, schema: string): Promise<SchemaReadyToken> {
+  assertSchemaIdentifier(schema);
+  const lockedTransaction = db.transactionWithInitialExclusiveLocks;
+  if (typeof lockedTransaction !== 'function') {
+    throw new ContractValidationError('legacy migration requires a transactor that locks authority before establishing its SERIALIZABLE snapshot');
+  }
+  await lockedTransaction.call(db, [
+    { schema, table: 'bpc_pairs' },
+    { schema, table: 'bpc_pending' },
+  ], async (exec) => {
+    await enterCriticalTx(exec, schema);
+    const versions = (await exec.query('SELECT schema_version FROM ha_outbox_meta WHERE id = 1 FOR UPDATE')).rows;
+    if (versions.length !== 1) throw new ContractValidationError('legacy migration requires exactly one schema-version authority row');
+    const current = safeSeq(versions[0].schema_version, 'schema_version');
+    if (current !== 2) throw new ContractValidationError(`legacy migration requires schema version 2; found ${current}`);
+    const columns = (await exec.query(
+      `SELECT table_name, column_name, udt_name FROM information_schema.columns
+       WHERE table_schema = current_schema() AND table_name IN ('bpc_pairs','bpc_pending')
+       ORDER BY table_name, ordinal_position`,
+    )).rows;
+    const expected = new Map<string, Set<string>>([
+      ['bpc_pairs', new Set(['id:text','name:text','scope:text','mode:text','secret_hash:text','pub_jwk:jsonb','status:text','created:int8','last_active:int8','requests:int4|int8','failed_sigs:int4|int8','cumulative_failures:float8','first_failure_at:int8','max_requests:int8','kind:text','canary_class:text','expires_at:int8'])],
+      ['bpc_pending', new Set(['token:text','registration:jsonb','requested_at:int8'])],
+    ]);
+    const seen = new Map<string, Set<string>>([['bpc_pairs', new Set()], ['bpc_pending', new Set()]]);
+    for (const row of columns) {
+      const table = String(row.table_name), column = String(row.column_name), type = String(row.udt_name);
+      const allowed = expected.get(table); if (!allowed) throw new ContractValidationError('legacy pair schema contains an unexpected table');
+      const match = [...allowed].find((entry) => { const [name, types] = entry.split(':'); return name === column && types.split('|').includes(type); });
+      if (!match) throw new ContractValidationError(`legacy pair schema has an unexpected column/type: ${table}.${column}:${type}`);
+      seen.get(table)!.add(match);
+    }
+    for (const [table, required] of expected) if (seen.get(table)!.size !== required.size) throw new ContractValidationError(`legacy pair schema is incomplete: ${table}`);
+    const posture = (await exec.query(
+      `SELECT rel.relname AS table_name, rel.relkind, rel.relpersistence, rel.relrowsecurity, rel.relforcerowsecurity,
+              (SELECT count(*)::int FROM pg_trigger tg WHERE tg.tgrelid=rel.oid AND NOT tg.tgisinternal) AS triggers,
+              (SELECT count(*)::int FROM pg_policy p WHERE p.polrelid=rel.oid) AS policies,
+              (SELECT count(*)::int FROM pg_rewrite rw WHERE rw.ev_class=rel.oid) AS rules,
+              (SELECT count(*)::int FROM pg_inherits i WHERE i.inhrelid=rel.oid OR i.inhparent=rel.oid) AS inheritance
+       FROM pg_class rel JOIN pg_namespace n ON n.oid=rel.relnamespace
+       WHERE n.nspname=current_schema() AND rel.relname IN ('bpc_pairs','bpc_pending')`,
+    )).rows;
+    if (posture.length !== 2 || posture.some((row) => row.relkind !== 'r' || row.relpersistence !== 'p' || row.relrowsecurity !== false || row.relforcerowsecurity !== false || Number(row.triggers)!==0 || Number(row.policies)!==0 || Number(row.rules)!==0 || Number(row.inheritance)!==0)) {
+      throw new ContractValidationError('legacy pair schema has unsafe relation/RLS/policy/trigger/rule/inheritance posture');
+    }
+    const collisions = (await exec.query(
+      `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+       WHERE n.nspname=current_schema() AND c.relname IN ('bpc_pairs_v3_stage','bpc_pending_v3_stage','bpc_pairs_v2_backup','bpc_pending_v2_backup')`,
+    )).rows;
+    if (collisions.length) throw new ContractValidationError('legacy migration staging object already exists');
+    await executeDdlBatch(exec,`
+      CREATE TABLE bpc_pairs_v3_stage (
+        id text PRIMARY KEY CHECK (id ~ '^[A-Za-z0-9_-]{1,64}$'), name text NOT NULL CHECK (length(name) BETWEEN 1 AND 128),
+        scope text NOT NULL CHECK (scope IN ('read','read-write','admin')), mode text NOT NULL CHECK (mode IN ('development','production')),
+        secret_hash text NOT NULL CHECK (secret_hash ~ '^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'), pub_jwk jsonb NOT NULL CHECK ((${PUBLIC_JWK_CHECK}) IS TRUE),
+        status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','locked','expired','rotated','revoked')), created bigint NOT NULL CHECK (created BETWEEN 0 AND ${JS_SAFE_INT_SQL}),
+        last_active bigint CHECK (last_active IS NULL OR last_active BETWEEN 0 AND ${JS_SAFE_INT_SQL}), requests bigint NOT NULL DEFAULT 0 CHECK (requests BETWEEN 0 AND ${JS_SAFE_INT_SQL}),
+        failed_sigs bigint NOT NULL DEFAULT 0 CHECK (failed_sigs BETWEEN 0 AND ${JS_SAFE_INT_SQL}), cumulative_failures double precision CHECK (cumulative_failures IS NULL OR (cumulative_failures>=0 AND cumulative_failures <= '1.7976931348623157e308'::double precision)),
+        first_failure_at bigint CHECK (first_failure_at IS NULL OR first_failure_at BETWEEN 0 AND ${JS_SAFE_INT_SQL}), max_requests bigint CHECK (max_requests IS NULL OR max_requests BETWEEN 0 AND ${JS_SAFE_INT_SQL}),
+        kind text NOT NULL DEFAULT 'legitimate' CHECK (kind IN ('legitimate','ghost')), canary_class text CHECK (canary_class IS NULL OR canary_class IN ('env_file','docs','registry_exfil')),
+        expires_at bigint CHECK (expires_at IS NULL OR expires_at BETWEEN 0 AND ${JS_SAFE_INT_SQL}), CHECK ((kind='ghost' AND canary_class IS NOT NULL) OR (kind='legitimate' AND canary_class IS NULL))
+      );
+      CREATE TABLE bpc_pending_v3_stage (
+        token text PRIMARY KEY CHECK (length(token) BETWEEN 1 AND 256), registration jsonb NOT NULL CHECK ((${PENDING_REGISTRATION_CHECK}) IS TRUE),
+        requested_at bigint NOT NULL CHECK (requested_at BETWEEN 0 AND ${JS_SAFE_INT_SQL})
+      );
+    `);
+    const sourcePairs = Number((await exec.query('SELECT count(*)::int AS n FROM bpc_pairs')).rows[0].n);
+    const sourcePending = Number((await exec.query('SELECT count(*)::int AS n FROM bpc_pending')).rows[0].n);
+    if (sourcePairs > 0) {
+      const copied = await exec.query('INSERT INTO bpc_pairs_v3_stage SELECT id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at FROM bpc_pairs');
+      if (copied.rowCount !== sourcePairs) throw new ContractValidationError(`legacy pair copy affected ${copied.rowCount}; expected ${sourcePairs}`);
+    }
+    if (sourcePending > 0) {
+      const copied = await exec.query('INSERT INTO bpc_pending_v3_stage SELECT token,registration,requested_at FROM bpc_pending');
+      if (copied.rowCount !== sourcePending) throw new ContractValidationError(`legacy pending copy affected ${copied.rowCount}; expected ${sourcePending}`);
+    }
+    const pairMismatch = (await exec.query(`SELECT EXISTS(
+      (SELECT id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests::bigint,failed_sigs::bigint,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at FROM bpc_pairs
+       EXCEPT SELECT id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at FROM bpc_pairs_v3_stage)
+      UNION ALL
+      (SELECT id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at FROM bpc_pairs_v3_stage
+       EXCEPT SELECT id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests::bigint,failed_sigs::bigint,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at FROM bpc_pairs)
+    ) AS mismatch`)).rows[0].mismatch;
+    const pendingMismatch = (await exec.query(`SELECT EXISTS(
+      (SELECT token,registration,requested_at FROM bpc_pending EXCEPT SELECT token,registration,requested_at FROM bpc_pending_v3_stage)
+      UNION ALL
+      (SELECT token,registration,requested_at FROM bpc_pending_v3_stage EXCEPT SELECT token,registration,requested_at FROM bpc_pending)
+    ) AS mismatch`)).rows[0].mismatch;
+    if (pairMismatch !== false || pendingMismatch !== false) throw new ContractValidationError('legacy pair migration copy did not preserve exact authority rows');
+    await executeDdlBatch(exec,`
+      ALTER TABLE bpc_pairs RENAME TO bpc_pairs_v2_backup;
+      ALTER TABLE bpc_pending RENAME TO bpc_pending_v2_backup;
+      DROP TABLE bpc_pairs_v2_backup, bpc_pending_v2_backup;
+      ALTER TABLE bpc_pairs_v3_stage RENAME TO bpc_pairs;
+      ALTER TABLE bpc_pending_v3_stage RENAME TO bpc_pending;
+      ALTER INDEX bpc_pairs_v3_stage_pkey RENAME TO bpc_pairs_pkey;
+      ALTER INDEX bpc_pending_v3_stage_pkey RENAME TO bpc_pending_pkey;
+      CREATE INDEX bpc_pending_requested_at ON bpc_pending (requested_at, token);
+    `);
+    await attestSchema(exec);
+    affectedOne(await exec.query(`UPDATE ha_outbox_meta SET schema_version=${HA_OUTBOX_SCHEMA_VERSION} WHERE id=1 AND schema_version=2`), 'legacy schema version advance');
   });
   return mintReadyToken({ db, schema, manifest: HA_OUTBOX_SCHEMA_MANIFEST, version: HA_OUTBOX_SCHEMA_VERSION });
 }

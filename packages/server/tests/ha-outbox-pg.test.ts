@@ -1,4 +1,7 @@
 import { describe, expect, it, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   ContractValidationError,
@@ -17,14 +20,28 @@ import {
   PgPromotionFence,
   PgReceiverCheckpoint,
   assertSchemaVersionOnly,
-  __unsafeMintReadyTokenForTests,
+  provisionSchemaVersion,
   type AckReceipt,
   type AckReceiptVerifier,
   type MutationApplier,
   type OutboxTransport,
   type PgExecutor,
   type PgTransactor,
+  type SchemaReadyToken,
 } from '../src/ha-outbox-pg.js';
+
+const CATALOG = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'ha-outbox-manifest-catalog.fixture.json'), 'utf8')) as {
+  cols: Record<string, unknown>[]; cons: Record<string, unknown>[]; idx: Record<string, unknown>[]; rel: Record<string, unknown>[]; trig: Record<string, unknown>[]; pol: Record<string, unknown>[];
+};
+function catalogRows(sql: string): Record<string, unknown>[] | undefined {
+  if (sql.includes('information_schema.columns')) return CATALOG.cols;
+  if (sql.includes('pg_get_constraintdef')) return CATALOG.cons;
+  if (sql.includes('pg_indexes')) return CATALOG.idx;
+  if (sql.includes('pg_get_triggerdef')) return CATALOG.trig;
+  if (sql.includes('pg_policy')) return CATALOG.pol;
+  if (sql.includes('rel.relkind')) return CATALOG.rel;
+  return undefined;
+}
 
 /**
  * Snapshot-based in-memory transactional store for LOGIC only. transaction()
@@ -74,8 +91,9 @@ function makeExec(s: State, isolation: string, queryHook?: (sql: string) => Prom
       const P = params as string[];
       const out = (rows: Record<string, unknown>[], rc?: number) => ({ rows, rowCount: rc ?? rows.length });
       if (sql.includes('SHOW transaction_isolation')) return out([{ transaction_isolation: isolation }]);
-      if (sql.includes('set_config')) { pinned = P[1]; return out([{ set_config: P[1] }]); }
-      if (sql.includes('current_schema()')) return out([{ s: pinned }]);
+      if (sql.includes('set_config')) { pinned = P[1].split(',')[0]; return out([{ set_config: P[1] }]); }
+      const catalog = catalogRows(sql); if (catalog) return out(catalog);
+      if (sql.includes('current_schema()')) return out([{ s:pinned,p1:pinned,p2:'pg_catalog',p3:null,n:2 }]);
       if (sql.includes('FROM ha_outbox_meta')) return out([{ schema_version: s.version }]);
       if (sql.includes('FROM ha_outbox_fence') && sql.includes('SELECT fence_token')) { const t = s.fence.get(P[0]); return out(t === undefined ? [] : [{ fence_token: t.toString() }]); }
       if (sql.includes('INSERT INTO ha_outbox_fence')) { const cur = s.fence.get(P[0]) ?? 0n; const n = cur + 1n; s.fence.set(P[0], n); return out([{ fence_token: n.toString() }]); }
@@ -119,7 +137,7 @@ const sanitizer: MutationSanitizer<Raw, Clean> = {
 const applied: string[] = [];
 const applier: MutationApplier<Clean> = { async applyInTx(_e, r) { expect(Object.isFrozen(r)).toBe(true); expect(Object.isFrozen(r.mutation)).toBe(true); applied.push(`${r.sequence}:${(r.mutation as Clean).pairId}`); } };
 const SID = 'bpc:pair:default/v1';
-const tok = (d: MemoryPg) => __unsafeMintReadyTokenForTests(d, 'public');
+const readyFor = (d: PgTransactor) => provisionSchemaVersion(d, 'public');
 const RECEIVER_ID = 'receiver-A', KEY_ID = 'k1';
 // Signature binds keyId + record digest + DECISION, so a swapped decision fails verify.
 const sign = (r: OutboxRecord<unknown>, decision: ReceiverDecision) => `${KEY_ID}:${r.opDigest}:${decision}`;
@@ -135,9 +153,9 @@ const dig = (streamId: string, sourceEpoch: string, sequence: number, fenceToken
   canonicalOpDigest<Clean>({ streamId, sourceEpoch, sequence, fenceToken, mutation: m as SanitizedMutation<Clean> });
 
 describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC)', () => {
-  let db: MemoryPg; let outbox: PgDurableOutbox<Raw, Clean>;
-  beforeEach(() => { db = new MemoryPg(); db.provision(SID, 'e1'); applied.length = 0;
-    outbox = new PgDurableOutbox(db, tok(db), { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'fail-authoritative-mutation' }); });
+  let db: MemoryPg; let outbox: PgDurableOutbox<Raw, Clean>; let ready: SchemaReadyToken;
+  beforeEach(async () => { db = new MemoryPg(); db.provision(SID, 'e1'); applied.length = 0; ready = await readyFor(db);
+    outbox = new PgDurableOutbox(db, ready, { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'fail-authoritative-mutation' }); });
 
   it('schema version gate passes at current version, fails on drift', async () => {
     await assertSchemaVersionOnly(db, 'public');
@@ -177,7 +195,7 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
       sanitize(raw) { sanitizerCalls++; return sanitizer.sanitize(raw); },
       assertSanitized: sanitizer.assertSanitized,
     };
-    const guarded = new PgDurableOutbox(db, tok(db), { streamId: SID, sanitizer: guardedSanitizer, maxPendingRows: 100, backpressure: 'fail-authoritative-mutation' });
+    const guarded = new PgDurableOutbox(db, ready, { streamId: SID, sanitizer: guardedSanitizer, maxPendingRows: 100, backpressure: 'fail-authoritative-mutation' });
     const input = new Proxy({ streamId: SID, rawMutation: { pairId: 'p1' }, fenceToken: 0n }, { getPrototypeOf(target) { proxyTraps++; return Reflect.getPrototypeOf(target); } });
     await expect(guarded.appendInTx({} as never, input)).rejects.toThrow(/transaction|bound|expired/i);
     expect(sanitizerCalls).toBe(0); expect(proxyTraps).toBe(0); expect(db.rowCount(SID)).toBe(0);
@@ -194,7 +212,7 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
     await expect(outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'p1' }, fenceToken: 0n }))).rejects.toBeInstanceOf(ContractValidationError);
   });
   it('backpressure fails closed, never sheds', async () => {
-    const ob = new PgDurableOutbox(db, tok(db), { streamId: SID, sanitizer, maxPendingRows: 3, backpressure: 'fail-authoritative-mutation' });
+    const ob = new PgDurableOutbox(db, ready, { streamId: SID, sanitizer, maxPendingRows: 3, backpressure: 'fail-authoritative-mutation' });
     for (let i = 0; i < 3; i++) await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'p' + i }, fenceToken: 0n }));
     await expect(ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'p4' }, fenceToken: 0n }))).rejects.toBeInstanceOf(OutboxBackpressureError);
     expect(db.rowCount(SID)).toBe(3);
@@ -209,7 +227,7 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
   });
 
   // ── receiver ──
-  const rcvFor = (sid: string) => new PgReceiverCheckpoint<Clean>(db, sid, sanitizer, applier, tok(db));
+  const rcvFor = (sid: string) => new PgReceiverCheckpoint<Clean>(db, sid, sanitizer, applier, ready);
   const apply = (rcv: PgReceiverCheckpoint<Clean>, rec: OutboxRecord<Clean>) => rcv.verifyAndApplyDelivered(rec);
   const mk = (sid: string, seq: number, m: Clean, fence = '0'): OutboxRecord<Clean> => ({ contractVersion: '1', streamId: sid, sourceEpoch: 'e1', sequence: seq, fenceToken: fence, opDigest: dig(sid, 'e1', seq, fence, m), mutation: m as SanitizedMutation<Clean> });
 
@@ -267,7 +285,7 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
   });
 
   // ── publisher: per-stream ordered lease + signed-decision ACK (H1/H2 logic) ──
-  const pubFor = (t: OutboxTransport, v: AckReceiptVerifier = verifier) => new PgDurablePublisher<Clean>(db, SID, t, 'quarantine', sanitizer, v, tok(db), { leaseMs: 30_000 });
+  const pubFor = (t: OutboxTransport, v: AckReceiptVerifier = verifier) => new PgDurablePublisher<Clean>(db, SID, t, 'quarantine', sanitizer, v, ready, { leaseMs: 30_000 });
   const seed = async (n: number) => { for (let i = 0; i < n; i++) await outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'p' + i }, fenceToken: 0n })); };
 
   it('(H1) delivers lowest-first and ACKs each on applied/duplicate-ok', async () => {
@@ -282,9 +300,10 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
     await seed(3);
     for (const decision of ['reject-gap', 'reject-fence'] as ReceiverDecision[]) {
       const fresh = new MemoryPg(); fresh.provision(SID, 'e1');
-      const ob = new PgDurableOutbox(fresh, tok(fresh), { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'quarantine' });
+      const freshReady = await readyFor(fresh);
+      const ob = new PgDurableOutbox(fresh, freshReady, { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'quarantine' });
       for (let i = 0; i < 3; i++) await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'p' + i }, fenceToken: 0n }));
-      const pub = new PgDurablePublisher<Clean>(fresh, SID, { async deliverAndAwaitAck(r) { return receiptFor(r, decision); } }, 'quarantine', sanitizer, verifier, tok(fresh), { leaseMs: 30_000 });
+      const pub = new PgDurablePublisher<Clean>(fresh, SID, { async deliverAndAwaitAck(r) { return receiptFor(r, decision); } }, 'quarantine', sanitizer, verifier, freshReady, { leaseMs: 30_000 });
       const res = await pub.drainOnce();
       expect(res.acked).toBe(0); expect(res.retriable).toBe(true); expect(res.published).toBe(1); // stopped after the first
       expect(fresh.rowsOf(SID).every((r) => r.acked_at === null && r.quarantined_at === null)).toBe(true);
@@ -389,7 +408,7 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
     await expect(apply(rcv, mk('r6/v1', 1, { pairId: 'p1' }))).rejects.toBeInstanceOf(ContractValidationError);
   });
   it('promotion fence is monotonic + persisted', async () => {
-    const fence = new PgPromotionFence(db, tok(db));
+    const fence = new PgPromotionFence(db, ready);
     const t1 = await fence.acquire('f/v1'); const t2 = await fence.acquire('f/v1');
     expect(t2).toBeGreaterThan(t1); expect(await fence.current('f/v1')).toBe(t2);
   });
@@ -431,7 +450,9 @@ class GatedPg implements PgTransactor {
         const out = (rows: Record<string, unknown>[], rc?: number) => ({ rows, rowCount: rc ?? rows.length });
         if (sql.includes('SHOW transaction_isolation')) return out([{ transaction_isolation: 'serializable' }]);
         if (sql.includes('set_config')) return out([{ set_config: 'public' }]);
-        if (sql.includes('current_schema()')) return out([{ s: 'public' }]);
+        const catalog = catalogRows(sql); if (catalog) return out(catalog);
+        if (sql.includes('current_schema()')) return out([{ s:'public',p1:'public',p2:'pg_catalog',p3:null,n:2 }]);
+        if (sql.includes('FROM ha_outbox_meta')) return out([{ schema_version: HA_OUTBOX_SCHEMA_VERSION }]);
         if (sql.includes('FROM ha_outbox_fence')) return out([{ fence_token: '0' }]);
         if (sql.includes('count(*)')) return out([{ n: '0' }]);
         if (sql.includes('FROM ha_outbox_source_checkpoint')) return out([{ source_epoch: 'e1', sequence: 0 }]);
@@ -444,13 +465,13 @@ class GatedPg implements PgTransactor {
     catch (e) { this.committed = false; this.discarded = true; throw e; } // (R12) discard the connection on error
   }
 }
-const gatedOutbox = (db: GatedPg) => new PgDurableOutbox<Raw, Clean>(db, __unsafeMintReadyTokenForTests(db, 'public'), { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'quarantine' });
+const gatedOutbox = async (db: GatedPg) => new PgDurableOutbox<Raw, Clean>(db, await readyFor(db), { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'quarantine' });
 const tick = () => new Promise<void>((r) => setTimeout(r, 10));
 
 describe('(R11) capability-scoped executor / structured scope', () => {
   it('(a) a blocked read then a LATER query is denied; the tx rolls back; no mutation runs', async () => {
     const db = new GatedPg(); db.gateOn = 'FROM ha_outbox_fence';
-    const outbox = gatedOutbox(db);
+    const outbox = await gatedOutbox(db);
     let captured: unknown;
     const p = outbox.withOutboxTx(async (tx) => { void outbox.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'x' }, fenceToken: 0n }).catch((e) => { captured = e; }); return 'x'; });
     await tick();            // appendInTx is parked on the gated fence read; the callback has returned
@@ -463,7 +484,7 @@ describe('(R11) capability-scoped executor / structured scope', () => {
 
   it('(b) a FIRST mutation launched unawaited runs but CANNOT commit — the tx rolls back', async () => {
     const db = new GatedPg(); db.gateOn = 'INSERT INTO ha_outbox_rows';
-    const outbox = gatedOutbox(db);
+    const outbox = await gatedOutbox(db);
     const p = outbox.withOutboxTx(async (_tx, scoped) => { void scoped.query('INSERT INTO ha_outbox_rows (stream_id) VALUES ($1)', ['x']); return 'x'; });
     await tick();            // the INSERT is in-flight (gated); the callback has returned
     db.gate.resolve();       // let the INSERT actually execute on the connection
@@ -474,7 +495,7 @@ describe('(R11) capability-scoped executor / structured scope', () => {
 
   it('(c) the callback only ever gets the scoped proxy; it is dead after the scope (raw exec never exposed)', async () => {
     const db = new GatedPg();
-    const outbox = gatedOutbox(db);
+    const outbox = await gatedOutbox(db);
     let scopedRef: PgExecutor | undefined;
     await outbox.withOutboxTx(async (_tx, scoped) => { scopedRef = scoped; return 'ok'; });
     expect(() => scopedRef!.query('SELECT 1')).toThrow(/outside its active/);
@@ -482,7 +503,7 @@ describe('(R11) capability-scoped executor / structured scope', () => {
 
   it('(d) the normal fully-awaited path commits', async () => {
     const db = new GatedPg();
-    const outbox = gatedOutbox(db);
+    const outbox = await gatedOutbox(db);
     const h = await outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'x' }, fenceToken: 0n }));
     expect(h.sequence).toBe(1);
     expect(db.insertRan).toBe(true);
@@ -491,7 +512,7 @@ describe('(R11) capability-scoped executor / structured scope', () => {
 
   it('(e) a NEVER-RESOLVING query is bounded by the scope deadline; the tx rolls back and the connection is discarded', async () => {
     const db = new GatedPg(); db.gateOn = 'FROM ha_outbox_fence'; // gate is never resolved
-    const outbox = new PgDurableOutbox<Raw, Clean>(db, __unsafeMintReadyTokenForTests(db, 'public'), { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'quarantine', scopeDeadlineMs: 50 });
+    const outbox = new PgDurableOutbox<Raw, Clean>(db, await readyFor(db), { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'quarantine', scopeDeadlineMs: 50 });
     const p = outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'x' }, fenceToken: 0n }));
     await expect(p).rejects.toThrow(/deadline/);
     expect(db.committed).toBe(false);   // never committed
@@ -500,15 +521,15 @@ describe('(R11) capability-scoped executor / structured scope', () => {
 
   it('(f) a FAST unawaited REJECTION is retained and fails the scope (not lost); the tx rolls back', async () => {
     const db = new GatedPg(); db.rejectOn = 'INSERT INTO ha_outbox_rows';
-    const outbox = gatedOutbox(db);
+    const outbox = await gatedOutbox(db);
     const p = outbox.withOutboxTx(async (_tx, scoped) => { void scoped.query('INSERT INTO ha_outbox_rows (stream_id) VALUES ($1)', ['x']).catch(() => {}); return 'x'; });
     await expect(p).rejects.toThrow(/rejected — rolling back|in-flight|scope/);
     expect(db.committed).toBe(false);   // the fast rejection was observed -> rollback, not a false commit
   });
 
   it('(g/R13) the deadline covers enterCriticalTx: a hung isolation/pin query is bounded', async () => {
-    const db = new GatedPg(); db.gateOn = 'SHOW transaction_isolation'; // the FIRST critical query, before any bound-tx work
-    const outbox = new PgDurableOutbox<Raw, Clean>(db, __unsafeMintReadyTokenForTests(db, 'public'), { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'quarantine', scopeDeadlineMs: 50 });
+    const db = new GatedPg(); const ready = await readyFor(db); db.gateOn = 'SHOW transaction_isolation'; // the FIRST critical query, before any bound-tx work
+    const outbox = new PgDurableOutbox<Raw, Clean>(db, ready, { streamId: SID, sanitizer, maxPendingRows: 100, backpressure: 'quarantine', scopeDeadlineMs: 50 });
     const p = outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'x' }, fenceToken: 0n }));
     await expect(p).rejects.toThrow(/deadline/);
     expect(db.committed).toBe(false);
@@ -516,7 +537,7 @@ describe('(R11) capability-scoped executor / structured scope', () => {
   });
 
   it('(h/R13/MED) scopeDeadlineMs is centrally validated (finite integer, 1..2^31-1) for outbox AND receiver', async () => {
-    const db = new GatedPg(); const ready = __unsafeMintReadyTokenForTests(db, 'public');
+    const db = new GatedPg(); const ready = await readyFor(db);
     for (const bad of [0, -1, 1.5, 2_147_483_648, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(() => new PgDurableOutbox<Raw, Clean>(db, ready, { streamId: SID, sanitizer, maxPendingRows: 1, backpressure: 'quarantine', scopeDeadlineMs: bad })).toThrow(/scopeDeadlineMs/);
       expect(() => new PgReceiverCheckpoint<Clean>(db, SID, sanitizer, applier, ready, undefined, bad)).toThrow(/scopeDeadlineMs/);

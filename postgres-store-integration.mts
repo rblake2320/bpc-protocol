@@ -36,7 +36,7 @@ const publicKey: JsonWebKey = {
   kty: 'EC',
   crv: 'P-256',
   x: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-  y: 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+  y: 'B'.repeat(42) + 'E',
 };
 
 const pair: StoredPair = {
@@ -44,7 +44,7 @@ const pair: StoredPair = {
   name: 'postgres-live-ghost',
   scope: 'read-write',
   mode: 'production',
-  secretHash: 'C'.repeat(43),
+  secretHash: 'C'.repeat(42)+'Q',
   pubJwk: publicKey,
   status: 'active',
   created: Date.now(),
@@ -63,16 +63,19 @@ const pending: PairRegistration = {
   name: 'postgres-pending',
   scope: 'read',
   mode: 'production',
-  secretHash: 'D'.repeat(43),
+  secretHash: 'D'.repeat(42)+'Q',
   pubJwk: publicKey,
   maxRequests: 3,
 };
 
 let pool = new Pool({ connectionString, max: 2 });
 try {
-  // Start from the pre-hardening schema so PG_SCHEMA must exercise its
-  // idempotent security-field migration, not only fresh table creation.
+  await pool.query('DROP TABLE IF EXISTS bpc_pending, bpc_pairs CASCADE');
+  // The deprecated standalone DDL is explicitly fresh-only: it must not
+  // pretend CREATE IF NOT EXISTS upgraded a weaker legacy catalog.
   await pool.query(legacySchema);
+  await assert.rejects(() => pool.query(PG_SCHEMA), /fresh-only/);
+  await pool.query('DROP TABLE bpc_pending, bpc_pairs');
   await pool.query(PG_SCHEMA);
   let store = new PgPairStore(pool);
 
@@ -111,7 +114,7 @@ try {
 
   console.log(
     'PostgreSQL store integration: PASS ' +
-      '(legacy migration, security fields, pending lifecycle, reconnect durability)',
+      '(legacy refusal, strict fresh schema, security fields, pending lifecycle, reconnect durability)',
   );
 } finally {
   try {

@@ -70,7 +70,9 @@ npm run test:postgres:ha
 See [docs/REDIS_NONCE.md](docs/REDIS_NONCE.md) for production wiring and
 [docs/SCOPE_MODEL.md](docs/SCOPE_MODEL.md) for the deliberately closed scope
 model. See [docs/POSTGRES_TRANSACTOR.md](docs/POSTGRES_TRANSACTOR.md) for
-transaction outcome, deadline, connection-disposal, and deployment boundaries.
+transaction outcome, deadline, connection-disposal, and deployment boundaries,
+and [docs/DURABLE_PAIR_AUTHORITY.md](docs/DURABLE_PAIR_AUTHORITY.md) for the
+encrypted transactional pair-store and v2-to-v3 migration boundary.
 
 `test:adversarial` starts an isolated loopback demo server on an ephemeral port
 and runs the HTTP attack and scope-escalation suites. `test:interop` executes

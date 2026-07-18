@@ -156,6 +156,7 @@ export type {
 } from './rollback-checkpoint.js';
 export {
   HA_OUTBOX_PG_SCHEMA,
+  BPC_PAIR_PG_SCHEMA,
   HA_OUTBOX_SCHEMA_MANIFEST,
   HA_OUTBOX_SCHEMA_VERSION,
   PgDurableOutbox,
@@ -166,6 +167,8 @@ export {
   assertSchemaReady,
   attestSchema,
   provisionSchemaVersion,
+  prepareLegacyPairAuthorityV2ForMigration,
+  migrateLegacyPairAuthorityToV3,
   schemaManifest,
 } from './ha-outbox-pg.js';
 export {
@@ -194,6 +197,22 @@ export type {
   PgTx,
   SchemaReadyToken,
 } from './ha-outbox-pg.js';
+export {
+  PgPairMutationApplier,
+  PgTransactionalPairStore,
+  Aes256GcmPairPayloadCodec,
+  bpcPairMutationSanitizer,
+} from './pg-durable-pair-store.js';
+export type {
+  BpcPairMutation,
+  CanonicalPairRegistration,
+  CanonicalPublicJwk,
+  CanonicalStoredPair,
+  PairPayloadCodec,
+  PairSealKeyring,
+  PgTransactionalPairStoreOptions,
+  SealedPairPayload,
+} from './pg-durable-pair-store.js';
 export {
   RedisContinuityConfigurationError,
   createGovernedRedisBackedNonceStore,

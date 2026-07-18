@@ -134,3 +134,15 @@ product or security claims. Git history contains the original wording.
   outbox mechanism exist and are tested against real PostgreSQL.
 - **Restore only with:** issue #16's real two-node PostgreSQL and Redis drill,
   adversarial stale-writer/split-brain cases, and recorded RPO/RTO evidence.
+
+## P-014: Pair-store mechanism as complete registry transactionality
+
+- **Parked:** claiming that the transactional PostgreSQL PairStore alone makes
+  every registry workflow atomic or race-free.
+- **Reason:** compound approval currently spans pending consumption and pair
+  creation at the registry API, and several lifecycle paths still use
+  read-modify-write without compare-and-set semantics.
+- **Current claim:** each individual `PgTransactionalPairStore` mutation is
+  atomically coupled to its encrypted durable-outbox record.
+- **Restore only with:** atomic compound approval, transactional/CAS lifecycle
+  updates, concurrency tests, and middleware failure-ordering review.
