@@ -155,3 +155,17 @@ it no longer reaches the control it claims to test. The HTTP adversarial and
 scope-escalation runners now execute through one command that owns an isolated
 loopback server. Static source observations and unavailable-endpoint skips are
 not counted as passing attack evidence.
+
+## 2026-07-18: Represent uncertain commit outcomes instead of guessing
+
+Once a PostgreSQL client dispatches `COMMIT`, loss of the response proves neither
+commit nor rollback. Treating that failure as a normal rollback could let a
+caller retry and create a second authoritative mutation. The production
+transactor returns `AmbiguousCommitError` with `committed="unknown"` unless
+PostgreSQL explicitly reports `COMMIT` or `ROLLBACK`. Reconciliation uses the
+durable idempotency key and checkpoint.
+
+The adapter owns a total transaction deadline in addition to the server-side
+statement timeout, verifies command tags, destroys failed connections, and keeps
+serialization retries disabled unless explicitly enabled for replay-safe work.
+The mandatory real-PostgreSQL harness now uses this same production adapter.

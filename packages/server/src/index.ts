@@ -168,6 +168,18 @@ export {
   provisionSchemaVersion,
   schemaManifest,
 } from './ha-outbox-pg.js';
+export {
+  AmbiguousCommitError,
+  ConnectionDisposalError,
+  NodePostgresTransactor,
+  PostCommitReleaseError,
+} from './pg-transactor.js';
+export type {
+  NodePostgresClient,
+  NodePostgresPool,
+  NodePostgresResult,
+  NodePostgresTransactorOptions,
+} from './pg-transactor.js';
 export type {
   AckReceipt,
   AckReceiptVerifier,
