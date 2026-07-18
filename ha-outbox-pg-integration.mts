@@ -32,12 +32,17 @@ import {
   PgDurablePublisher,
   PgPromotionFence,
   PgReceiverCheckpoint,
+  PgPairMutationApplier,
+  PgTransactionalPairStore,
+  bpcPairMutationSanitizer,
   NodePostgresTransactor,
   adoptCurrentSchemaVersion,
   assertSchemaReady,
   attestSchema,
   canonicalOpDigest,
   ContractValidationError,
+  migrateLegacyPairAuthorityToV3,
+  prepareLegacyPairAuthorityV2ForMigration,
   provisionSchemaVersion,
   schemaManifest,
 } from './packages/server/src/index.ts';
@@ -56,6 +61,8 @@ import type {
   PgTransactor,
   ReceiverDecision,
   SanitizedMutation,
+  BpcPairMutation,
+  StoredPair,
 } from './packages/server/src/index.ts';
 
 const connectionString = process.env['BPC_TEST_POSTGRES_URL'] ?? process.env['HA_OUTBOX_PG_URL'];
@@ -128,19 +135,48 @@ const mkOutbox = (db: PgTransactor, streamId: string) => new PgDurableOutbox<Raw
 async function applyDDL(): Promise<void> {
   for (const stmt of HA_OUTBOX_PG_SCHEMA.split(';').map((s) => s.trim()).filter(Boolean)) await pool.query(stmt);
 }
+async function installLegacyPairSchema(standalone=false): Promise<void> {
+  await pool.query(`DROP TABLE IF EXISTS bpc_pending,bpc_pairs${standalone?',ha_outbox_rows,ha_outbox_applied,ha_outbox_fence,ha_outbox_source_checkpoint,ha_outbox_receiver_checkpoint,ha_outbox_publisher_lease,ha_outbox_quarantine,ha_outbox_meta':''} CASCADE`);
+  await pool.query(`CREATE TABLE bpc_pairs (
+    id text PRIMARY KEY, name text NOT NULL, scope text NOT NULL, mode text NOT NULL,
+    secret_hash text NOT NULL, pub_jwk jsonb NOT NULL, status text NOT NULL DEFAULT 'active',
+    created bigint NOT NULL, last_active bigint, requests integer NOT NULL DEFAULT 0,
+    failed_sigs integer NOT NULL DEFAULT 0, cumulative_failures double precision,
+    first_failure_at bigint, max_requests bigint, kind text NOT NULL DEFAULT 'legitimate',
+    canary_class text, expires_at bigint
+  )`);
+  await pool.query('CREATE TABLE bpc_pending (token text PRIMARY KEY, registration jsonb NOT NULL, requested_at bigint NOT NULL)');
+  if(!standalone)await pool.query('UPDATE ha_outbox_meta SET schema_version=2 WHERE id=1');
+}
 async function resetSchema(): Promise<void> {
   await pool.query('DROP SCHEMA IF EXISTS shadow CASCADE');
   await pool.query('DROP SCHEMA IF EXISTS evil CASCADE');
   await pool.query('DROP SCHEMA IF EXISTS alt CASCADE');
-  await pool.query('DROP TABLE IF EXISTS ha_outbox_rows, ha_outbox_applied, ha_outbox_fence, ha_outbox_source_checkpoint, ha_outbox_receiver_checkpoint, ha_outbox_publisher_lease, ha_outbox_quarantine, ha_outbox_meta CASCADE');
+  await pool.query('DROP SCHEMA IF EXISTS replica CASCADE');
+  await pool.query('DROP TABLE IF EXISTS bpc_pending, bpc_pairs, ha_outbox_rows, ha_outbox_applied, ha_outbox_fence, ha_outbox_source_checkpoint, ha_outbox_receiver_checkpoint, ha_outbox_publisher_lease, ha_outbox_quarantine, ha_outbox_meta CASCADE');
   await pool.query('DROP FUNCTION IF EXISTS ha_noop() CASCADE');
   await applyDDL();
-  READY = await provisionSchemaVersion(serial, SCHEMA); // attests fresh schema, stamps v2, mints token
+  READY = await provisionSchemaVersion(serial, SCHEMA); // attests fresh schema, stamps current version, mints token
 }
 async function provision(streamId: string, epoch = 'e1'): Promise<void> {
   await pool.query('INSERT INTO ha_outbox_fence (stream_id, fence_token) VALUES ($1,0)', [streamId]);
   await pool.query('INSERT INTO ha_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)', [streamId, epoch]);
   await pool.query('INSERT INTO ha_outbox_receiver_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)', [streamId, epoch]);
+}
+async function applyDDLInSchema(schema: string): Promise<void> {
+  if (!/^[a-z][a-z0-9_]{0,62}$/.test(schema)) throw new Error('invalid test schema');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL search_path TO ${schema}`);
+    for (const stmt of HA_OUTBOX_PG_SCHEMA.split(';').map((s) => s.trim()).filter(Boolean)) await client.query(stmt);
+    await client.query('COMMIT');
+  } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; } finally { client.release(); }
+}
+async function provisionInSchema(schema: string, streamId: string, epoch = 'e1'): Promise<void> {
+  await pool.query(`INSERT INTO ${schema}.ha_outbox_fence (stream_id, fence_token) VALUES ($1,0)`, [streamId]);
+  await pool.query(`INSERT INTO ${schema}.ha_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)`, [streamId, epoch]);
+  await pool.query(`INSERT INTO ${schema}.ha_outbox_receiver_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)`, [streamId, epoch]);
 }
 const unacked = async (sid: string) => Number((await pool.query('SELECT count(*)::int AS n FROM ha_outbox_rows WHERE stream_id=$1 AND acked_at IS NULL AND quarantined_at IS NULL', [sid])).rows[0].n);
 
@@ -310,8 +346,8 @@ async function main(): Promise<void> {
     await serial.transaction((e) => attestSchema(e));
     // (a) quarantined_at present but the op_digest CHECK removed -> attestation catches it
     await pool.query(`DO $$ DECLARE r record; BEGIN
-      FOR r IN SELECT conname FROM pg_constraint c JOIN pg_class rel ON rel.oid=c.conrelid
-               WHERE rel.relname='ha_outbox_rows' AND c.contype='c' AND pg_get_constraintdef(c.oid) LIKE '%op_digest%'
+      FOR r IN SELECT conname FROM pg_constraint c JOIN pg_class rel ON rel.oid=c.conrelid JOIN pg_namespace n ON n.oid=rel.relnamespace
+               WHERE n.nspname=current_schema() AND rel.relname='ha_outbox_rows' AND c.contype='c' AND pg_get_constraintdef(c.oid) LIKE '%op_digest%'
       LOOP EXECUTE 'ALTER TABLE ha_outbox_rows DROP CONSTRAINT '||quote_ident(r.conname); END LOOP; END $$;`);
     await assert.rejects(() => serial.transaction((e) => attestSchema(e)), /attestation failed/);
     await assert.rejects(() => adoptCurrentSchemaVersion(serial, SCHEMA), /attestation failed/, 'migration must not stamp a weakened schema');
@@ -441,14 +477,102 @@ async function main(): Promise<void> {
     await assertSchemaVersionOnly(serial, SCHEMA);
   });
 
+  await check('(v2->v3) legacy pair authority migrates atomically, preserves data, attests, and advances only after validation', async () => {
+    await installLegacyPairSchema(true);
+    const jwk = { kty:'EC', crv:'P-256', x:'x'.repeat(42)+'w', y:'y'.repeat(42)+'w' };
+    await pool.query(`INSERT INTO bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,kind)
+      VALUES('legacy_pair','Legacy','read-write','production',$1,$2,'active',1,NULL,2,1,1.25,'legitimate')`, ['s'.repeat(43), jwk]);
+    await pool.query(`INSERT INTO bpc_pending(token,registration,requested_at) VALUES('legacy_pending',$1,10)`, [{name:'Legacy',scope:'read-write',mode:'production',secretHash:'s'.repeat(43),pubJwk:jwk,kind:'legitimate'}]);
+    await prepareLegacyPairAuthorityV2ForMigration(serial,SCHEMA);
+    const migrated = await migrateLegacyPairAuthorityToV3(serial, SCHEMA);
+    assert.ok(migrated, 'migration did not return a readiness capability');
+    await assertSchemaReady(serial, SCHEMA);
+    assert.equal(Number((await pool.query("SELECT cumulative_failures FROM bpc_pairs WHERE id='legacy_pair'")).rows[0].cumulative_failures), 1.25);
+    assert.equal(Number((await pool.query("SELECT requested_at FROM bpc_pending WHERE token='legacy_pending'")).rows[0].requested_at), 10);
+    assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), HA_OUTBOX_SCHEMA_VERSION);
+  });
+
+  await check('(v2->v3) migration lock precedes the SERIALIZABLE snapshot so a blocked writer can never be lost', async () => {
+    await resetSchema(); await installLegacyPairSchema();
+    const writer = await pool.connect();
+    const jwk = { kty:'EC', crv:'P-256', x:'x'.repeat(42)+'w', y:'y'.repeat(42)+'w' };
+    try {
+      await writer.query('BEGIN');
+      await writer.query(`INSERT INTO bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,kind)
+        VALUES('late','Late','read','production',$1,$2,'active',1,NULL,0,0,'legitimate')`, ['s'.repeat(43), jwk]);
+      const migration = migrateLegacyPairAuthorityToV3(serial, SCHEMA);
+      let waiting = false;
+      for (let i=0; i<100 && !waiting; i++) {
+        const result = await pool.query(`SELECT EXISTS(
+          SELECT 1 FROM pg_locks
+          WHERE relation='public.bpc_pairs'::regclass
+            AND mode='AccessExclusiveLock' AND NOT granted
+        ) AS waiting`);
+        waiting = result.rows[0]?.waiting === true;
+        if (!waiting) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(waiting, true, 'migration did not block on the writer-held authority table');
+      await writer.query('COMMIT');
+      let migrationError: unknown;
+      try { await migration; } catch (error) { migrationError = error; }
+      const lateRows = Number((await pool.query("SELECT count(*)::int AS n FROM bpc_pairs WHERE id='late'")).rows[0].n);
+      assert.equal(lateRows, 1, 'migration lost a row committed while its authority lock was waiting');
+      const version = Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version);
+      if (migrationError) assert.equal(version, 2, 'failed migration advanced the schema authority');
+      else assert.equal(version, HA_OUTBOX_SCHEMA_VERSION, 'successful migration did not advance the schema authority');
+    } finally {
+      await writer.query('ROLLBACK').catch(()=>{});
+      writer.release();
+    }
+  });
+
+  await check('(v2->v3) invalid legacy authority fails closed with data and version marker preserved', async () => {
+    await resetSchema(); await installLegacyPairSchema();
+    await pool.query(`INSERT INTO bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,kind)
+      VALUES('bad_private','Bad','read','production',$1,$2,'active',1,NULL,0,0,'legitimate')`, ['s'.repeat(43), {kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w',d:'private'}]);
+    await assert.rejects(() => migrateLegacyPairAuthorityToV3(serial, SCHEMA), /check constraint|violates/i);
+    assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), 2);
+    assert.equal(Number((await pool.query("SELECT count(*)::int n FROM bpc_pairs WHERE id='bad_private'")).rows[0].n), 1, 'failed migration lost legacy authority data');
+    const type = (await pool.query("SELECT udt_name FROM information_schema.columns WHERE table_schema='public' AND table_name='bpc_pairs' AND column_name='requests'")).rows[0].udt_name;
+    assert.equal(type, 'int4', 'failed migration partially swapped the legacy table');
+    for (const [name, seed] of [
+      ['unsafe integer', () => pool.query(`INSERT INTO bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,kind) VALUES('unsafe','x','read','production',$1,$2,'active',$3,NULL,0,0,'legitimate')`,['s'.repeat(43),{kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w'},'9007199254740992'])],
+      ['non-finite float', () => pool.query(`INSERT INTO bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,kind) VALUES('nan_pair','x','read','production',$1,$2,'active',1,NULL,0,0,'NaN','legitimate')`,['s'.repeat(43),{kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w'}])],
+      ['malformed pending registration', () => pool.query("INSERT INTO bpc_pending(token,registration,requested_at) VALUES('bad_pending',$1,1)",[{name:'x',scope:'read',mode:'production',secretHash:'s'.repeat(43),pubJwk:{}}])],
+    ] as const) {
+      await resetSchema(); await installLegacyPairSchema(); await seed();
+      await assert.rejects(()=>migrateLegacyPairAuthorityToV3(serial,SCHEMA),/check constraint|violates/i,name);
+      assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version),2,`${name} advanced the version marker`);
+    }
+    await resetSchema();
+  });
+
+  await check('(v2->v3) FORCE RLS cannot hide authority rows from migration', async () => {
+    const role=`bpc_migrator_${process.pid}`, schema=`rls_migration_${process.pid}`, password='migration-test-only';
+    await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`); await pool.query(`DROP ROLE IF EXISTS ${role}`);
+    await pool.query(`CREATE ROLE ${role} LOGIN PASSWORD '${password}' NOSUPERUSER NOBYPASSRLS`);
+    await pool.query(`CREATE SCHEMA ${schema} AUTHORIZATION ${role}`);
+    const roleUrl=new URL(connectionString); roleUrl.username=role; roleUrl.password=password;
+    const rolePool=new Pool({connectionString:roleUrl.toString(),max:2});
+    try {
+      const client=await rolePool.connect();
+      try { await client.query(`SET search_path TO ${schema}`); for(const stmt of HA_OUTBOX_PG_SCHEMA.split(';').map(s=>s.trim()).filter(Boolean))await client.query(stmt); await client.query('INSERT INTO ha_outbox_meta(id,schema_version) VALUES(1,2)'); await client.query('DROP TABLE bpc_pending,bpc_pairs'); await client.query(`CREATE TABLE bpc_pairs(id text PRIMARY KEY,name text NOT NULL,scope text NOT NULL,mode text NOT NULL,secret_hash text NOT NULL,pub_jwk jsonb NOT NULL,status text NOT NULL DEFAULT 'active',created bigint NOT NULL,last_active bigint,requests integer NOT NULL DEFAULT 0,failed_sigs integer NOT NULL DEFAULT 0,cumulative_failures double precision,first_failure_at bigint,max_requests bigint,kind text NOT NULL DEFAULT 'legitimate',canary_class text,expires_at bigint);CREATE TABLE bpc_pending(token text PRIMARY KEY,registration jsonb NOT NULL,requested_at bigint NOT NULL)`); const jwk={kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w'}; for(const id of ['visible','hidden'])await client.query(`INSERT INTO bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,kind) VALUES($1,'x','read','production',$2,$3,'active',1,NULL,0,0,'legitimate')`,[id,'s'.repeat(43),jwk]); await client.query('ALTER TABLE bpc_pairs ENABLE ROW LEVEL SECURITY'); await client.query('ALTER TABLE bpc_pairs FORCE ROW LEVEL SECURITY'); await client.query("CREATE POLICY visible_only ON bpc_pairs USING(id='visible')"); }
+      finally { client.release(); }
+      const roleDb=new NodePostgresTransactor(rolePool);
+      await assert.rejects(()=>migrateLegacyPairAuthorityToV3(roleDb,schema),/unsafe relation\/RLS\/policy/);
+      assert.equal(Number((await pool.query(`SELECT count(*)::int n FROM ${schema}.bpc_pairs`)).rows[0].n),2,'RLS migration lost a hidden authority row');
+      assert.equal(Number((await pool.query(`SELECT schema_version FROM ${schema}.ha_outbox_meta WHERE id=1`)).rows[0].schema_version),2);
+    } finally { await rolePool.end().catch(()=>{}); await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`); await pool.query(`DROP ROLE IF EXISTS ${role}`); }
+  });
+
   await check('(R6/HIGH1) migration is forward-only: a FUTURE version is never downgraded, data preserved', async () => {
     const sid = 'sc:nodown/v1'; await provision(sid);
     const ob = mkOutbox(serial, sid);
     await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'keepme' }, fenceToken: 0n }));
     // simulate a future version sharing this exact catalog (semantic-only revision / pre-staged marker)
-    await pool.query('UPDATE ha_outbox_meta SET schema_version = 3 WHERE id = 1');
+    await pool.query('UPDATE ha_outbox_meta SET schema_version = $1 WHERE id = 1', [HA_OUTBOX_SCHEMA_VERSION + 1]);
     await assert.rejects(() => adoptCurrentSchemaVersion(serial, SCHEMA), /refusing to downgrade/);
-    assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), 3, 'future version must be preserved');
+    assert.equal(Number((await pool.query('SELECT schema_version FROM ha_outbox_meta WHERE id=1')).rows[0].schema_version), HA_OUTBOX_SCHEMA_VERSION + 1, 'future version must be preserved');
     assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM ha_outbox_rows WHERE stream_id=$1', [sid])).rows[0].n), 1, 'data must be preserved on refused downgrade');
     // being already-current is a clean no-op
     await pool.query('UPDATE ha_outbox_meta SET schema_version = $1 WHERE id = 1', [HA_OUTBOX_SCHEMA_VERSION]);
@@ -525,6 +649,140 @@ async function main(): Promise<void> {
     assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM ha_outbox_quarantine WHERE stream_id=$1', [sid])).rows[0].n), 0);
   });
 
+  await check('(pair authority) all PairStore writes commit atomically with ordered outbox and apply on an independent receiver', async () => {
+    const sid = 'bpc:pair:default/v1'; await provision(sid);
+    await pool.query('CREATE SCHEMA replica');
+    await applyDDLInSchema('replica');
+    const replicaReady = await provisionSchemaVersion(serial, 'replica');
+    await provisionInSchema('replica', sid);
+
+    const sealKey = Buffer.alloc(32, 7);
+    const keyring = { activeKeyId:'pair-key-1', resolveKey:(keyId:string) => { if (keyId !== 'pair-key-1') throw new Error('unknown key'); return sealKey; } };
+    const source = new PgTransactionalPairStore(serial, READY, { streamId: sid, fenceToken: 0n, keyring, maxPendingRows: 100 });
+    const receiver = new PgReceiverCheckpoint<BpcPairMutation>(serial, sid, bpcPairMutationSanitizer, new PgPairMutationApplier(sid, keyring), replicaReady);
+    const decisions: ReceiverDecision[] = [];
+    const transport: OutboxTransport = { async deliverAndAwaitAck(record) {
+      const decision = await receiver.verifyAndApplyDelivered(record as OutboxRecord<BpcPairMutation>);
+      decisions.push(decision); return receiptFor(record, decision);
+    } };
+    const publisher = new PgDurablePublisher<BpcPairMutation>(serial, sid, transport, 'fail-authoritative-mutation', bpcPairMutationSanitizer, verifier, READY, { leaseMs: 30_000 });
+    const pair: StoredPair = {
+      id: 'pair_atomic_1', name: 'Atomic pair', scope: 'read-write', mode: 'production',
+      secretHash: 's'.repeat(43), pubJwk: { kty: 'EC', crv: 'P-256', x: 'x'.repeat(42)+'w', y: 'y'.repeat(42)+'w' },
+      status: 'active', created: 100, lastActive: null, requests: 2, failedSigs: 1,
+      cumulativeFailures: 1.25e-7, firstFailureAt: 90, maxRequests: 1000, kind: 'legitimate', expiresAt: 5000,
+    };
+    const registration = { name: pair.name, scope: pair.scope, mode: pair.mode, secretHash: pair.secretHash, pubJwk: pair.pubJwk, maxRequests: pair.maxRequests, kind: pair.kind };
+
+    await source.set(pair); assert.equal((await source.get(pair.id))?.cumulativeFailures, 1.25e-7);
+    const storedWire = (await pool.query('SELECT mutation FROM ha_outbox_rows WHERE stream_id=$1 AND sequence=1', [sid])).rows[0].mutation;
+    assert.equal(storedWire.kind, 'bpc.pair.set.v1'); assert.ok(storedWire.sealed?.ciphertext);
+    assert.ok(!JSON.stringify(storedWire).includes(pair.secretHash), 'outbox leaked the operational HMAC key');
+    assert.ok(!JSON.stringify(storedWire).includes('secretHash'), 'outbox leaked a clear secretHash field');
+    assert.equal((await publisher.drainOnce()).acked, 1);
+    assert.equal(Number((await pool.query('SELECT cumulative_failures FROM replica.bpc_pairs WHERE id=$1', [pair.id])).rows[0].cumulative_failures), 1.25e-7);
+
+    await source.setPending('pending-1', registration, 200); assert.equal((await publisher.drainOnce()).acked, 1);
+    assert.equal(Number((await pool.query("SELECT count(*)::int n FROM replica.bpc_pending WHERE token='pending-1'")).rows[0].n), 1);
+    await source.deletePending('pending-1'); assert.equal((await publisher.drainOnce()).acked, 1);
+    assert.equal(Number((await pool.query("SELECT count(*)::int n FROM replica.bpc_pending WHERE token='pending-1'")).rows[0].n), 0);
+    await source.delete(pair.id); assert.equal((await publisher.drainOnce()).acked, 1);
+    assert.equal(Number((await pool.query('SELECT count(*)::int n FROM replica.bpc_pairs WHERE id=$1', [pair.id])).rows[0].n), 0);
+    assert.deepEqual(decisions, ['applied', 'applied', 'applied', 'applied']);
+    assert.equal(Number((await pool.query('SELECT sequence FROM ha_outbox_source_checkpoint WHERE stream_id=$1', [sid])).rows[0].sequence), 4);
+    assert.equal(Number((await pool.query('SELECT sequence FROM replica.ha_outbox_receiver_checkpoint WHERE stream_id=$1', [sid])).rows[0].sequence), 4);
+  });
+
+  await check('(pair authority) backpressure and stale fencing roll back the authoritative mutation', async () => {
+    const sid = 'bpc:pair:rollback/v1'; await provision(sid);
+    const keyring = { activeKeyId:'pair-key-1', resolveKey:() => Buffer.alloc(32, 7) };
+    const limited = new PgTransactionalPairStore(serial, READY, { streamId: sid, fenceToken: 0n, keyring, maxPendingRows: 1 });
+    const base: StoredPair = { id: 'rollback_pair', name: 'before', scope: 'read', mode: 'production', secretHash: 's'.repeat(43), pubJwk: { kty: 'EC', crv: 'P-256', x: 'x'.repeat(42)+'w', y: 'y'.repeat(42)+'w' }, status: 'active', created: 1, lastActive: null, requests: 0, failedSigs: 0, kind: 'legitimate' };
+    await limited.set(base);
+    await assert.rejects(() => limited.set({ ...base, name: 'must-rollback' }), /backpressure/i);
+    assert.equal((await limited.get(base.id))?.name, 'before');
+    assert.equal(Number((await pool.query('SELECT count(*)::int n FROM ha_outbox_rows WHERE stream_id=$1', [sid])).rows[0].n), 1);
+
+    await pool.query('UPDATE ha_outbox_fence SET fence_token=2 WHERE stream_id=$1', [sid]);
+    await assert.rejects(() => limited.delete(base.id), /fence token.*stale|stale.*fence/i);
+    assert.equal((await limited.get(base.id))?.name, 'before', 'stale writer deleted authority despite rejected outbox append');
+  });
+
+  await check('(pair authority) governed schema precedes pg_temp and successful transactions discard session state', async () => {
+    const sid='bpc:pair:temp-shadow/v1';await provision(sid);
+    const tempPool=new Pool({connectionString,max:1});
+    try{
+      const tempDb=new NodePostgresTransactor(tempPool);
+      const tempReady=await assertSchemaReady(tempDb,SCHEMA);
+      const client=await tempPool.connect();
+      try{await client.query('CREATE TEMP TABLE bpc_pairs (LIKE public.bpc_pairs INCLUDING ALL)');}finally{client.release();}
+      const keyring={activeKeyId:'pair-key-1',resolveKey:()=>Buffer.alloc(32,7)};
+      const store=new PgTransactionalPairStore(tempDb,tempReady,{streamId:sid,fenceToken:0n,keyring,maxPendingRows:10});
+      const value:StoredPair={id:'temp_shadow_guard',name:'Public authority',scope:'read',mode:'production',secretHash:'s'.repeat(43),pubJwk:{kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w'},status:'active',created:1,lastActive:null,requests:0,failedSigs:0,kind:'legitimate'};
+      await store.set(value);
+      assert.equal(Number((await pool.query("SELECT count(*)::int n FROM public.bpc_pairs WHERE id='temp_shadow_guard'")).rows[0].n),1,'pg_temp shadow captured authority mutation');
+      assert.equal(Number((await pool.query('SELECT count(*)::int n FROM ha_outbox_rows WHERE stream_id=$1',[sid])).rows[0].n),1);
+      assert.equal((await tempPool.query("SELECT to_regclass('pg_temp.bpc_pairs') AS r")).rows[0].r,null,'successful transaction returned pooled session with temp state');
+    }finally{await tempPool.end();}
+  });
+
+  await check('(pair authority) encrypted payload cannot be transplanted across streams under the same seal key', async () => {
+    const sourceSid='bpc:pair:tenant-a/v1', targetSid='bpc:pair:tenant-b/v1'; await provision(sourceSid); await provision(targetSid);
+    await pool.query('CREATE SCHEMA replica'); await applyDDLInSchema('replica');
+    const replicaReady=await provisionSchemaVersion(serial,'replica'); await provisionInSchema('replica',targetSid);
+    const keyring={activeKeyId:'pair-key-1',resolveKey:()=>Buffer.alloc(32,7)};
+    const source=new PgTransactionalPairStore(serial,READY,{streamId:sourceSid,fenceToken:0n,keyring,maxPendingRows:10});
+    const p:StoredPair={id:'tenant_bound',name:'Tenant bound',scope:'read',mode:'production',secretHash:'s'.repeat(43),pubJwk:{kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w'},status:'active',created:1,lastActive:null,requests:0,failedSigs:0,kind:'legitimate'};
+    await source.set(p);
+    const row=(await pool.query('SELECT mutation FROM ha_outbox_rows WHERE stream_id=$1 AND sequence=1',[sourceSid])).rows[0];
+    const mutation=row.mutation as SanitizedMutation<BpcPairMutation>;
+    const transplanted:OutboxRecord<BpcPairMutation>={contractVersion:'1',streamId:targetSid,sourceEpoch:'e1',sequence:1,fenceToken:'0',opDigest:canonicalOpDigest({streamId:targetSid,sourceEpoch:'e1',sequence:1,fenceToken:'0',mutation}),mutation};
+    const receiver=new PgReceiverCheckpoint<BpcPairMutation>(serial,targetSid,bpcPairMutationSanitizer,new PgPairMutationApplier(targetSid,keyring),replicaReady);
+    await assert.rejects(()=>receiver.verifyAndApplyDelivered(transplanted),/authentication failed/);
+    assert.equal(Number((await pool.query("SELECT count(*)::int n FROM replica.bpc_pairs WHERE id='tenant_bound'")).rows[0].n),0);
+  });
+
+  await check('(pair authority) receiver authentication failure rolls back apply/history/checkpoint and leaves source retryable', async () => {
+    const sid = 'bpc:pair:keyfail/v1'; await provision(sid);
+    await pool.query('CREATE SCHEMA replica'); await applyDDLInSchema('replica');
+    const replicaReady = await provisionSchemaVersion(serial, 'replica'); await provisionInSchema('replica', sid);
+    const sourceKeyring = { activeKeyId:'pair-key-1', resolveKey:() => Buffer.alloc(32, 7) };
+    const wrongKeyring = { activeKeyId:'pair-key-1', resolveKey:() => Buffer.alloc(32, 8) };
+    const source = new PgTransactionalPairStore(serial, READY, { streamId: sid, fenceToken: 0n, keyring: sourceKeyring, maxPendingRows: 10 });
+    const receiver = new PgReceiverCheckpoint<BpcPairMutation>(serial, sid, bpcPairMutationSanitizer, new PgPairMutationApplier(sid, wrongKeyring), replicaReady);
+    const transport: OutboxTransport = { async deliverAndAwaitAck(record) { const d=await receiver.verifyAndApplyDelivered(record as OutboxRecord<BpcPairMutation>); return receiptFor(record,d); } };
+    const publisher = new PgDurablePublisher<BpcPairMutation>(serial,sid,transport,'fail-authoritative-mutation',bpcPairMutationSanitizer,verifier,READY,{leaseMs:30_000});
+    const p: StoredPair = { id:'keyfail',name:'Key fail',scope:'read',mode:'production',secretHash:'s'.repeat(43),pubJwk:{kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w'},status:'active',created:1,lastActive:null,requests:0,failedSigs:0,kind:'legitimate' };
+    await source.set(p);
+    await assert.rejects(() => publisher.drainOnce(), /authentication failed/);
+    assert.equal(Number((await pool.query("SELECT count(*)::int n FROM replica.bpc_pairs WHERE id='keyfail'")).rows[0].n),0);
+    assert.equal(Number((await pool.query('SELECT sequence FROM replica.ha_outbox_receiver_checkpoint WHERE stream_id=$1',[sid])).rows[0].sequence),0);
+    assert.equal(Number((await pool.query('SELECT count(*)::int n FROM replica.ha_outbox_applied WHERE stream_id=$1',[sid])).rows[0].n),0);
+    assert.equal(await unacked(sid),1);
+  });
+
+  await check('(pair authority) combined readiness attests pair tables and database constraints reject private JWK material', async () => {
+    await assertSchemaReady(serial, SCHEMA);
+    await pool.query('DROP INDEX bpc_pending_requested_at');
+    await assert.rejects(() => assertSchemaReady(serial, SCHEMA), /attestation failed/);
+    await resetSchema();
+    await assert.rejects(
+      () => pool.query(`INSERT INTO bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,kind)
+        VALUES('private_jwk','x','read','production',$1,$2,'active',1,NULL,0,0,'legitimate')`, ['s'.repeat(43), { kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w',d:'private' }]),
+      /check constraint/i,
+    );
+    for (const [token,registration] of [
+      ['missing_jwk_fields',{name:'x',scope:'read',mode:'production',secretHash:'s'.repeat(43),pubJwk:{}}],
+      ['null_jwk_fields',{name:'x',scope:'read',mode:'production',secretHash:'s'.repeat(43),pubJwk:{kty:'EC',crv:'P-256',x:null,y:null}}],
+      ['private_pending',{name:'x',scope:'read',mode:'production',secretHash:'s'.repeat(43),pubJwk:{kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w',d:'private'}}],
+    ] as const) await assert.rejects(()=>pool.query('INSERT INTO bpc_pending(token,registration,requested_at) VALUES($1,$2,1)',[token,registration]),/check constraint/i);
+    await assert.rejects(()=>pool.query('INSERT INTO bpc_pending(token,registration,requested_at) VALUES($1,$2,$3)',['unsafe_time',{name:'x',scope:'read',mode:'production',secretHash:'s'.repeat(43),pubJwk:{kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w'}},'9007199254740992']),/check constraint/i);
+    await assert.rejects(()=>pool.query(`INSERT INTO bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,kind)
+      VALUES('unsafe_pair','x','read','production',$1,$2,'active',$3,NULL,0,0,0,'legitimate')`,['s'.repeat(43),{kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w'},'9007199254740992']),/check constraint/i);
+    for(const bad of ['NaN','Infinity']) await assert.rejects(()=>pool.query(`INSERT INTO bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,kind)
+      VALUES($1,'x','read','production',$2,$3,'active',1,NULL,0,0,$4,'legitimate')`,[`bad_${bad}`, 's'.repeat(43),{kty:'EC',crv:'P-256',x:'x'.repeat(42)+'w',y:'y'.repeat(42)+'w'},bad]),/check constraint/i);
+  });
+
   await check('(production adapter) deadline destroys a hung real-PG connection and pool recovers', async () => {
     const bounded = new NodePostgresTransactor(pool, {
       statementTimeoutMs: 30_000,
@@ -540,6 +798,20 @@ async function main(): Promise<void> {
     const healthy = await pool.query('SELECT 1 AS ok');
     assert.equal(healthy.rows[0].ok, 1, 'pool did not recover after destroying the timed-out client');
     assert.equal(pool.waitingCount, 0, 'pool retained waiters after timed-out client destruction');
+  });
+
+  await check('(production adapter) callback transaction-control and multi-statement escapes roll back', async () => {
+    await pool.query('DROP TABLE IF EXISTS tx_escape_guard');
+    await pool.query('CREATE TABLE tx_escape_guard(id integer PRIMARY KEY)');
+    for(const [i,sql] of ['COMMIT','/* sneaky */ COMMIT','ROLLBACK','SAVEPOINT x','SELECT 1; COMMIT'].entries()){
+      await assert.rejects(()=>serial.transaction(async exec=>{
+        await exec.query('INSERT INTO tx_escape_guard(id) VALUES($1)',[i]);
+        await exec.query(sql);
+        throw new Error('must not reach');
+      }),/forbids|exactly one statement/);
+    }
+    assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM tx_escape_guard')).rows[0].n),0,'transaction-control escape committed data');
+    await pool.query('DROP TABLE tx_escape_guard');
   });
 
   console.log(`\n# ${passed} checks passed`);

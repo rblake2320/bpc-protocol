@@ -16,7 +16,7 @@
     "test:postgres:ha": "tsx ha-outbox-pg-integration.mts",
     "test:interop": "tsx cross-language-integration.mts",
     "test:adversarial": "tsx adversarial-integration.mts",
-    "test:pack": "npm pack --dry-run --workspaces",
+    "test:pack": "npm run build && tsx package-boundary-suite.mts && npm pack --dry-run --workspaces",
     "test:core": "npm run test --workspace=packages/core",
     "test:server": "npm run test --workspace=packages/server",
     "test:client": "npm run test --workspace=packages/client-sdk"

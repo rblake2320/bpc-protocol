@@ -195,3 +195,34 @@
 - Verification: 40 focused adversarial tests, 295 server tests, TypeScript
   build, and 23 real PostgreSQL 16 checks. Independent review found no remaining
   critical, high, or medium snapshot-boundary blocker.
+
+## 2026-07-18: Transactional encrypted pair authority
+
+- Added `PgTransactionalPairStore`, coupling pair and pending-registration
+  changes to ordered durable-outbox records in one `SERIALIZABLE` transaction.
+- Classified `secretHash` correctly as operational HMAC key material. Set
+  mutations use AES-256-GCM with a fresh nonce and AAD bound to the protocol,
+  stream, operation, authority identity, algorithm, and seal-key identifier;
+  clear key material is absent from durable replication records.
+- Expanded schema version 3 and its catalog manifest to govern the outbox and
+  pair-authority tables together. Removed the exported test readiness-token
+  bypass and added a package-boundary regression.
+- Added a forward-only, transactional v2-to-v3 migration that copies legacy
+  authority through the new constraints, attests the complete schema, and only
+  then advances the version marker. Invalid legacy data rolls back intact.
+- Added a governed standalone-v2 preparation step and a migration-only
+  transactor entry that acquires authority locks before establishing the
+  serializable snapshot. A deterministic real-PostgreSQL regression proves a
+  writer committing while migration waits is preserved or the migration fails.
+- Closed normalization aliases and side effects: required values come only from
+  own data descriptors, public-key/secret values use canonical 32-byte
+  base64url, and sealed payload encodings must round-trip canonically.
+- Closed the production transactor escape that allowed callback-issued
+  transaction/session control. Callback SQL is now single-statement and
+  lexed across comments and quoted literals before dispatch; a real PostgreSQL
+  regression proves early COMMIT/ROLLBACK/SAVEPOINT/multi-statement attempts
+  leave zero durable rows.
+- Verification: TypeScript build, 306 server tests, package-boundary and dry-run
+  tarball checks, and 34 integrated PostgreSQL 16 checks.
+- This is single-node mechanism evidence. Issue #16 remains open for the real
+  two-node PostgreSQL/Redis drill, resynchronization, and measured RPO/RTO.
