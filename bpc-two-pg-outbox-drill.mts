@@ -2,9 +2,11 @@
  * Two-independent-PostgreSQL mechanism drill for BPC issue #16.
  *
  * This proves the existing pair/outbox/publisher/receiver path across distinct
- * PostgreSQL failure domains. The adapter below is deliberately in-process and
- * test-only: this is NOT authenticated-network, promotion, failover, split-brain,
- * availability, or HA evidence. Issue #16 remains open for those acceptance gates.
+ * PostgreSQL cluster identities and state authorities. Same-host CI containers
+ * do not prove independent physical failure domains. The adapter below is
+ * deliberately in-process and test-only: this is NOT authenticated-network,
+ * promotion, failover, split-brain, availability, or HA evidence. Issue #16
+ * remains open for those acceptance gates.
  */
 import assert from 'node:assert/strict';
 import pg from 'pg';
