@@ -44,12 +44,13 @@ class MemoryPg implements PgTransactor {
   isolation = 'serializable';
   state: State = { fence: new Map(), src: new Map(), rcv: new Map(), rows: [], applied: [], lease: new Map(), quar: [], version: HA_OUTBOX_SCHEMA_VERSION };
   crashBeforeCommit = false;
+  queryHook: ((sql: string) => Promise<void>) | undefined;
   private clone(s: State): State {
     return { fence: new Map(s.fence), src: new Map([...s.src].map(([k, v]) => [k, { ...v }])), rcv: new Map([...s.rcv].map(([k, v]) => [k, { ...v }])), rows: s.rows.map((r) => ({ ...r })), applied: s.applied.map((a) => ({ ...a })), lease: new Map([...s.lease].map(([k, v]) => [k, { ...v }])), quar: s.quar.map((q) => ({ ...q })), version: s.version };
   }
   async transaction<T>(fn: (exec: PgExecutor) => Promise<T>, _opts?: { signal?: AbortSignal }): Promise<T> {
     const work = this.clone(this.state);
-    const result = await fn(makeExec(work, this.isolation));
+    const result = await fn(makeExec(work, this.isolation, this.queryHook));
     if (this.crashBeforeCommit) { this.crashBeforeCommit = false; throw new Error('crash before commit'); }
     this.state = work;
     return result;
@@ -64,11 +65,12 @@ class MemoryPg implements PgTransactor {
   holdLease(streamId: string): void { this.state.lease.set(streamId, { token: 'someone-else', until: CLOCK + 1_000_000 }); }
 }
 
-function makeExec(s: State, isolation: string): PgExecutor {
+function makeExec(s: State, isolation: string, queryHook?: (sql: string) => Promise<void>): PgExecutor {
   const now = () => CLOCK++;
   let pinned = 'public';
   return {
     async query(sql: string, params: unknown[] = []) {
+      await queryHook?.(sql);
       const P = params as string[];
       const out = (rows: Record<string, unknown>[], rc?: number) => ({ rows, rowCount: rc ?? rows.length });
       if (sql.includes('SHOW transaction_isolation')) return out([{ transaction_isolation: isolation }]);
@@ -115,7 +117,7 @@ const sanitizer: MutationSanitizer<Raw, Clean> = {
   assertSanitized(c): asserts c is SanitizedMutation<Clean> { if (!c || typeof c !== 'object' || 'secret' in (c as object)) throw new ContractValidationError('unsanitized'); },
 };
 const applied: string[] = [];
-const applier: MutationApplier<Clean> = { async applyInTx(_e, r) { applied.push(`${r.sequence}:${(r.mutation as Clean).pairId}`); } };
+const applier: MutationApplier<Clean> = { async applyInTx(_e, r) { expect(Object.isFrozen(r)).toBe(true); expect(Object.isFrozen(r.mutation)).toBe(true); applied.push(`${r.sequence}:${(r.mutation as Clean).pairId}`); } };
 const SID = 'bpc:pair:default/v1';
 const tok = (d: MemoryPg) => __unsafeMintReadyTokenForTests(d, 'public');
 const RECEIVER_ID = 'receiver-A', KEY_ID = 'k1';
@@ -124,6 +126,7 @@ const sign = (r: OutboxRecord<unknown>, decision: ReceiverDecision) => `${KEY_ID
 const receiptFor = (r: OutboxRecord<unknown>, decision: ReceiverDecision): AckReceipt => ({ streamId: r.streamId, sourceEpoch: r.sourceEpoch, sequence: r.sequence, opDigest: r.opDigest, decision, receiverId: RECEIVER_ID, keyId: KEY_ID, issuedAt: 'now', signature: sign(r, decision) });
 const verifier: AckReceiptVerifier = {
   async verify(receipt, record) {
+    expect(Object.isFrozen(receipt)).toBe(true); expect(Object.isFrozen(record)).toBe(true); expect(Object.isFrozen(record.mutation)).toBe(true);
     if (receipt.receiverId !== RECEIVER_ID || receipt.keyId !== KEY_ID) throw new ContractValidationError('unknown/unauthorized receiver');
     if (receipt.signature !== sign(record, receipt.decision)) throw new ContractValidationError('bad ACK signature (forged/unsigned or decision not covered)');
   },
@@ -146,6 +149,38 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
     const h = await outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'p1', secret: 'X' }, fenceToken: 0n }));
     expect(h.sequence).toBe(1); expect(h.fenceToken).toBe('0'); expect(db.rowCount(SID)).toBe(1);
     expect('secret' in (db.state.rows[0].mutation as object)).toBe(false);
+  });
+  it('snapshots raw append input before the first awaited query (TOCTOU)', async () => {
+    const entered = deferred(); const release = deferred();
+    db.queryHook = async (sql) => { if (sql.includes('SELECT fence_token')) { entered.resolve(); await release.promise; } };
+    const raw = { pairId: 'ORIGINAL', secret: 'X' };
+    const pending = outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: raw, fenceToken: 0n }));
+    await entered.promise;
+    raw.pairId = 'EVIL'; raw.secret = 'CHANGED';
+    release.resolve(); await pending;
+    expect(db.rowsOf(SID)[0].mutation).toEqual({ pairId: 'ORIGINAL' });
+  });
+  it('rejects proxy/accessor append inputs before any outbox query', async () => {
+    const queries: string[] = [];
+    db.queryHook = async (sql) => { queries.push(sql); };
+    const proxied = new Proxy({ pairId: 'p1' }, {});
+    await expect(outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: proxied, fenceToken: 0n }))).rejects.toThrow(/proxy/);
+    const accessor = Object.defineProperty({}, 'pairId', { enumerable: true, get: () => 'p1' }) as Raw;
+    await expect(outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: accessor, fenceToken: 0n }))).rejects.toThrow(/accessor/);
+    // Transaction setup necessarily queries before the callback; neither malformed
+    // input reaches the outbox fence/admission queries or commits a row.
+    expect(queries.some((sql) => sql.includes('ha_outbox_fence'))).toBe(false); expect(db.rowCount(SID)).toBe(0);
+  });
+  it('rejects an invalid tx before sanitizer or input inspection', async () => {
+    let sanitizerCalls = 0, proxyTraps = 0;
+    const guardedSanitizer: MutationSanitizer<Raw, Clean> = {
+      sanitize(raw) { sanitizerCalls++; return sanitizer.sanitize(raw); },
+      assertSanitized: sanitizer.assertSanitized,
+    };
+    const guarded = new PgDurableOutbox(db, tok(db), { streamId: SID, sanitizer: guardedSanitizer, maxPendingRows: 100, backpressure: 'fail-authoritative-mutation' });
+    const input = new Proxy({ streamId: SID, rawMutation: { pairId: 'p1' }, fenceToken: 0n }, { getPrototypeOf(target) { proxyTraps++; return Reflect.getPrototypeOf(target); } });
+    await expect(guarded.appendInTx({} as never, input)).rejects.toThrow(/transaction|bound|expired/i);
+    expect(sanitizerCalls).toBe(0); expect(proxyTraps).toBe(0); expect(db.rowCount(SID)).toBe(0);
   });
   it('CRASH before commit rolls back mutation + sequence', async () => {
     db.crashBeforeCommit = true;
@@ -184,6 +219,24 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
     expect(await apply(rcv, tampered)).toBe('reject-fork');
     expect(applied.length).toBe(0);
   });
+  it('snapshots the complete delivered record before transaction awaits (TOCTOU)', async () => {
+    db.provision('r-snapshot/v1', 'e1'); const rcv = rcvFor('r-snapshot/v1');
+    const entered = deferred(); const release = deferred();
+    db.queryHook = async (sql) => { if (sql.includes('SHOW transaction_isolation')) { entered.resolve(); await release.promise; } };
+    const record = mk('r-snapshot/v1', 1, { pairId: 'ORIGINAL' });
+    const pending = apply(rcv, record);
+    await entered.promise;
+    (record.mutation as Clean).pairId = 'EVIL'; record.opDigest = 'f'.repeat(64);
+    release.resolve();
+    expect(await pending).toBe('applied');
+    expect(applied).toEqual(['1:ORIGINAL']);
+  });
+  it('rejects an invalid receiver tx before inspecting a hostile record', async () => {
+    db.provision('r-invalid-tx/v1', 'e1'); const rcv = rcvFor('r-invalid-tx/v1'); let traps = 0;
+    const hostile = new Proxy(mk('r-invalid-tx/v1', 1, { pairId: 'p1' }), { getPrototypeOf(target) { traps++; return Reflect.getPrototypeOf(target); } });
+    await expect(rcv.verifyAndApplyInTx({} as never, hostile)).rejects.toThrow(/transaction|bound|expired/i);
+    expect(traps).toBe(0); expect(applied).toEqual([]);
+  });
   it('#2 fence exact equality — FUTURE, STALE, MISSING all reject-fence', async () => {
     db.provision('r2/v1', 'e1'); const rcv = rcvFor('r2/v1');
     db.setFence('r2/v1', 3n);
@@ -220,7 +273,7 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
   it('(H1) delivers lowest-first and ACKs each on applied/duplicate-ok', async () => {
     await seed(3);
     const order: number[] = [];
-    const pub = pubFor({ async deliverAndAwaitAck(r) { order.push(r.sequence); return receiptFor(r, r.sequence === 2 ? 'duplicate-ok' : 'applied'); } });
+    const pub = pubFor({ async deliverAndAwaitAck(r) { expect(Object.isFrozen(r)).toBe(true); expect(Object.isFrozen(r.mutation)).toBe(true); order.push(r.sequence); return receiptFor(r, r.sequence === 2 ? 'duplicate-ok' : 'applied'); } });
     expect(await pub.drainOnce()).toEqual({ published: 3, acked: 3, quarantined: 0, retriable: false });
     expect(order).toEqual([1, 2, 3]); // strict order
     expect(db.rowsOf(SID).every((r) => r.acked_at !== null)).toBe(true);
@@ -256,6 +309,35 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
     await expect(swapped.drainOnce()).rejects.toThrow(/signature|decision/i);
     expect(db.rowsOf(SID)[0].acked_at).toBeNull();
   });
+  it('snapshots the full ACK before awaiting its verifier (TOCTOU)', async () => {
+    await seed(1);
+    const entered = deferred(); const release = deferred(); let returned!: AckReceipt;
+    const gatedVerifier: AckReceiptVerifier = { async verify(receipt, record) { entered.resolve(); await release.promise; await verifier.verify(receipt, record); } };
+    const pub = pubFor({ async deliverAndAwaitAck(r) { returned = receiptFor(r, 'reject-fork'); return returned; } }, gatedVerifier);
+    const pending = pub.drainOnce();
+    await entered.promise;
+    returned.decision = 'applied'; returned.signature = 'EVIL';
+    release.resolve();
+    const result = await pending;
+    expect(result).toMatchObject({ acked: 0, quarantined: 1 });
+    expect(db.rowsOf(SID)[0].acked_at).toBeNull();
+  });
+
+  it('rejects accessor/inherited transport shapes before verification', async () => {
+    await seed(1);
+    const bad = Object.create({ decision: 'applied' }) as AckReceipt;
+    Object.assign(bad, { streamId: SID, sourceEpoch: 'e1', sequence: 1, opDigest: db.rowsOf(SID)[0].op_digest, receiverId: RECEIVER_ID, keyId: KEY_ID, issuedAt: 'now', signature: 'x' });
+    const pub = pubFor({ async deliverAndAwaitAck() { return bad; } }, { async verify() { throw new Error('must not reach verifier'); } });
+    await expect(pub.drainOnce()).rejects.toThrow(/plain objects|unexpected or missing fields/);
+    expect(db.rowsOf(SID)[0].acked_at).toBeNull();
+  });
+  it('rejects proxy ACK shapes before calling the verifier', async () => {
+    await seed(1); let verified = false;
+    const proxied = new Proxy(receiptFor(mk(SID, 1, { pairId: 'p0' }), 'applied'), {});
+    const pub = pubFor({ async deliverAndAwaitAck() { return proxied; } }, { async verify() { verified = true; } });
+    await expect(pub.drainOnce()).rejects.toThrow(/proxy/);
+    expect(verified).toBe(false); expect(db.rowsOf(SID)[0].acked_at).toBeNull();
+  });
   it('(R4) an unknown/forged receiver decision is fail-closed — not acked, not quarantined', async () => {
     await seed(1);
     const passAll: AckReceiptVerifier = { async verify() {} };
@@ -277,6 +359,13 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
     const pub = pubFor({ async deliverAndAwaitAck(r) { return receiptFor(r, 'applied'); } });
     await expect(pub.drainOnce()).rejects.toThrow(/corrupted outbox row/);
     expect(db.rowsOf(SID)[0].acked_at).toBeNull();
+  });
+  it('snapshots a database row once and rejects a changing proxy before transport', async () => {
+    await seed(1); let reads = 0, transported = false;
+    db.rowsOf(SID)[0].mutation = new Proxy({ pairId: 'p0' }, { get(target, key, receiver) { if (key === 'pairId') return reads++ === 0 ? 'p0' : 'EVIL'; return Reflect.get(target, key, receiver); } });
+    const pub = pubFor({ async deliverAndAwaitAck(r) { transported = true; return receiptFor(r, 'applied'); } });
+    await expect(pub.drainOnce()).rejects.toThrow(/proxy/);
+    expect(transported).toBe(false); expect(db.rowsOf(SID)[0].acked_at).toBeNull();
   });
   it('(H2) single-active lease: a second publisher on the same stream gets nothing while the lease is held', async () => {
     await seed(2);
