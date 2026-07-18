@@ -139,10 +139,10 @@ product or security claims. Git history contains the original wording.
 
 - **Parked:** claiming that the transactional PostgreSQL PairStore alone makes
   every registry workflow atomic or race-free.
-- **Reason:** compound approval currently spans pending consumption and pair
-  creation at the registry API, and several lifecycle paths still use
-  read-modify-write without compare-and-set semantics.
-- **Current claim:** each individual `PgTransactionalPairStore` mutation is
-  atomically coupled to its encrypted durable-outbox record.
-- **Restore only with:** atomic compound approval, transactional/CAS lifecycle
-  updates, concurrency tests, and middleware failure-ordering review.
+- **Reason:** pair approval, rotation, lifecycle updates, and usage claims are
+  now atomic, but the IP failure tracker is still node-local and the two-node
+  PostgreSQL/Redis failover boundary is not proven.
+- **Current claim:** `AtomicPairStore` makes the named pair-authority transitions
+  atomic and couples PostgreSQL changes to compound durable-outbox mutations.
+- **Restore only with:** distributed anomaly aggregation plus issue #16's real
+  two-node drill, snapshot/tail resync, and measured RPO/RTO evidence.

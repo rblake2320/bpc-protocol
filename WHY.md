@@ -194,3 +194,13 @@ catalog attestation and one readiness capability cover both. A schema-version
 advance without a structural migration would create false readiness; the v2 to
 v3 path instead copies and validates legacy data, attests the final catalog,
 and advances the marker atomically.
+## 2026-07-18: Make pair registry lifecycle transitions atomic
+
+Pair lifecycle changes now use an explicit `AtomicPairStore` capability because
+detached read/mutate/write sequences can lose updates, resurrect revoked state,
+double-consume approvals, and oversubscribe request or pair limits. PostgreSQL
+couples each authoritative transition to its durable outbox mutation in one
+SERIALIZABLE transaction. Compound approval and rotation mutations preserve the
+same atomic boundary at the receiver. Legacy stores remain available only as a
+bounded compatibility path; production construction can require the atomic
+capability and fail closed.

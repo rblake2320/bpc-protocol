@@ -226,3 +226,23 @@
   tarball checks, and 34 integrated PostgreSQL 16 checks.
 - This is single-node mechanism evidence. Issue #16 remains open for the real
   two-node PostgreSQL/Redis drill, resynchronization, and measured RPO/RTO.
+## 2026-07-18: Atomic pair registry mechanism
+
+- Added `AtomicPairStore` and production enforcement in `PairRegistry`.
+- Added transactional PostgreSQL approval, mutation, successful-use claim, and
+  rotation operations with compound receiver mutations.
+- Removed fire-and-forget expiry/lock persistence and enforced `maxRequests`
+  with an atomic claim before authorization succeeds.
+- Added concurrent memory-store tests and real PostgreSQL approval, capacity,
+  CAS, usage-cap, and compound receiver evidence.
+- Bound the final successful-use claim to the complete authorization policy
+  snapshot and retained durable expiry/cap reasons for concurrent losers.
+- Added middleware regressions for concurrent scope mutation and the final
+  usage-cap race; neither denial increments the pair's successful-use count.
+- Canonicalized public-key identity identically in middleware, memory, and
+  PostgreSQL claims; absent and explicit-undefined optional JWK metadata no
+  longer creates a false policy mismatch.
+- Validation: 318 server tests, 37 integrated PostgreSQL 16 checks, workspace
+  build/tests, package-boundary suite, and dry-pack all pass.
+- Issue #16 remains open; this is single-node transactional mechanism evidence,
+  not a two-node HA claim.

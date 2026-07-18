@@ -17,6 +17,7 @@ import { verifyBPCRequest } from '../src/middleware.js';
 import { MemoryPairStore, MemoryNonceBackend, MemoryAnomalyStore } from '../src/memory-store.js';
 import { MemoryRateLimiter } from '../src/rate-limiter.js';
 import type { BPCRequestData } from '../src/middleware.js';
+import type { SuccessfulUsePolicy } from '../src/store.js';
 
 // --- Test helpers ---
 
@@ -71,12 +72,13 @@ describe('@bpc/server — verifyBPCRequest', () => {
   let registry: PairRegistry;
   let nonceStore: ServerNonceStore;
   let anomaly: AnomalyEngine;
+  let pairStore: MemoryPairStore;
   let keypair: Awaited<ReturnType<typeof generateKeypair>>;
   let pairId: string;
   let secretHash: string;
 
   beforeEach(async () => {
-    const pairStore = new MemoryPairStore();
+    pairStore = new MemoryPairStore();
     const nonceBackend = new MemoryNonceBackend();
     const anomalyStore = new MemoryAnomalyStore();
 
@@ -123,7 +125,8 @@ describe('@bpc/server — verifyBPCRequest', () => {
     expect('pair' in result).toBe(false);
   });
 
-  it('returns the authorization values actually used when scope mutates concurrently', async () => {
+  it('denies when authorization policy mutates after verification begins', async () => {
+    const replacementKeypair = await generateKeypair();
     let signalNonceCheck!: () => void;
     let releaseNonceCheck!: () => void;
     const nonceCheckStarted = new Promise<void>((resolve) => { signalNonceCheck = resolve; });
@@ -149,17 +152,21 @@ describe('@bpc/server — verifyBPCRequest', () => {
     }), registry, blockingNonceStore, anomaly);
 
     await nonceCheckStarted;
-    await registry.updatePair(pairId, { scope: 'admin', name: 'mutated-after-authorization' });
+    await pairStore.atomicMutate(pairId, (current) => ({
+      ...current,
+      scope: 'admin',
+      mode: 'production',
+      secretHash: 'z'.repeat(43),
+      pubJwk: replacementKeypair.pubJwk,
+      name: 'mutated-after-authorization',
+    }));
     releaseNonceCheck();
 
     const result = await verification;
-    expect(result.ok).toBe(true);
-    expect(result.snapshot?.scope).toBe('read-write');
-    expect(Object.isFrozen(result.snapshot)).toBe(true);
-    expect(() => {
-      (result.snapshot as unknown as { scope: string }).scope = 'admin';
-    }).toThrow(TypeError);
-    expect((await registry.get(pairId))?.scope).toBe('admin');
+    expect(result).toMatchObject({ ok: false, error: 'pair_state_changed_retry' });
+    expect(await registry.get(pairId)).toMatchObject({
+      scope: 'admin', mode: 'production', secretHash: 'z'.repeat(43), requests: 0,
+    });
   });
 
   it('does not authorize a method enabled only by a concurrent scope escalation', async () => {
@@ -580,6 +587,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
     const result = await verifyBPCRequest(req, registry, nonceStore, anomaly);
     expect(result.ok).toBe(false);
     expect(result.error).toBe('pair_expired');
+    expect((await registry.get(expPairId))?.status).toBe('expired');
   });
 
   it('should expire a pair after its maxRequests cap is exhausted', async () => {
@@ -637,6 +645,52 @@ describe('@bpc/server — verifyBPCRequest', () => {
     const cappedPair = await registry.get(cappedPairId);
     expect(cappedPair?.status).toBe('expired');
     expect(cappedPair?.requests).toBe(1);
+  });
+
+  it('persists expiry before returning the early usage-cap denial', async () => {
+    const localStore=new MemoryPairStore(),localRegistry=new PairRegistry(localStore,10,10,true),localNonce=new ServerNonceStore(new MemoryNonceBackend(),120_000),localAnomaly=new AnomalyEngine(new MemoryAnomalyStore());
+    const kp=await generateKeypair(),secret=await hashSecret('already-exhausted'),id=await localRegistry.registerDirect({name:'already-exhausted',scope:'read',mode:'production',secretHash:secret,pubJwk:kp.pubJwk,maxRequests:1});
+    const current=await localRegistry.get(id);await localStore.set({...current!,requests:1,status:'active'});
+    const signed=await buildSignedRequest(kp.privateKey,id,'GET','/api/data',secret);
+    const result=await verifyBPCRequest(makeReqData({pairId:id,signedData:signed.signedData,signature:signed.signature,method:'GET',path:'/api/data',bodyHash:signed.bodyHash}),localRegistry,localNonce,localAnomaly);
+    expect(result).toMatchObject({ok:false,error:'pair_usage_cap_exceeded'});
+    expect((await localRegistry.get(id))?.status).toBe('expired');
+  });
+
+  it('returns the durable usage-cap reason to the concurrent final-cap loser', async () => {
+    class FinalCapRaceStore extends MemoryPairStore {
+      private entered = 0;
+      private release!: () => void;
+      private readonly bothEntered = new Promise<void>((resolve) => { this.release = resolve; });
+      override async claimSuccessfulUse(id:string,at:number,expected:SuccessfulUsePolicy) {
+        this.entered++;
+        if (this.entered === 2) this.release();
+        await this.bothEntered;
+        return super.claimSuccessfulUse(id,at,expected);
+      }
+    }
+    const localStore=new FinalCapRaceStore(),localRegistry=new PairRegistry(localStore,10,10,true),localNonce=new ServerNonceStore(new MemoryNonceBackend(),120_000),localAnomaly=new AnomalyEngine(new MemoryAnomalyStore());
+    const kp=await generateKeypair(),secret=await hashSecret('final-cap-race'),id=await localRegistry.registerDirect({name:'final-cap-race',scope:'read',mode:'production',secretHash:secret,pubJwk:kp.pubJwk,maxRequests:1});
+    const signed=await Promise.all([buildSignedRequest(kp.privateKey,id,'GET','/api/data',secret),buildSignedRequest(kp.privateKey,id,'GET','/api/data',secret)]);
+    const results=await Promise.all(signed.map((request)=>verifyBPCRequest(makeReqData({pairId:id,signedData:request.signedData,signature:request.signature,method:'GET',path:'/api/data',bodyHash:request.bodyHash}),localRegistry,localNonce,localAnomaly)));
+    expect(results.filter((result)=>result.ok)).toHaveLength(1);
+    expect(results.filter((result)=>!result.ok)).toEqual([expect.objectContaining({error:'pair_usage_cap_exceeded'})]);
+    expect(await localRegistry.get(id)).toMatchObject({status:'expired',requests:1});
+  });
+
+  it('denies when expiry elapses or is shortened after the verification snapshot but before the final claim', async () => {
+    class ExpiryRaceStore extends MemoryPairStore {
+      override async claimSuccessfulUse(id:string,at:number,expected:SuccessfulUsePolicy) {
+        await this.atomicMutate(id,(pair)=>({...pair,expiresAt:at-1}));
+        return super.claimSuccessfulUse(id,at,expected);
+      }
+    }
+    const localStore=new ExpiryRaceStore(),localRegistry=new PairRegistry(localStore,10,10,true),localNonce=new ServerNonceStore(new MemoryNonceBackend(),120_000),localAnomaly=new AnomalyEngine(new MemoryAnomalyStore());
+    const kp=await generateKeypair(),secret=await hashSecret('expiry-race'),id=await localRegistry.registerDirect({name:'expiry-race',scope:'read',mode:'production',secretHash:secret,pubJwk:kp.pubJwk,expiresAt:Date.now()+60_000});
+    const signed=await buildSignedRequest(kp.privateKey,id,'GET','/api/data',secret);
+    const result=await verifyBPCRequest(makeReqData({pairId:id,signedData:signed.signedData,signature:signed.signature,method:'GET',path:'/api/data',bodyHash:signed.bodyHash}),localRegistry,localNonce,localAnomaly);
+    expect(result).toMatchObject({ok:false,error:'pair_expired'});
+    expect(await localRegistry.get(id)).toMatchObject({status:'expired',requests:0});
   });
 
   it('should reject a version mismatch', async () => {
@@ -697,7 +751,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
     const raceId1 = await registry1.registerDirect({ name: 'race-1', scope: 'read', mode: 'development', secretHash: sh1, pubJwk: kp1.pubJwk });
     // Manually set failedSigs to lockoutCount without changing status
     const pair1 = await registry1.get(raceId1);
-    if (pair1) { pair1.failedSigs = 10; }
+    if (pair1) { await store1.set({ ...pair1, failedSigs: 10 }); }
     const { signedData: sd1, signature: sig1 } = await buildSignedRequest(kp1.privateKey, raceId1, 'GET', '/api/data', sh1);
     const req1 = makeReqData({ pairId: raceId1, signedData: sd1, signature: sig1, method: 'GET', path: '/api/data' });
     const result = await verifyBPCRequest(req1, registry1, nonceStore1, anomaly1, { sigWindowMs: 60_000, lockoutCount: 10, enableShadowMode: false });
@@ -715,7 +769,7 @@ describe('@bpc/server — verifyBPCRequest', () => {
     const sh2 = await hashSecret('race-guard-secret-2');
     const raceId2 = await registry2.registerDirect({ name: 'race-2', scope: 'read', mode: 'development', secretHash: sh2, pubJwk: kp2.pubJwk });
     const pair2 = await registry2.get(raceId2);
-    if (pair2) { pair2.failedSigs = 10; }
+    if (pair2) { await store2.set({ ...pair2, failedSigs: 10 }); }
     const { signedData: sd2, signature: sig2 } = await buildSignedRequest(kp2.privateKey, raceId2, 'GET', '/api/data', sh2);
     const req2 = makeReqData({ pairId: raceId2, signedData: sd2, signature: sig2, method: 'GET', path: '/api/data' });
     const result2 = await verifyBPCRequest(req2, registry2, nonceStore2, anomaly2, { sigWindowMs: 60_000, lockoutCount: 10, enableShadowMode: true });
@@ -726,6 +780,61 @@ describe('@bpc/server — verifyBPCRequest', () => {
 });
 
 describe('@bpc/server — PairRegistry', () => {
+  it('atomically consumes one pending approval under concurrent approvers', async () => {
+    const store = new MemoryPairStore();
+    const registry = new PairRegistry(store, 10, 10, true);
+    const kp = await generateKeypair();
+    const token = await registry.requestPairing({ name:'atomic', scope:'read', mode:'production', secretHash:await hashSecret('atomic-approval'), pubJwk:kp.pubJwk });
+    const results = await Promise.allSettled([registry.approvePairing(token), registry.approvePairing(token)]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(await registry.listPending()).toHaveLength(0);
+    expect(await registry.list()).toHaveLength(1);
+  });
+
+  it('serializes capacity, lifecycle updates, and successful-use claims', async () => {
+    const store = new MemoryPairStore();
+    const registry = new PairRegistry(store, 1, 10, true);
+    const kp = await generateKeypair();
+    const registration = (name:string) => ({ name, scope:'read' as const, mode:'production' as const, secretHash:'s'.repeat(43), pubJwk:kp.pubJwk, maxRequests:1 });
+    const [a,b] = await Promise.all([registry.requestPairing(registration('a')),registry.requestPairing(registration('b'))]);
+    const approvals = await Promise.allSettled([registry.approvePairing(a),registry.approvePairing(b)]);
+    expect(approvals.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    const pairId = (approvals.find((result): result is PromiseFulfilledResult<string> => result.status === 'fulfilled'))!.value;
+    await Promise.all([registry.updatePair(pairId,{name:'renamed'}),registry.updatePair(pairId,{scope:'admin'})]);
+    expect(await registry.get(pairId)).toMatchObject({name:'renamed',scope:'admin'});
+    expect((await Promise.all([registry.claimSuccessfulUse(pairId),registry.claimSuccessfulUse(pairId)])).filter(Boolean)).toHaveLength(1);
+    expect(await registry.get(pairId)).toMatchObject({requests:1,status:'expired'});
+    await Promise.all([registry.revoke(pairId),registry.updatePair(pairId,{name:'after-revoke'})]);
+    expect(await registry.get(pairId)).toMatchObject({status:'revoked',name:'after-revoke'});
+  });
+
+  it('re-evaluates stale expiry and lock facts under the authority lock', async () => {
+    const store=new MemoryPairStore(),registry=new PairRegistry(store,10,10,true),kp=await generateKeypair(),now=Date.now();
+    const pairId=await registry.registerDirect({name:'stale-facts',scope:'read',mode:'production',secretHash:'s'.repeat(43),pubJwk:kp.pubJwk,expiresAt:now-1});
+    await registry.updatePair(pairId,{expiresAt:now+60_000});
+    expect(await registry.markExpired(pairId,now)).toBe(false);
+    expect((await registry.get(pairId))?.status).toBe('active');
+    const pair=await registry.get(pairId);await store.set({...pair!,failedSigs:10});
+    await store.atomicMutate(pairId,(current)=>({...current,failedSigs:0}));
+    expect(await registry.ensureLocked(pairId,10)).toBe(false);
+    expect((await registry.get(pairId))?.status).toBe('active');
+  });
+
+  it('enforces approval and rotation predicates identically in the memory authority', async () => {
+    const store=new MemoryPairStore(),kp=await generateKeypair(),registration={name:'policy',scope:'read' as const,mode:'production' as const,secretHash:'s'.repeat(43),pubJwk:kp.pubJwk,maxRequests:3,kind:'ghost' as const,canaryClass:'docs' as const};
+    await store.setPending('policy-token',registration,1);
+    await expect(store.approvePending('policy-token',{registration,requestedAt:1},{id:'bad-approval',...registration,name:'other',status:'active',created:2,lastActive:null,requests:0,failedSigs:0},10)).rejects.toThrow(/does not match|initial state/);
+    expect(await store.getPending('policy-token')).toBeDefined();
+    const old={id:'old-policy',...registration,status:'active' as const,created:2,lastActive:null,requests:0,failedSigs:0};await store.set(old);
+    expect(await store.rotatePair(old,{...old,id:'bad-rotation',created:3,cumulativeFailures:0})).toBe(false);
+    expect((await store.get(old.id))?.status).toBe('active');
+  });
+
+  it('requires an atomic store when production enforcement is requested', () => {
+    const legacy = { get:async()=>undefined,set:async()=>{},delete:async()=>{},list:async()=>[],getPending:async()=>undefined,setPending:async()=>{},deletePending:async()=>{},listPending:async()=>[] };
+    expect(() => new PairRegistry(legacy, 10, 10, true)).toThrow(/AtomicPairStore/);
+  });
+
   it('should support approval workflow', async () => {
     const store = new MemoryPairStore();
     const registry = new PairRegistry(store);

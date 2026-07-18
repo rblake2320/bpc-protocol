@@ -6,7 +6,8 @@ export type {
   AnomalyCounters,
 } from './types.js';
 export type { BPCRequestData, BPCServerConfig } from './middleware.js';
-export type { PairStore, NonceStoreBackend, AnomalyStore } from './store.js';
+export type { PairStore, AtomicPairStore, PairAtomicMutation, SuccessfulUseClaim, SuccessfulUsePolicy, NonceStoreBackend, AnomalyStore } from './store.js';
+export { canonicalAuthorizationJwk, successfulUsePolicy, successfulUsePolicyMatches } from './store.js';
 export type { AuditLog, AuditEntry, AuditAction, AuditSeverity } from './audit.js';
 export type { RateLimiter, RateLimitResult } from './rate-limiter.js';
 export type { RotationRequest, RotationResult } from './rotation.js';
@@ -66,6 +67,7 @@ export {
   sealAgentCredentialCacheEntry,
 } from './agent-cache.js';
 export { PairRegistry } from './registry.js';
+export { isAtomicPairStore } from './store.js';
 export type { RedactedPair } from './registry.js';
 export { AnomalyEngine } from './anomaly.js';
 export { NonceStoreUnavailableError, ServerNonceStore } from './nonce-store.js';
