@@ -204,3 +204,19 @@ SERIALIZABLE transaction. Compound approval and rotation mutations preserve the
 same atomic boundary at the receiver. Legacy stores remain available only as a
 bounded compatibility path; production construction can require the atomic
 capability and fail closed.
+
+## 2026-07-18: Authenticate the outbox network attempt, not only the payload
+
+A signed receiver decision proves who authorized a verdict, but it does not by
+itself authorize the network caller or prevent a valid old response from being
+replayed into a later delivery attempt. The transport therefore authenticates
+the raw request before parsing, durably consumes a nonce, and binds the response
+MAC to that exact request nonce and body digest. A lost response is retried and
+reconciled through receiver idempotency rather than guessed.
+
+Attestation without a lock leaves a catalog-inspection-to-write race, so nonce
+admission locks the table before inspection and retains that lock through the
+insert. Likewise, quarantining one ordered mutation without blocking later
+sequence numbers would convert a terminal authentication failure into an
+ordering gap. The earliest unacknowledged row therefore remains authoritative
+even after it is quarantined; recovery must be explicit rather than skip-based.

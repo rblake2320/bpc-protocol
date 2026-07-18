@@ -146,3 +146,14 @@ product or security claims. Git history contains the original wording.
   atomic and couples PostgreSQL changes to compound durable-outbox mutations.
 - **Restore only with:** distributed anomaly aggregation plus issue #16's real
   two-node drill, snapshot/tail resync, and measured RPO/RTO evidence.
+
+## P-015: Same-host authenticated transport as production HA
+
+- **Parked:** describing the authenticated loopback two-PostgreSQL drill as
+  independent-network HA, failover, or split-brain proof.
+- **Reason:** the transport and state stores are real, but the CI services share
+  one host and the slice does not promote a receiver or test an external fence.
+- **Current claim:** authenticated independent-state replication survives lost
+  ACK and receiver database reconnection and converges without duplicate apply.
+- **Restore only with:** issue #16's external-fence, partition, promotion,
+  snapshot-and-tail, restart, and measured RPO/RTO acceptance matrix.

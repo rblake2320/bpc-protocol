@@ -200,6 +200,21 @@ export type {
   SchemaReadyToken,
 } from './ha-outbox-pg.js';
 export {
+  BPC_TRANSPORT_NONCE_SCHEMA,
+  AckVerificationUnavailableError,
+  HttpOutboxTransport,
+  OutboxTransportError,
+  PgReplayNonceStore,
+  createHttpOutboxReceiver,
+} from './http-outbox-transport.js';
+export type {
+  FetchLike,
+  FetchResponseLike,
+  HttpOutboxReceiverOptions,
+  HttpOutboxTransportOptions,
+  PgReplayNonceStoreOptions,
+} from './http-outbox-transport.js';
+export {
   PgPairMutationApplier,
   PgTransactionalPairStore,
   Aes256GcmPairPayloadCodec,

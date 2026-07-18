@@ -4,6 +4,21 @@ All notable changes to BPC Protocol are documented in this file.
 
 ## [Unreleased] -- 2026-07-16
 
+- Added an authenticated, replay-resistant HTTP durable-outbox transport with
+  exact-path authorization, bounded raw-body verification, durable receiver
+  nonces, request-attempt-bound response MACs, and decision-bound receipts.
+- Replaced the two-PostgreSQL drill's in-process adapter with a real loopback
+  HTTP hop. The drill records receiver lag and convergence time and proves zero
+  missing acknowledged rows after ACK loss and receiver-database reconnection.
+- Locked the replay table before per-request catalog attestation and held that
+  lock through nonce insertion; exact index definitions are attested rather
+  than inferred from their count.
+- Made a terminal quarantine the durable ordered-stream barrier so a restarted
+  publisher cannot skip the failed row and dispatch later sequence numbers.
+- Kept issue #16 open: same-host loopback does not prove external promotion
+  fencing, split-brain denial, snapshot-and-tail resynchronization, or
+  independent network/failure-domain availability.
+
 - Made the heterogeneous-horizon regression use a controlled clock and retain
   an exact 1000ms quarantine assertion; host scheduling can no longer turn the
   assertion into a false 999ms failure. Clock restoration is protected even if

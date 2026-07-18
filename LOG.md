@@ -246,3 +246,19 @@
   build/tests, package-boundary suite, and dry-pack all pass.
 - Issue #16 remains open; this is single-node transactional mechanism evidence,
   not a two-node HA claim.
+
+## 2026-07-18: Authenticated two-state replication hop
+
+- Added the production HTTP implementation of `OutboxTransport` and a bounded
+  receiver handler. Request authentication binds the exact method/path and raw
+  body digest before a durable nonce is consumed and semantic parsing begins.
+- Bound each response to the fresh request attempt in addition to the existing
+  signed receiver decision. Lost replies remain ambiguous and retriable; they
+  never fabricate an acknowledgement.
+- Locked the durable nonce table before its per-request catalog attestation and
+  held the lock through nonce insertion, closing the concurrent-DDL gap.
+- Made a terminally quarantined row the durable ordered-stream barrier, so a
+  fresh publisher cannot skip it and deliver later operations.
+- Replaced the two-PostgreSQL drill's in-process adapter with the authenticated
+  socket path and recorded zero post-convergence loss plus convergence time.
+- This is bounded mechanism evidence; issue #16 remains open.

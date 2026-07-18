@@ -36,6 +36,8 @@ for (const workspace of workspaces) {
     const direct = await import(pathToFileURL(path.resolve(packageDir, 'dist/ha-outbox-pg.js')).href);
     const names = [...Object.keys(runtime), ...Object.keys(direct)];
     assert(!names.some((name) => /unsafe.*mint|mint.*ready.*test/i.test(name)), '@bpc/server publishes a readiness-token bypass');
+    assert(!('MemoryReplayNonceStore' in runtime) && !('createMemoryReplayNonceStoreForTests' in runtime),
+      '@bpc/server publishes a non-durable replay authority');
   }
   passed++;
   console.log(`  PASS ${manifest.name} entry points exist and import`);
