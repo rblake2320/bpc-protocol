@@ -19,9 +19,12 @@ transaction. Approval and rotation use compound mutations, so a receiver cannot
 commit only half of either authority transition.
 
 The final successful-use claim rechecks the current `expiresAt` and usage cap
-under the same authority lock. A concurrent expiry or policy change therefore
-returns a typed denial and durably expires the pair instead of authorizing from
-the earlier verification snapshot.
+under the same authority lock. It also binds the authorization-relevant policy
+captured by verification: status, scope, mode, secret/key identity, expiry,
+usage cap, pair kind, and canary class. Concurrent expiry or cap exhaustion
+returns its durable terminal reason; any other policy mismatch returns a typed
+state-change denial without incrementing usage. The request is never authorized
+from a stale verification snapshot.
 
 Construct `PairRegistry` with `requireAtomic=true` for production. The legacy
 fallback remains for bounded single-writer adapters and is not a concurrency

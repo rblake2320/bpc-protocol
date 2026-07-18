@@ -235,7 +235,11 @@
   with an atomic claim before authorization succeeds.
 - Added concurrent memory-store tests and real PostgreSQL approval, capacity,
   CAS, usage-cap, and compound receiver evidence.
-- Validation: 317 server tests, 36 integrated PostgreSQL 16 checks, workspace
+- Bound the final successful-use claim to the complete authorization policy
+  snapshot and retained durable expiry/cap reasons for concurrent losers.
+- Added middleware regressions for concurrent scope mutation and the final
+  usage-cap race; neither denial increments the pair's successful-use count.
+- Validation: 318 server tests, 36 integrated PostgreSQL 16 checks, workspace
   build/tests, package-boundary suite, and dry-pack all pass.
 - Issue #16 remains open; this is single-node transactional mechanism evidence,
   not a two-node HA claim.

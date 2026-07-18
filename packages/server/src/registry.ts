@@ -27,7 +27,7 @@
  */
 
 import { generateId } from '@bpc/core';
-import { isAtomicPairStore, type AtomicPairStore, type PairStore, type SuccessfulUseClaim } from './store.js';
+import { isAtomicPairStore, successfulUsePolicy, successfulUsePolicyMatches, type AtomicPairStore, type PairStore, type SuccessfulUseClaim, type SuccessfulUsePolicy } from './store.js';
 import type { StoredPair, PairRegistration } from './types.js';
 
 /** Minimum secretHash length: 43 chars = 256-bit HKDF output in base64url. */
@@ -389,16 +389,19 @@ export class PairRegistry {
   }
 
   /**
-   * Atomically claim one successful authorization use. A false result means
-   * the usage cap was already exhausted by a concurrent request.
+   * Atomically claim one successful authorization use against a freshly
+   * captured policy. False includes any concurrent terminal or policy change.
    */
   async claimSuccessfulUse(pairId: string): Promise<boolean> {
-    return (await this.claimSuccessfulUseOutcome(pairId, Date.now())) === 'claimed';
+    const pair = await this.store.get(pairId);
+    if (!pair) return false;
+    return (await this.claimSuccessfulUseOutcome(pairId, Date.now(), successfulUsePolicy(pair))) === 'claimed';
   }
 
-  async claimSuccessfulUseOutcome(pairId: string, at: number): Promise<SuccessfulUseClaim> {
+  async claimSuccessfulUseOutcome(pairId: string, at: number, expected: SuccessfulUsePolicy): Promise<SuccessfulUseClaim> {
+    const captured = structuredClone(expected);
     if (this.atomicStore) {
-      const outcome = await this.atomicStore.claimSuccessfulUse(pairId, at);
+      const outcome = await this.atomicStore.claimSuccessfulUse(pairId, at, captured);
       if (outcome === 'claimed') {
         for (const key of this.ipFailureTracker.keys()) {
           if (key.startsWith(`${pairId}:`)) this.ipFailureTracker.delete(key);
@@ -407,18 +410,31 @@ export class PairRegistry {
       return outcome;
     }
     let claimed = false;
+    let outcome: SuccessfulUseClaim = 'inactive';
     const claim = (source: Readonly<StoredPair>): StoredPair => {
       const pair = structuredClone(source) as StoredPair;
+      if (pair.status === 'expired') {
+        if (pair.expiresAt !== undefined && pair.expiresAt < at) outcome = 'time-expired';
+        else if (pair.maxRequests && pair.maxRequests > 0 && pair.requests >= pair.maxRequests) outcome = 'usage-exhausted';
+        return pair;
+      }
       if (pair.status !== 'active') return pair;
       if (pair.expiresAt !== undefined && pair.expiresAt < at) {
         pair.status = 'expired';
+        outcome = 'time-expired';
         return pair;
       }
       if (pair.maxRequests && pair.maxRequests > 0 && pair.requests >= pair.maxRequests) {
         pair.status = 'expired';
+        outcome = 'usage-exhausted';
+        return pair;
+      }
+      if (!successfulUsePolicyMatches(pair, captured)) {
+        outcome = 'policy-changed';
         return pair;
       }
       claimed = true;
+      outcome = 'claimed';
       pair.requests++;
       pair.lastActive = at;
       pair.failedSigs = 0;
@@ -436,7 +452,7 @@ export class PairRegistry {
         if (key.startsWith(`${pairId}:`)) this.ipFailureTracker.delete(key);
       }
     }
-    return claimed ? 'claimed' : pair ? (pair.expiresAt !== undefined && pair.expiresAt < at ? 'time-expired' : pair.maxRequests && pair.maxRequests > 0 && pair.requests >= pair.maxRequests ? 'usage-exhausted' : 'inactive') : 'missing';
+    return pair ? outcome : 'missing';
   }
 
   /**

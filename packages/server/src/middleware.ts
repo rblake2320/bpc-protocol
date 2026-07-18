@@ -41,6 +41,7 @@ import type { ServerNonceStore } from './nonce-store.js';
 import type { AnomalyEngine } from './anomaly.js';
 import type { RateLimiter } from './rate-limiter.js';
 import type { AuditLog } from './audit.js';
+import type { SuccessfulUsePolicy } from './store.js';
 import { AuthorizationQuarantineError, type ContinuityGate } from './redis-continuity.js';
 
 export interface BPCRequestData {
@@ -429,7 +430,18 @@ export async function verifyBPCRequest(
     return { ok: false, pairId: req.pairId, error: 'ghost_pair_denied', shadow: true, tarpitDelayMs: delayMs };
   }
 
-  const useClaim = await registry.claimSuccessfulUseOutcome(req.pairId, Date.now());
+  const expectedUsePolicy: SuccessfulUsePolicy = {
+    status: auth.status,
+    scope: auth.scope,
+    mode: auth.mode,
+    secretHash: auth.secretHash,
+    pubJwk: auth.pubJwk,
+    expiresAt: auth.expiresAt,
+    maxRequests: auth.maxRequests,
+    kind: auth.kind,
+    canaryClass: auth.canaryClass,
+  };
+  const useClaim = await registry.claimSuccessfulUseOutcome(req.pairId, Date.now(), expectedUsePolicy);
   if (useClaim === 'time-expired') return deny('pair_expired');
   if (useClaim === 'usage-exhausted') return deny('pair_usage_cap_exceeded');
   if (useClaim !== 'claimed') return deny('pair_state_changed_retry');

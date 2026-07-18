@@ -21,7 +21,20 @@ export type PairAtomicMutation = (
   current: Readonly<StoredPair>,
 ) => StoredPair | undefined;
 
-export type SuccessfulUseClaim = 'claimed' | 'missing' | 'inactive' | 'time-expired' | 'usage-exhausted';
+export type SuccessfulUseClaim = 'claimed' | 'missing' | 'inactive' | 'policy-changed' | 'time-expired' | 'usage-exhausted';
+
+/** Authorization-relevant state that must still match at final use claim. */
+export interface SuccessfulUsePolicy {
+  readonly status: StoredPair['status'];
+  readonly scope: StoredPair['scope'];
+  readonly mode: StoredPair['mode'];
+  readonly secretHash: string;
+  readonly pubJwk: JsonWebKey;
+  readonly expiresAt?: number;
+  readonly maxRequests?: number;
+  readonly kind: NonNullable<StoredPair['kind']>;
+  readonly canaryClass?: StoredPair['canaryClass'];
+}
 
 function sameData(left: unknown, right: unknown): boolean {
   if (Object.is(left, right)) return true;
@@ -44,6 +57,32 @@ export function rotationPolicyMatches(oldPair: Readonly<StoredPair>, replacement
   return oldPair.name===replacement.name&&oldPair.scope===replacement.scope&&oldPair.mode===replacement.mode&&oldPair.secretHash===replacement.secretHash&&oldPair.expiresAt===replacement.expiresAt&&oldPair.maxRequests===replacement.maxRequests&&(oldPair.kind??'legitimate')===(replacement.kind??'legitimate')&&oldPair.canaryClass===replacement.canaryClass;
 }
 
+export function successfulUsePolicy(pair: Readonly<StoredPair>): SuccessfulUsePolicy {
+  return {
+    status: pair.status,
+    scope: pair.scope,
+    mode: pair.mode,
+    secretHash: pair.secretHash,
+    pubJwk: structuredClone(pair.pubJwk),
+    expiresAt: pair.expiresAt,
+    maxRequests: pair.maxRequests,
+    kind: pair.kind ?? 'legitimate',
+    canaryClass: pair.canaryClass,
+  };
+}
+
+export function successfulUsePolicyMatches(pair: Readonly<StoredPair>, expected: Readonly<SuccessfulUsePolicy>): boolean {
+  return pair.status === expected.status
+    && pair.scope === expected.scope
+    && pair.mode === expected.mode
+    && pair.secretHash === expected.secretHash
+    && sameData(pair.pubJwk, expected.pubJwk)
+    && pair.expiresAt === expected.expiresAt
+    && pair.maxRequests === expected.maxRequests
+    && (pair.kind ?? 'legitimate') === expected.kind
+    && pair.canaryClass === expected.canaryClass;
+}
+
 /**
  * Pair authority operations that cannot be safely composed from get/set calls.
  * Production registries should require this capability. Legacy PairStore
@@ -58,7 +97,7 @@ export interface AtomicPairStore extends PairStore {
     maxActivePairs: number,
   ): Promise<boolean>;
   rotatePair(expectedOld: StoredPair, replacement: StoredPair): Promise<boolean>;
-  claimSuccessfulUse(pairId: string, at: number): Promise<SuccessfulUseClaim>;
+  claimSuccessfulUse(pairId: string, at: number, expected: SuccessfulUsePolicy): Promise<SuccessfulUseClaim>;
   expireIfElapsed(pairId: string, now: number): Promise<boolean>;
   expireIfUsageExhausted(pairId: string): Promise<boolean>;
   lockIfFailureThreshold(pairId: string, minimumFailures: number): Promise<boolean>;

@@ -1,4 +1,4 @@
-import { hasInitialPairState, pairMatchesRegistration, rotationPolicyMatches, type AtomicPairStore, type PairAtomicMutation, type SuccessfulUseClaim, type NonceStoreBackend, type AnomalyStore } from './store.js';
+import { hasInitialPairState, pairMatchesRegistration, rotationPolicyMatches, successfulUsePolicyMatches, type AtomicPairStore, type PairAtomicMutation, type SuccessfulUseClaim, type SuccessfulUsePolicy, type NonceStoreBackend, type AnomalyStore } from './store.js';
 import type { StoredPair, PairRegistration } from './types.js';
 
 export class MemoryPairStore implements AtomicPairStore {
@@ -72,11 +72,16 @@ export class MemoryPairStore implements AtomicPairStore {
     });
   }
 
-  async claimSuccessfulUse(pairId: string, at: number): Promise<SuccessfulUseClaim> {
+  async claimSuccessfulUse(pairId: string, at: number, expected: SuccessfulUsePolicy): Promise<SuccessfulUseClaim> {
     if (!Number.isSafeInteger(at) || at < 0) throw new Error('Successful-use timestamp is invalid');
+    const captured = structuredClone(expected);
     return this.exclusively(() => {
       const current = this.pairs.get(pairId);
       if (!current) return 'missing';
+      if (current.status === 'expired') {
+        if (current.expiresAt !== undefined && current.expiresAt < at) return 'time-expired';
+        if (current.maxRequests && current.maxRequests > 0 && current.requests >= current.maxRequests) return 'usage-exhausted';
+      }
       if (current.status !== 'active') return 'inactive';
       if (current.expiresAt !== undefined && current.expiresAt < at) {
         this.pairs.set(pairId, { ...current, status: 'expired' });
@@ -86,6 +91,7 @@ export class MemoryPairStore implements AtomicPairStore {
         this.pairs.set(pairId, { ...current, status: 'expired' });
         return 'usage-exhausted';
       }
+      if (!successfulUsePolicyMatches(current, captured)) return 'policy-changed';
       const requests = current.requests + 1;
       this.pairs.set(pairId, {
         ...current, requests, lastActive: at, failedSigs: 0,

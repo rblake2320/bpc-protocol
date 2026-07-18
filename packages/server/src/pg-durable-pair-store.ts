@@ -28,7 +28,7 @@ import {
   type PgTransactor,
   type SchemaReadyToken,
 } from './ha-outbox-pg.js';
-import { hasInitialPairState, pairMatchesRegistration, rotationPolicyMatches, type AtomicPairStore, type PairAtomicMutation, type SuccessfulUseClaim } from './store.js';
+import { hasInitialPairState, pairMatchesRegistration, rotationPolicyMatches, successfulUsePolicyMatches, type AtomicPairStore, type PairAtomicMutation, type SuccessfulUseClaim, type SuccessfulUsePolicy } from './store.js';
 import type { PairRegistration, StoredPair } from './types.js';
 
 const PAIR_KEYS = ['id','name','scope','mode','secretHash','pubJwk','status','created','lastActive','requests','failedSigs','cumulativeFailures','firstFailureAt','expiresAt','maxRequests','kind','canaryClass'] as const;
@@ -310,12 +310,17 @@ export class PgTransactionalPairStore implements AtomicPairStore {
       const rotated={...expectedOld,status:'rotated' as const};await upsertPair(e,rotated);await insertPair(e,replacement);return true;
     });
   }
-  async claimSuccessfulUse(pairId:string,at:number):Promise<SuccessfulUseClaim>{
+  async claimSuccessfulUse(pairId:string,at:number,expected:SuccessfulUsePolicy):Promise<SuccessfulUseClaim>{
     if(!ID.test(pairId)||!Number.isSafeInteger(at)||at<0)throw new ContractValidationError('successful-use claim input invalid');
+    const captured=structuredClone(expected);
     return this.outbox.withOutboxTx(async(tx,e)=>{
       const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[pairId])).rows[0];
       if(!row)return 'missing';
       const current=rowToPair(row);
+      if(current.status==='expired'){
+        if(current.expiresAt!==undefined&&current.expiresAt<at)return 'time-expired';
+        if(current.maxRequests&&current.maxRequests>0&&current.requests>=current.maxRequests)return 'usage-exhausted';
+      }
       if(current.status!=='active')return 'inactive';
       if(current.expiresAt!==undefined&&current.expiresAt<at){
         const expired=normalizePair({...current,status:'expired'},false),aad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.set.v1' as const,pairId};
@@ -325,6 +330,7 @@ export class PgTransactionalPairStore implements AtomicPairStore {
         const expired=normalizePair({...current,status:'expired'},false),aad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.set.v1' as const,pairId};
         await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:{kind:aad.kind,pairId,sealed:this.codec.sealPair(expired,aad)},fenceToken:this.opts.fenceToken});await upsertPair(e,expired);return 'usage-exhausted';
       }
+      if(!successfulUsePolicyMatches(current,captured))return 'policy-changed';
       const requests=current.requests+1;
       if(!Number.isSafeInteger(requests))throw new ContractValidationError('pair request counter exhausted');
       const next=normalizePair({...current,requests,lastActive:at,failedSigs:0,cumulativeFailures:0,firstFailureAt:null,status:current.maxRequests&&current.maxRequests>0&&requests>=current.maxRequests?'expired':current.status},false);

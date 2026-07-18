@@ -45,6 +45,7 @@ import {
   prepareLegacyPairAuthorityV2ForMigration,
   provisionSchemaVersion,
   schemaManifest,
+  successfulUsePolicy,
 } from './packages/server/src/index.ts';
 // version-only gate is intentionally NOT in the package index (weaker gate);
 // imported from the module directly only to demonstrate the drift bypass.
@@ -722,8 +723,9 @@ async function main(): Promise<void> {
     assert.equal(await source.expireIfElapsed(pair.id,500),false,'stale expiry fact expired a freshly extended pair');
     assert.equal(await source.lockIfFailureThreshold(pair.id,10),false,'stale failure threshold locked a freshly reset pair');
     assert.equal((await source.get(pair.id))?.status,'active');
-    const claims=await Promise.all([source.claimSuccessfulUse(pair.id,200),source.claimSuccessfulUse(pair.id,201)]);
-    assert.equal(claims.filter((outcome)=>outcome==='claimed').length,1);assert.equal(claims.filter((outcome)=>outcome==='inactive').length,1);
+    const claimPolicy=successfulUsePolicy((await source.get(pair.id))!);
+    const claims=await Promise.all([source.claimSuccessfulUse(pair.id,200,claimPolicy),source.claimSuccessfulUse(pair.id,201,claimPolicy)]);
+    assert.equal(claims.filter((outcome)=>outcome==='claimed').length,1);assert.equal(claims.filter((outcome)=>outcome==='usage-exhausted').length,1);
     const claimedPair=await source.get(pair.id);assert.equal(claimedPair?.requests,1);assert.equal(claimedPair?.status,'expired');assert.equal(claimedPair?.lastActive,claims[0]==='claimed'?200:201);
 
     const r2={...registration,name:'second'},r3={...registration,name:'third'};
@@ -741,9 +743,14 @@ async function main(): Promise<void> {
     assert.equal((await source.get(rotationOld.id))?.status,'rotated');assert.equal((await source.get(rotationNew.id))?.status,'active');
     assert.equal((await pool.query('SELECT status FROM replica.bpc_pairs WHERE id=$1',[rotationOld.id])).rows[0].status,'rotated');
     assert.equal((await pool.query('SELECT status FROM replica.bpc_pairs WHERE id=$1',[rotationNew.id])).rows[0].status,'active');
+    const rotationPolicy=successfulUsePolicy((await source.get(rotationNew.id))!);
+    await source.atomicMutate(rotationNew.id,(current)=>({...current,scope:'read-write'}));
+    assert.equal(await source.claimSuccessfulUse(rotationNew.id,450,rotationPolicy),'policy-changed','final claim authorized after current policy changed');
+    assert.equal((await source.get(rotationNew.id))?.requests,0,'policy-change denial consumed a successful use');
     await source.atomicMutate(rotationNew.id,(current)=>({...current,expiresAt:500}));
-    assert.equal(await source.claimSuccessfulUse(rotationNew.id,501),'time-expired','final claim authorized after current expiry');
-    assert.deepEqual(await source.get(rotationNew.id),{...rotationNew,expiresAt:500,status:'expired'});
+    const expiryPolicy=successfulUsePolicy((await source.get(rotationNew.id))!);
+    assert.equal(await source.claimSuccessfulUse(rotationNew.id,501,expiryPolicy),'time-expired','final claim authorized after current expiry');
+    assert.deepEqual(await source.get(rotationNew.id),{...rotationNew,scope:'read-write',expiresAt:500,status:'expired'});
   });
 
   await check('(atomic registry) receiver approval conflict rolls back pending deletion and checkpoint', async () => {
