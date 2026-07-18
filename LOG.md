@@ -167,3 +167,19 @@
   authorization. Review and an intentional release decision are still required.
 - Rollback: revert the resulting hardening commit; parked wording and rationale
   remain in `PARKED.md`, `WHY.md`, and Git history.
+
+## 2026-07-18: Production PostgreSQL transaction adapter for durable outbox
+
+- Added `NodePostgresTransactor`, enforcing `SERIALIZABLE`, verified `BEGIN`,
+  server-side statement timeout, verified `COMMIT`, and an internal deadline
+  across connection acquisition through commit.
+- Failed, aborted, timed-out, or poisoned connections are destroyed instead of
+  returned to the pool. Disposal failures have explicit observable outcomes.
+- A dispatched `COMMIT` with a lost or malformed response becomes
+  `AmbiguousCommitError` with `committed="unknown"`; callers reconcile by
+  idempotency key instead of blindly retrying.
+- Replaced the real-PostgreSQL harness's bespoke adapter with the production
+  class. Verification: 23 focused adapter tests, 286 server tests, TypeScript
+  build, package dry-run, and 23 real PostgreSQL 16 checks.
+- This is single-node mechanism evidence. Issue #16 remains open for the real
+  two-node PostgreSQL and Redis failover/split-brain drill with measured RPO/RTO.

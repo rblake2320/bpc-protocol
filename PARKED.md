@@ -122,3 +122,15 @@ product or security claims. Git history contains the original wording.
   Redis tests remain responsible for real countdown behavior.
 - **Restore only with:** a deterministic clock supplied by the test harness that
   preserves the same exact semantic assertion.
+
+## P-013: Durable-outbox mechanism as high-availability proof
+
+- **Parked:** describing the PostgreSQL durable-outbox mechanism or its
+  single-node integration as production HA, lossless replication, or measured
+  failover capability.
+- **Reason:** one PostgreSQL service cannot establish behavior during two-node
+  database/Redis failover, split brain, or network partition.
+- **Current claim:** a production PostgreSQL transactor and single-node durable
+  outbox mechanism exist and are tested against real PostgreSQL.
+- **Restore only with:** issue #16's real two-node PostgreSQL and Redis drill,
+  adversarial stale-writer/split-brain cases, and recorded RPO/RTO evidence.

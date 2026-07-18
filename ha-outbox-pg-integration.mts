@@ -32,6 +32,7 @@ import {
   PgDurablePublisher,
   PgPromotionFence,
   PgReceiverCheckpoint,
+  NodePostgresTransactor,
   adoptCurrentSchemaVersion,
   assertSchemaReady,
   attestSchema,
@@ -84,46 +85,28 @@ class EvilDefaultPg implements PgTransactor {
   }
 }
 
-// (R12/R13) A conforming transactor: bounds queries (statement_timeout), VERIFIES
-// the COMMIT command tag (an aborted tx silently turns COMMIT into ROLLBACK),
-// HONORS opts.signal (on abort it DESTROYS the connection immediately — closing
-// the socket breaks a hung in-flight query — instead of unbounded-awaiting
-// ROLLBACK), and DISCARDS the connection on any error/timeout so a poisoned
-// connection is never reused. (A production impl would also issue a PostgreSQL
-// CancelRequest on a side connection and set a socket-level timeout.)
-class RealPg implements PgTransactor {
-  constructor(private readonly level: 'SERIALIZABLE' | 'READ COMMITTED') {}
-  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>, opts?: { signal?: AbortSignal }): Promise<T> {
-    const signal = opts?.signal;
-    for (let attempt = 0; ; attempt++) {
-      const client = await pool.connect();
-      let released = false;
-      const discard = () => { if (!released) { released = true; try { client.release(new Error('discard poisoned/aborted connection')); } catch { /* already gone */ } } };
-      if (signal) { if (signal.aborted) discard(); else signal.addEventListener('abort', discard, { once: true }); }
-      let errored = false;
-      try {
-        await client.query(`BEGIN ISOLATION LEVEL ${this.level}`);
-        await client.query("SET LOCAL statement_timeout = '30000'"); // bound queries at the connection layer
-        const exec: PgExecutor = { query: async (sql, params) => { const r = await client.query(sql, params as unknown[]); return { rows: r.rows, rowCount: r.rowCount ?? 0 }; } };
-        const result = await fn(exec);
-        const c = await client.query('COMMIT');
-        if ((c as { command?: string }).command !== 'COMMIT') { errored = true; throw new Error(`COMMIT did not commit (aborted tx -> ${(c as { command?: string }).command})`); }
-        return result;
-      } catch (e) {
-        errored = true;
-        // bounded rollback — never unbounded-await ROLLBACK on a hung/aborted connection
-        await Promise.race([client.query('ROLLBACK').catch(() => {}), new Promise((r) => setTimeout(r, 1000))]);
-        const code = (e as { code?: string }).code;
-        if ((code === '40001' || code === '40P01') && attempt < 50) { discard(); continue; }
-        throw e;
-      } finally {
-        if (signal) signal.removeEventListener('abort', discard);
-        if (errored) discard(); else if (!released) { released = true; client.release(); }
-      }
+const serial = new NodePostgresTransactor(pool, { maxSerializationRetries: 50 });
+
+/** Deliberately nonconforming negative-test adapter. Production uses
+ * NodePostgresTransactor above; this exists only to prove the mechanism rejects
+ * READ COMMITTED at its runtime assertion. */
+const readCommitted: PgTransactor = {
+  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>): Promise<T> {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      const exec: PgExecutor = { query: async (sql, params) => { const r = await client.query(sql, params as unknown[]); return { rows: r.rows, rowCount: r.rowCount ?? 0 }; } };
+      const value = await fn(exec);
+      await client.query('COMMIT');
+      return value;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      client.release();
     }
-  }
-}
-const serial = new RealPg('SERIALIZABLE');
+  },
+};
 
 interface Raw { pairId: string; secret?: string }
 interface Clean { pairId: string }
@@ -198,7 +181,7 @@ async function main(): Promise<void> {
   await check('READ COMMITTED transactor is rejected; SERIALIZABLE works', async () => {
     const sid = 'sc:iso/v1'; await provision(sid);
     // readiness itself cannot be obtained on a non-serializable transactor
-    await assert.rejects(() => assertSchemaReady(new RealPg('READ COMMITTED'), SCHEMA), /SERIALIZABLE/);
+    await assert.rejects(() => assertSchemaReady(readCommitted, SCHEMA), /SERIALIZABLE/);
     const ok = mkOutbox(serial, sid);
     const h = await ok.withOutboxTx((tx) => ok.appendInTx(tx, { streamId: sid, rawMutation: { pairId: 'p' }, fenceToken: 0n }));
     assert.equal(h.sequence, 1);
@@ -380,7 +363,7 @@ async function main(): Promise<void> {
   await check('(R8/HIGH) readiness token is unforgeable + bound to transactor', async () => {
     const good = await assertSchemaReady(serial, SCHEMA);
     // a token minted for `serial` cannot construct a mechanism on a DIFFERENT transactor
-    const other = new RealPg('SERIALIZABLE');
+    const other = new NodePostgresTransactor(pool);
     assert.throws(() => new PgPromotionFence(other, good), /different PgTransactor/);
     // a forged (non-minted) object is rejected
     assert.throws(() => new PgPromotionFence(serial, {} as unknown as SchemaReadyToken), /forged or foreign/);
@@ -395,7 +378,7 @@ async function main(): Promise<void> {
     // receiverA is bound to `serial` (READY)
     const receiverA = new PgReceiverCheckpoint<Clean>(serial, sid, sanitizer, applierRecording, READY);
     // a token minted for `serial` cannot even CONSTRUCT a receiver on another transactor
-    const serialB = new RealPg('SERIALIZABLE');
+    const serialB = new NodePostgresTransactor(pool);
     assert.throws(() => new PgReceiverCheckpoint<Clean>(serialB, sid, sanitizer, applierRecording, READY), /different PgTransactor/);
     // and a bound tx produced by dbB cannot be fed to receiverA — rejected before any query runs
     const readyB = await assertSchemaReady(serialB, SCHEMA); // same physical DB, distinct transactor identity
@@ -418,7 +401,7 @@ async function main(): Promise<void> {
     const outbox = mkOutbox(serial, sid); // bound to (serial, public)
     const appendInput = { streamId: sid, rawMutation: { pairId: 'x' }, fenceToken: 0n };
     // (a) foreign transactor: a tx produced by dbB fed to outboxA -> reject before any query
-    const serialB = new RealPg('SERIALIZABLE');
+    const serialB = new NodePostgresTransactor(pool);
     const readyB = await assertSchemaReady(serialB, SCHEMA);
     const outboxB = new PgDurableOutbox<Raw, Clean>(serialB, readyB, { streamId: sid, sanitizer, maxPendingRows: 100, backpressure: 'quarantine' });
     await assert.rejects(() => outboxB.withOutboxTx((txB) => outbox.appendInTx(txB, appendInput)), /different transactor/);
@@ -540,6 +523,23 @@ async function main(): Promise<void> {
     assert.deepEqual(appliedOrder, Array.from({ length: N }, (_, i) => i + 1), 'lease steal caused double-apply or out-of-order');
     assert.equal(await unacked(sid), 0, 'lease steal lost rows');
     assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM ha_outbox_quarantine WHERE stream_id=$1', [sid])).rows[0].n), 0);
+  });
+
+  await check('(production adapter) deadline destroys a hung real-PG connection and pool recovers', async () => {
+    const bounded = new NodePostgresTransactor(pool, {
+      statementTimeoutMs: 30_000,
+      transactionTimeoutMs: 150,
+      rollbackTimeoutMs: 50,
+    });
+    const started = Date.now();
+    await assert.rejects(
+      () => bounded.transaction((exec) => exec.query('SELECT pg_sleep(30)')),
+      /transaction deadline exceeded/,
+    );
+    assert.ok(Date.now() - started < 2_000, 'hung query was not bounded by the adapter deadline');
+    const healthy = await pool.query('SELECT 1 AS ok');
+    assert.equal(healthy.rows[0].ok, 1, 'pool did not recover after destroying the timed-out client');
+    assert.equal(pool.waitingCount, 0, 'pool retained waiters after timed-out client destruction');
   });
 
   console.log(`\n# ${passed} checks passed`);

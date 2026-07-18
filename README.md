@@ -60,9 +60,17 @@ $env:BPC_TEST_POSTGRES_URL = "postgresql://bpc_test:password@127.0.0.1:5432/bpc_
 npm run test:postgres
 ```
 
+The durable-outbox PostgreSQL mechanism has a separate mandatory integration:
+
+```powershell
+$env:BPC_TEST_POSTGRES_URL = "postgresql://bpc_test:password@127.0.0.1:5432/bpc_test"
+npm run test:postgres:ha
+```
+
 See [docs/REDIS_NONCE.md](docs/REDIS_NONCE.md) for production wiring and
 [docs/SCOPE_MODEL.md](docs/SCOPE_MODEL.md) for the deliberately closed scope
-model.
+model. See [docs/POSTGRES_TRANSACTOR.md](docs/POSTGRES_TRANSACTOR.md) for
+transaction outcome, deadline, connection-disposal, and deployment boundaries.
 
 `test:adversarial` starts an isolated loopback demo server on an ephemeral port
 and runs the HTTP attack and scope-escalation suites. `test:interop` executes
