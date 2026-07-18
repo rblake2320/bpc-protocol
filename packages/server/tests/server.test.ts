@@ -640,6 +640,16 @@ describe('@bpc/server — verifyBPCRequest', () => {
     expect(cappedPair?.requests).toBe(1);
   });
 
+  it('persists expiry before returning the early usage-cap denial', async () => {
+    const localStore=new MemoryPairStore(),localRegistry=new PairRegistry(localStore,10,10,true),localNonce=new ServerNonceStore(new MemoryNonceBackend(),120_000),localAnomaly=new AnomalyEngine(new MemoryAnomalyStore());
+    const kp=await generateKeypair(),secret=await hashSecret('already-exhausted'),id=await localRegistry.registerDirect({name:'already-exhausted',scope:'read',mode:'production',secretHash:secret,pubJwk:kp.pubJwk,maxRequests:1});
+    const current=await localRegistry.get(id);await localStore.set({...current!,requests:1,status:'active'});
+    const signed=await buildSignedRequest(kp.privateKey,id,'GET','/api/data',secret);
+    const result=await verifyBPCRequest(makeReqData({pairId:id,signedData:signed.signedData,signature:signed.signature,method:'GET',path:'/api/data',bodyHash:signed.bodyHash}),localRegistry,localNonce,localAnomaly);
+    expect(result).toMatchObject({ok:false,error:'pair_usage_cap_exceeded'});
+    expect((await localRegistry.get(id))?.status).toBe('expired');
+  });
+
   it('should reject a version mismatch', async () => {
     const { signedData, signature } = await buildSignedRequest(
       keypair.privateKey, pairId, 'GET', '/api/data', secretHash,
@@ -753,6 +763,18 @@ describe('@bpc/server — PairRegistry', () => {
     expect(await registry.get(pairId)).toMatchObject({requests:1,status:'expired'});
     await Promise.all([registry.revoke(pairId),registry.updatePair(pairId,{name:'after-revoke'})]);
     expect(await registry.get(pairId)).toMatchObject({status:'revoked',name:'after-revoke'});
+  });
+
+  it('re-evaluates stale expiry and lock facts under the authority lock', async () => {
+    const store=new MemoryPairStore(),registry=new PairRegistry(store,10,10,true),kp=await generateKeypair(),now=Date.now();
+    const pairId=await registry.registerDirect({name:'stale-facts',scope:'read',mode:'production',secretHash:'s'.repeat(43),pubJwk:kp.pubJwk,expiresAt:now-1});
+    await registry.updatePair(pairId,{expiresAt:now+60_000});
+    expect(await registry.markExpired(pairId,now)).toBe(false);
+    expect((await registry.get(pairId))?.status).toBe('active');
+    const pair=await registry.get(pairId);await store.set({...pair!,failedSigs:10});
+    await store.atomicMutate(pairId,(current)=>({...current,failedSigs:0}));
+    expect(await registry.ensureLocked(pairId,10)).toBe(false);
+    expect((await registry.get(pairId))?.status).toBe('active');
   });
 
   it('requires an atomic store when production enforcement is requested', () => {

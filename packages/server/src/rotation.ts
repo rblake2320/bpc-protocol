@@ -181,6 +181,9 @@ export async function handleRotation(
     requests:   0,
     failedSigs: 0,
     expiresAt:  oldPair.expiresAt,
+    maxRequests: oldPair.maxRequests,
+    kind: oldPair.kind,
+    canaryClass: oldPair.canaryClass,
   };
   try {
     if (isAtomicPairStore(store)) {

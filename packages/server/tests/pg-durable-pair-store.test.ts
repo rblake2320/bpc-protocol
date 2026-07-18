@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { ContractValidationError } from '../src/ha-outbox-contract.js';
+import { ContractValidationError, type OutboxRecord } from '../src/ha-outbox-contract.js';
 import { generateKeypair } from '@bpc/core';
 import {
   Aes256GcmPairPayloadCodec,
+  PgPairMutationApplier,
   bpcPairMutationSanitizer,
+  type BpcPairMutation,
   type CanonicalPairRegistration,
   type CanonicalStoredPair,
 } from '../src/pg-durable-pair-store.js';
@@ -57,6 +59,15 @@ describe('AES-256-GCM pair payload codec', () => {
     for(const mutation of [approval,rotation]){const wire=JSON.stringify(mutation);expect(wire).not.toContain(p.secretHash);expect(wire).not.toContain('secretHash');}
     expect(()=>bpcPairMutationSanitizer.sanitize({...approval,unexpected:true} as never)).toThrow(/unexpected field/);
     expect(()=>bpcPairMutationSanitizer.sanitize({...rotation,newPairId:p.id} as never)).toThrow(/identities/);
+  });
+
+  it('rejects a compound approval whose sealed pair does not match the pending registration before DML', async () => {
+    const c=codec(),streamId='bpc:pair:test/v1',r=registration(),mismatched={...pair(),name:'different',requests:0,failedSigs:0,lastActive:null,cumulativeFailures:undefined,firstFailureAt:undefined};
+    const mutation=bpcPairMutationSanitizer.sanitize({kind:'bpc.pair.approve.v1',token:'approval-1',requestedAt:10,expectedPending:c.sealRegistration(r,{domain:'bpc-pair-payload',version:'1',streamId,kind:'bpc.pair.approve.v1',token:'approval-1',requestedAt:10}),pairId:mismatched.id,sealed:c.sealPair(mismatched,{domain:'bpc-pair-payload',version:'1',streamId,kind:'bpc.pair.approve.v1',pairId:mismatched.id})});
+    let queries=0;
+    const record={contractVersion:'1',streamId,sourceEpoch:'e1',sequence:1,fenceToken:'0',opDigest:'0'.repeat(64),mutation} as OutboxRecord<BpcPairMutation>;
+    await expect(new PgPairMutationApplier(streamId,{activeKeyId:KEY_ID,resolveKey:()=>KEY}).applyInTx({query:async()=>{queries++;return{rows:[],rowCount:0};}},record)).rejects.toThrow(/does not match pending/);
+    expect(queries).toBe(0);
   });
 
   it('uses a fresh nonce and rejects wrong AAD, key, tag, keyId and identity', () => {

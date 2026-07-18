@@ -65,7 +65,8 @@ export class MemoryPairStore implements AtomicPairStore {
     return this.exclusively(() => {
       const current = this.pairs.get(expectedOld.id);
       if (!current || JSON.stringify(current) !== JSON.stringify(expectedOld)) return false;
-      if (current.status !== 'active' || replacement.status !== 'active' || replacement.requests !== 0 || replacement.failedSigs !== 0 || replacement.lastActive !== null || this.pairs.has(replacement.id)) return false;
+      const policy = (pair: StoredPair) => ({ name:pair.name,scope:pair.scope,mode:pair.mode,secretHash:pair.secretHash,expiresAt:pair.expiresAt,maxRequests:pair.maxRequests,kind:pair.kind??'legitimate',canaryClass:pair.canaryClass });
+      if (current.status !== 'active' || replacement.status !== 'active' || replacement.requests !== 0 || replacement.failedSigs !== 0 || replacement.lastActive !== null || JSON.stringify(policy(current)) !== JSON.stringify(policy(replacement)) || this.pairs.has(replacement.id)) return false;
       this.pairs.set(current.id, { ...structuredClone(current), status: 'rotated' });
       this.pairs.set(replacement.id, structuredClone(replacement));
       return true;
@@ -87,6 +88,35 @@ export class MemoryPairStore implements AtomicPairStore {
         cumulativeFailures: 0, firstFailureAt: null,
         status: current.maxRequests && current.maxRequests > 0 && requests >= current.maxRequests ? 'expired' : current.status,
       });
+      return true;
+    });
+  }
+
+  async expireIfElapsed(pairId: string, now: number): Promise<boolean> {
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error('Expiry check timestamp is invalid');
+    return this.exclusively(() => {
+      const pair = this.pairs.get(pairId);
+      if (!pair || pair.status !== 'active' || pair.expiresAt === undefined || pair.expiresAt >= now) return false;
+      this.pairs.set(pairId, { ...pair, status: 'expired' });
+      return true;
+    });
+  }
+
+  async expireIfUsageExhausted(pairId: string): Promise<boolean> {
+    return this.exclusively(() => {
+      const pair = this.pairs.get(pairId);
+      if (!pair || pair.status !== 'active' || !pair.maxRequests || pair.maxRequests <= 0 || pair.requests < pair.maxRequests) return false;
+      this.pairs.set(pairId, { ...pair, status: 'expired' });
+      return true;
+    });
+  }
+
+  async lockIfFailureThreshold(pairId: string, minimumFailures: number): Promise<boolean> {
+    if (!Number.isSafeInteger(minimumFailures) || minimumFailures < 1) throw new Error('Failure threshold is invalid');
+    return this.exclusively(() => {
+      const pair = this.pairs.get(pairId);
+      if (!pair || pair.status !== 'active' || pair.failedSigs < minimumFailures) return false;
+      this.pairs.set(pairId, { ...pair, status: 'locked' });
       return true;
     });
   }

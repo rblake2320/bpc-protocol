@@ -10,7 +10,8 @@ The capability provides:
 - row-locked pair mutation that preserves unrelated concurrent fields;
 - atomic old-pair disable plus replacement creation during rotation;
 - atomic successful-use claims, including `maxRequests` enforcement; and
-- idempotent persisted expiry, lock, unlock, and revocation transitions.
+- condition-checked persisted expiry/lock transitions that re-evaluate fresh
+  authority state, plus atomic unlock and revocation transitions.
 
 `PgTransactionalPairStore` performs these operations in SERIALIZABLE
 transactions and appends the corresponding durable outbox record in the same
@@ -28,4 +29,3 @@ snapshot/tail resynchronization, and measured RPO/RTO still require the real
 two-node drill. The in-process IP failure tracker also remains node-local; pair
 authority persistence is atomic, but cross-node IP anomaly aggregation is a
 separate concern.
-

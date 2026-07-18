@@ -717,6 +717,11 @@ async function main(): Promise<void> {
       source.atomicMutate(pair.id,(current)=>({...current,scope:'admin'})),
     ]);
     assert.deepEqual(((await source.get(pair.id))&&{name:(await source.get(pair.id))!.name,scope:(await source.get(pair.id))!.scope}),{name:'renamed',scope:'admin'});
+    await source.atomicMutate(pair.id,(current)=>({...current,expiresAt:100,failedSigs:10}));
+    await source.atomicMutate(pair.id,(current)=>({...current,expiresAt:10_000,failedSigs:0}));
+    assert.equal(await source.expireIfElapsed(pair.id,500),false,'stale expiry fact expired a freshly extended pair');
+    assert.equal(await source.lockIfFailureThreshold(pair.id,10),false,'stale failure threshold locked a freshly reset pair');
+    assert.equal((await source.get(pair.id))?.status,'active');
     const claims=await Promise.all([source.claimSuccessfulUse(pair.id,200),source.claimSuccessfulUse(pair.id,201)]);
     assert.equal(claims.filter(Boolean).length,1);
     const claimedPair=await source.get(pair.id);assert.equal(claimedPair?.requests,1);assert.equal(claimedPair?.status,'expired');assert.equal(claimedPair?.lastActive,claims[0]?200:201);

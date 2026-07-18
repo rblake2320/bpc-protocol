@@ -257,7 +257,7 @@ export async function verifyBPCRequest(
 
   const lockoutCount = config.lockoutCount ?? 10;
   if (auth.failedSigs >= lockoutCount) {
-    await registry.ensureLocked(req.pairId);
+    if (!await registry.ensureLocked(req.pairId, lockoutCount)) return deny('pair_state_changed_retry');
     if (shadowEnabled) {
       await anomaly.enterShadowState(req.pairId, sourceIp, 'failedSigs_threshold');
       const delayMs = tarpitEnabled ? await anomaly.applyTarpit(sourceIp, 'shadow') : 0;
@@ -267,10 +267,11 @@ export async function verifyBPCRequest(
   }
 
   if (auth.expiresAt && Date.now() > auth.expiresAt) {
-    await registry.markExpired(req.pairId);
+    if (!await registry.markExpired(req.pairId, Date.now())) return deny('pair_state_changed_retry');
     return deny('pair_expired');
   }
   if (auth.maxRequests && auth.maxRequests > 0 && auth.requests >= auth.maxRequests) {
+    if (!await registry.markUsageExpired(req.pairId)) return deny('pair_state_changed_retry');
     return deny('pair_usage_cap_exceeded');
   }
   if (auth.status !== 'active') return deny('pair_revoked');

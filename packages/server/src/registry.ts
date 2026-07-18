@@ -359,25 +359,33 @@ export class PairRegistry {
   }
 
   /** Persist expiry before returning an expiry denial. */
-  async markExpired(pairId: string): Promise<void> {
+  async markExpired(pairId: string, now = Date.now()): Promise<boolean> {
     if (this.atomicStore) {
-      await this.atomicStore.atomicMutate(pairId, (pair) =>
-        pair.status === 'active' ? { ...pair, status: 'expired' } : { ...pair });
-      return;
+      return this.atomicStore.expireIfElapsed(pairId, now);
     }
     const pair = await this.store.get(pairId);
-    if (pair?.status === 'active') await this.store.set({ ...pair, status: 'expired' });
+    if (pair?.status !== 'active' || pair.expiresAt === undefined || pair.expiresAt >= now) return false;
+    await this.store.set({ ...pair, status: 'expired' });
+    return true;
+  }
+
+  async markUsageExpired(pairId: string): Promise<boolean> {
+    if (this.atomicStore) return this.atomicStore.expireIfUsageExhausted(pairId);
+    const pair = await this.store.get(pairId);
+    if (pair?.status !== 'active' || !pair.maxRequests || pair.maxRequests <= 0 || pair.requests < pair.maxRequests) return false;
+    await this.store.set({ ...pair, status: 'expired' });
+    return true;
   }
 
   /** Idempotently persist a threshold lock before returning a lock denial. */
-  async ensureLocked(pairId: string): Promise<void> {
+  async ensureLocked(pairId: string, minimumFailures: number): Promise<boolean> {
     if (this.atomicStore) {
-      await this.atomicStore.atomicMutate(pairId, (pair) =>
-        pair.status === 'active' ? { ...pair, status: 'locked' } : { ...pair });
-      return;
+      return this.atomicStore.lockIfFailureThreshold(pairId, minimumFailures);
     }
     const pair = await this.store.get(pairId);
-    if (pair?.status === 'active') await this.store.set({ ...pair, status: 'locked' });
+    if (pair?.status !== 'active' || pair.failedSigs < minimumFailures) return false;
+    await this.store.set({ ...pair, status: 'locked' });
+    return true;
   }
 
   /**

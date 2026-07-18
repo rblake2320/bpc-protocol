@@ -36,6 +36,9 @@ export interface AtomicPairStore extends PairStore {
   ): Promise<boolean>;
   rotatePair(expectedOld: StoredPair, replacement: StoredPair): Promise<boolean>;
   claimSuccessfulUse(pairId: string, at: number): Promise<boolean>;
+  expireIfElapsed(pairId: string, now: number): Promise<boolean>;
+  expireIfUsageExhausted(pairId: string): Promise<boolean>;
+  lockIfFailureThreshold(pairId: string, minimumFailures: number): Promise<boolean>;
 }
 
 export function isAtomicPairStore(store: PairStore): store is AtomicPairStore {
@@ -43,7 +46,10 @@ export function isAtomicPairStore(store: PairStore): store is AtomicPairStore {
   return typeof value.atomicMutate === 'function'
     && typeof value.approvePending === 'function'
     && typeof value.rotatePair === 'function'
-    && typeof value.claimSuccessfulUse === 'function';
+    && typeof value.claimSuccessfulUse === 'function'
+    && typeof value.expireIfElapsed === 'function'
+    && typeof value.expireIfUsageExhausted === 'function'
+    && typeof value.lockIfFailureThreshold === 'function';
 }
 
 /** Abstract interface for nonce storage. */
