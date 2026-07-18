@@ -14,6 +14,7 @@
     "test:redis": "tsx redis-nonce-integration.mts",
     "test:postgres": "tsx postgres-store-integration.mts",
     "test:postgres:ha": "tsx ha-outbox-pg-integration.mts",
+    "test:postgres:two-pg": "tsx bpc-two-pg-outbox-drill.mts",
     "test:interop": "tsx cross-language-integration.mts",
     "test:adversarial": "tsx adversarial-integration.mts",
     "test:pack": "npm run build && tsx package-boundary-suite.mts && npm pack --dry-run --workspaces",
