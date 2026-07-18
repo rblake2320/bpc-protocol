@@ -30,11 +30,13 @@
  * attested structure could be mutated under it. #16 stays OPEN.
  */
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { types as utilTypes } from 'node:util';
 import {
   ContractValidationError,
   OutboxBackpressureError,
   StaleFenceError,
   assertHeaderConformant,
+  canonicalize,
   canonicalOpDigest,
   fenceTokenToDecimal,
   type DurableOutbox,
@@ -50,6 +52,79 @@ import {
   type ReceiverDecision,
   type SanitizedMutation,
 } from './ha-outbox-contract.js';
+
+function deepFreezeJson<T>(value: T): T {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreezeJson(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function assertNoProxyGraph(value: unknown, seen = new WeakSet<object>()): void {
+  if (value === null || typeof value !== 'object') return;
+  if (utilTypes.isProxy(value)) throw new ContractValidationError('proxy objects are not accepted at an asynchronous trust boundary');
+  if (seen.has(value)) throw new ContractValidationError('cyclic objects are not canonicalizable');
+  seen.add(value);
+  for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(value))) {
+    if ('value' in descriptor) assertNoProxyGraph(descriptor.value, seen);
+  }
+  seen.delete(value);
+}
+
+/** Canonicalization rejects prototypes, accessors, symbols, sparse arrays and
+ * non-I-JSON values before any asynchronous boundary. Parsing creates a detached
+ * plain-data graph; freezing prevents a collaborator from changing the verified
+ * bytes while an injected signer, transport, verifier or applier is awaited. */
+function snapshotJson<T>(value: T, label: string): T {
+  try {
+    assertNoProxyGraph(value);
+    return deepFreezeJson(JSON.parse(canonicalize(value)) as T);
+  } catch (error) {
+    if (error instanceof ContractValidationError) throw error;
+    throw new ContractValidationError(`${label} is not canonical I-JSON`);
+  }
+}
+
+function assertExactOwnKeys(value: object, expected: readonly string[], label: string): void {
+  if (Object.getOwnPropertySymbols(value).length) throw new ContractValidationError(`${label} has symbol fields`);
+  const actual = Object.getOwnPropertyNames(value).sort();
+  const wanted = [...expected].sort();
+  if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
+    throw new ContractValidationError(`${label} has unexpected or missing fields`);
+  }
+  for (const key of actual) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+    if (!('value' in descriptor) || !descriptor.enumerable) throw new ContractValidationError(`${label} field '${key}' must be an enumerable data property`);
+  }
+}
+
+function snapshotRecord<Clean>(record: OutboxRecord<Clean>): OutboxRecord<Clean> {
+  const snapshot = snapshotJson(record, 'outbox record');
+  assertExactOwnKeys(snapshot as object, ['contractVersion', 'streamId', 'sourceEpoch', 'sequence', 'fenceToken', 'opDigest', 'mutation'], 'outbox record');
+  assertHeaderConformant(snapshot);
+  return snapshot;
+}
+
+function snapshotAppendInput<Raw>(input: { streamId: string; rawMutation: Raw; fenceToken: FenceToken }): {
+  streamId: string; rawMutation: Raw; fenceToken: FenceToken;
+} {
+  if (utilTypes.isProxy(input)) throw new ContractValidationError('append input cannot be a proxy');
+  if (input === null || typeof input !== 'object' || (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null)) {
+    throw new ContractValidationError('append input must be a plain object');
+  }
+  if (Object.getOwnPropertySymbols(input).length) throw new ContractValidationError('append input cannot contain symbol fields');
+  assertExactOwnKeys(input, ['streamId', 'rawMutation', 'fenceToken'], 'append input');
+  for (const key of ['streamId', 'rawMutation', 'fenceToken'] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(input, key);
+    if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) throw new ContractValidationError(`append input field '${key}' must be an enumerable data property`);
+  }
+  const streamId = Object.getOwnPropertyDescriptor(input, 'streamId')!.value as unknown;
+  const rawMutation = Object.getOwnPropertyDescriptor(input, 'rawMutation')!.value as Raw;
+  const fenceToken = Object.getOwnPropertyDescriptor(input, 'fenceToken')!.value as unknown;
+  if (typeof streamId !== 'string' || typeof fenceToken !== 'bigint') throw new ContractValidationError('append input has invalid streamId or fenceToken');
+  return Object.freeze({ streamId, rawMutation: snapshotJson(rawMutation, 'raw mutation'), fenceToken });
+}
 
 /** Backend brand for this implementation — makes a DurableTx from this backend
  *  distinct from any other backend's tx at the type level. */
@@ -650,18 +725,24 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
     tx: PgTx,
     input: { streamId: string; rawMutation: Raw; fenceToken: FenceToken },
   ): Promise<OutboxRecordHeader> {
-    // (R9/R10/HIGH) reject a foreign / stale tx BEFORE any query or mutation.
+    // Reject a forged, foreign or expired capability before inspecting caller
+    // input or invoking its sanitizer.
     const exec = execOfBound(tx, this.db, this.schema);
-    const streamId = input.streamId;
+    // Snapshot and sanitize synchronously before the first await. A caller cannot
+    // mutate raw input while fence/admission/checkpoint queries are pending.
+    const captured = snapshotAppendInput(input);
+    const clean = this.sanitizer.sanitize(captured.rawMutation);
+    const mutation = snapshotJson(clean, 'sanitized mutation') as SanitizedMutation<Clean>;
+    const streamId = captured.streamId;
     if (streamId !== this.opts.streamId) throw new ContractValidationError('streamId mismatch for this outbox');
-    const fenceDecimal = fenceTokenToDecimal(input.fenceToken);
+    const fenceDecimal = fenceTokenToDecimal(captured.fenceToken);
 
     // (h) validate the presented fence token against the authoritative persisted
     // token under a row lock; stale token fails closed.
     const fenceRows = (await exec.query('SELECT fence_token FROM ha_outbox_fence WHERE stream_id = $1 FOR UPDATE', [streamId])).rows;
     if (!fenceRows.length) throw new ContractValidationError('no authoritative fence row — stream not provisioned (fail closed)');
     const persistedFence = BigInt(String(fenceRows[0].fence_token));
-    if (input.fenceToken !== persistedFence) throw new StaleFenceError(input.fenceToken, persistedFence);
+    if (captured.fenceToken !== persistedFence) throw new StaleFenceError(captured.fenceToken, persistedFence);
 
     // (11) admission INSIDE the tx: over the bound → abort the mutation.
     const pending = safeSeq((await exec.query('SELECT count(*)::bigint AS n FROM ha_outbox_rows WHERE stream_id = $1 AND acked_at IS NULL AND quarantined_at IS NULL', [streamId])).rows[0].n, 'pending-count');
@@ -676,8 +757,7 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
     if (cur >= Number.MAX_SAFE_INTEGER) throw new ContractValidationError('source sequence exhausted safe-integer range');
     const nextSeq = cur + 1;
 
-    // (10) sanitize the RAW mutation here (runtime binding); digest the sanitized form.
-    const mutation = this.sanitizer.sanitize(input.rawMutation);
+    // (10) digest the detached, frozen sanitized snapshot captured at entry.
     const opDigest = canonicalOpDigest<Clean>({ streamId, sourceEpoch, sequence: nextSeq, fenceToken: fenceDecimal, mutation });
 
     const ins = await exec.query(
@@ -709,6 +789,19 @@ export interface AckReceipt {
   keyId: string;
   issuedAt: string;
   signature: string;
+}
+
+function snapshotAckReceipt(receipt: AckReceipt): AckReceipt {
+  const snapshot = snapshotJson(receipt, 'ACK receipt');
+  assertExactOwnKeys(snapshot as object, ['streamId', 'sourceEpoch', 'sequence', 'opDigest', 'decision', 'receiverId', 'keyId', 'issuedAt', 'signature'], 'ACK receipt');
+  if (typeof snapshot.streamId !== 'string' || typeof snapshot.sourceEpoch !== 'string' ||
+      !Number.isSafeInteger(snapshot.sequence) || snapshot.sequence < 1 ||
+      typeof snapshot.opDigest !== 'string' || typeof snapshot.decision !== 'string' ||
+      typeof snapshot.receiverId !== 'string' || typeof snapshot.keyId !== 'string' ||
+      typeof snapshot.issuedAt !== 'string' || typeof snapshot.signature !== 'string') {
+    throw new ContractValidationError('ACK receipt has invalid field types');
+  }
+  return snapshot;
 }
 /** (HIGH2/H1) Verifies a receipt is a genuine, authorized acknowledgement of
  *  THIS record AND its `decision`. MUST throw on an invalid signature, an
@@ -841,18 +934,28 @@ export class PgDurablePublisher<Clean> {
       for (;;) {
         const r = await this.nextDeliverable(leaseToken);
         if (!r) break;
-        const sourceEpoch = String(r.source_epoch);
-        const sequence = safeSeq(r.sequence, 'row.sequence');
-        const storedDigest = String(r.op_digest);
-        const mutation = r.mutation as SanitizedMutation<Clean>;
+        // Snapshot the complete database row ONCE before validating it. Reading
+        // a hostile/proxied mutation for digest verification and then again for
+        // delivery would permit two different payloads across that boundary.
+        const row = snapshotJson(r, 'outbox database row');
+        assertExactOwnKeys(row, ['source_epoch', 'sequence', 'fence_token', 'op_digest', 'mutation'], 'outbox database row');
+        const record = snapshotRecord<Clean>({
+          contractVersion: '1',
+          streamId: this.streamId,
+          sourceEpoch: String(row.source_epoch),
+          sequence: safeSeq(row.sequence, 'row.sequence'),
+          fenceToken: String(row.fence_token),
+          opDigest: String(row.op_digest),
+          mutation: row.mutation as SanitizedMutation<Clean>,
+        });
+        const { sourceEpoch, sequence, opDigest: storedDigest, mutation } = record;
         // (#5) fail closed on a corrupted/tampered stored row.
         this.sanitizer.assertSanitized(mutation);
-        const recomputed = canonicalOpDigest<Clean>({ streamId: this.streamId, sourceEpoch, sequence, fenceToken: String(r.fence_token), mutation });
+        const recomputed = canonicalOpDigest<Clean>({ streamId: record.streamId, sourceEpoch, sequence, fenceToken: record.fenceToken, mutation });
         if (!digestEquals(recomputed, storedDigest)) throw new ContractValidationError(`corrupted outbox row: digest mismatch at ${this.streamId}/${sourceEpoch}/${sequence}`);
 
-        const record: OutboxRecord<unknown> = { contractVersion: '1', streamId: this.streamId, sourceEpoch, sequence, fenceToken: String(r.fence_token), opDigest: storedDigest, mutation };
         // deliver OUTSIDE any tx — no DB lock is held across this network call.
-        const receipt = await this.transport.deliverAndAwaitAck(record); // throw → row stays, retried
+        const receipt = snapshotAckReceipt(await this.transport.deliverAndAwaitAck(record)); // throw → row stays, retried
         published++;
         // (HIGH2) verify signature (must cover the decision) came from the authorized receiver…
         await this.ackVerifier.verify(receipt, record); // throw → not acked
@@ -955,7 +1058,8 @@ export class PgReceiverCheckpoint<Clean> implements ReceiverCheckpoint<Clean, Pg
    *  injected, so a record can never be applied against a foreign database.
    *  (R13) deadline-bounded + abort-signalled over the whole tx. */
   async verifyAndApplyDelivered(record: OutboxRecord<Clean>): Promise<ReceiverDecision> {
-    return runScoped(this.scopeDeadlineMs, (signal) => this.db.transaction((exec) => withBoundTx(exec, this.db, this.schema, (tx) => this.verifyAndApplyInTx(tx, record)), { signal }));
+    const captured = snapshotRecord(record);
+    return runScoped(this.scopeDeadlineMs, (signal) => this.db.transaction((exec) => withBoundTx(exec, this.db, this.schema, (tx) => this.verifyAndApplyInTx(tx, captured)), { signal }));
   }
 
   async verifyAndApplyInTx(tx: PgTx, record: OutboxRecord<Clean>): Promise<ReceiverDecision> {
@@ -964,6 +1068,7 @@ export class PgReceiverCheckpoint<Clean> implements ReceiverCheckpoint<Clean, Pg
     // retained past its transaction). A foreign-db, wrong-schema, or stale tx is
     // rejected up front, closing the A-token/B-executor and use-after-tx gaps.
     const exec = execOfBound(tx, this.db, this.schema);
+    record = snapshotRecord(record);
     await enterCriticalTx(exec, this.schema);
     if (record.streamId !== this.streamId) throw new ContractValidationError('streamId mismatch for this receiver');
     assertHeaderConformant(record);

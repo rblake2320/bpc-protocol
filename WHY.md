@@ -169,3 +169,13 @@ The adapter owns a total transaction deadline in addition to the server-side
 statement timeout, verifies command tags, destroys failed connections, and keeps
 serialization retries disabled unless explicitly enabled for replay-safe work.
 The mandatory real-PostgreSQL harness now uses this same production adapter.
+
+## 2026-07-18: Snapshot before awaiting injected collaborators
+
+Cryptographic verification does not help if a caller, transport, database row,
+or verifier can mutate the object being verified while an asynchronous operation
+is pending. Durable-outbox inputs are now converted once to detached canonical
+I-JSON, deep-frozen, and used exclusively after the first await. Capability
+validation still runs first so a forged or expired transaction cannot trigger
+input inspection or sanitizer behavior. This preserves the invariant that the
+stored, digested, delivered, verified, and applied values are the same bytes.

@@ -183,3 +183,15 @@
   build, package dry-run, and 23 real PostgreSQL 16 checks.
 - This is single-node mechanism evidence. Issue #16 remains open for the real
   two-node PostgreSQL and Redis failover/split-brain drill with measured RPO/RTO.
+
+## 2026-07-18: Snapshot asynchronous outbox trust boundaries
+
+- Detached and deep-froze canonical I-JSON snapshots before every asynchronous
+  append, delivery, acknowledgement-verification, and receiver-apply boundary.
+- Rejected proxies, inherited/accessor/symbol fields, unexpected transport
+  fields, non-I-JSON values, and invalid transaction capabilities fail-closed.
+- Fixed a publisher double-read in which a changing database-row object could
+  validate one mutation and deliver another under the original digest.
+- Verification: 40 focused adversarial tests, 295 server tests, TypeScript
+  build, and 23 real PostgreSQL 16 checks. Independent review found no remaining
+  critical, high, or medium snapshot-boundary blocker.
