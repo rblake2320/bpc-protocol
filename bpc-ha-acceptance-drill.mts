@@ -127,7 +127,7 @@ async function main(): Promise<void> {
   redisMembers[1]!.disconnect();await assert.rejects(fenceStore.current(),/no authoritative majority/);
   await redisMembers[1]!.connect();await redisMembers[2]!.connect();assert.equal((await fenceStore.current()).epoch,1);const quorumRecoveryMs=Date.now()-quorumFaultAt;
   const aLeaseExpiry=Date.now()+6_000;
-  const grant1=signSourceLeaseGrant('guard-v1',guardPrivate,{streamId:SID,epoch:1,status:'active',holderNodeId:'node-a',leaseId:'lease-a',commandId:'grant-a1',expiresAtMs:aLeaseExpiry,grantSeq:1,prevDigest:null});
+  const grant1=signSourceLeaseGrant('guard-v1',guardPrivate,{streamId:SID,epoch:1,status:'active',holderNodeId:'node-a',leaseId:'lease-a',commandId:'grant-a1',expiresAtMs:aLeaseExpiry,maxTransactionDurationMs:dbA.maxTransactionDurationMs,grantSeq:1,prevDigest:null});
   await dbA.transaction((exec)=>installSourceLeaseGrant(exec,sourceResolver,grant1));await dbControl.transaction((exec)=>installSourceLeaseGrant(exec,sourceResolver,grant1));
   const binding1={streamId:SID,epoch:1,holderNodeId:'node-a',authoritySystemId:idA,nodeCredentialKeyId:'node-a-hsm',leaseId:'lease-a',grantDigest:grant1.grantDigest,redisClaimDigest:redisFenceRecordDigest(redisA),maxClockSkewMs:25,maxTransactionDurationMs:dbA.maxTransactionDurationMs};
   const makeStoreA=async(binding:typeof binding1)=>createHaPairAuthority(dbA,readyA,{streamId:SID,fenceToken:1n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbA,haReadyA,sourceResolver,binding,fenceStore,nodeAIdentity));
@@ -167,7 +167,7 @@ async function main(): Promise<void> {
   assert.equal(Number((await poolB.query('SELECT sequence FROM ha_outbox_receiver_checkpoint WHERE stream_id=$1',[SID])).rows[0].sequence),3);
   const tampered=structuredClone(snapshotAtC);(tampered.records[0] as {opDigest:string}).opDigest='0'.repeat(64);
   await assert.rejects(importPairSnapshotBundle(dbB,sourceResolver,tampered,bpcPairMutationSanitizer,new PgPairMutationApplier(SID,keyring)),/digest|empty pair authority/);
-  const grant2=signSourceLeaseGrant('guard-v1',guardPrivate,{streamId:SID,epoch:1,status:'active',holderNodeId:'node-a',leaseId:'lease-a',commandId:'renew-a2',expiresAtMs:aLeaseExpiry,grantSeq:2,prevDigest:grant1.grantDigest});
+  const grant2=signSourceLeaseGrant('guard-v1',guardPrivate,{streamId:SID,epoch:1,status:'active',holderNodeId:'node-a',leaseId:'lease-a',commandId:'renew-a2',expiresAtMs:aLeaseExpiry,maxTransactionDurationMs:dbA.maxTransactionDurationMs,grantSeq:2,prevDigest:grant1.grantDigest});
   await dbA.transaction((exec)=>installSourceLeaseGrant(exec,sourceResolver,grant2));await dbControl.transaction((exec)=>installSourceLeaseGrant(exec,sourceResolver,grant2));
   const binding2={...binding1,grantDigest:grant2.grantDigest}; storeA=await makeStoreA(binding2);
   await storeA.set(pair(4));await storeA.set(pair(5));await storeA.set(pair(6));
@@ -181,7 +181,7 @@ async function main(): Promise<void> {
   let entered!:()=>void,released!:()=>void;const enteredP=new Promise<void>(r=>entered=r),releaseP=new Promise<void>(r=>released=r);
   const inFlight=guardedOutbox.withOutboxTx(async(tx,exec)=>{await guardedOutbox.appendInTx(tx,{streamId:SID,rawMutation:{kind:'bpc.pair.delete.v1',pairId:'precommit-probe'},fenceToken:1n});await exec.query('INSERT INTO precommit_probe(id) VALUES(1)');entered();await releaseP;});
   await enteredP;redisMembers[1]!.disconnect();redisMembers[2]!.disconnect();released();await assert.rejects(inFlight,/majority|deadline|connection|closed|quorum/i);assert.equal(Number((await poolA.query('SELECT count(*)::int n FROM precommit_probe')).rows[0].n),0);await redisMembers[1]!.connect();await redisMembers[2]!.connect();
-  const revokedA=signSourceLeaseGrant('guard-v1',guardPrivate,{streamId:SID,epoch:1,status:'revoked',holderNodeId:'node-a',leaseId:'lease-a',commandId:'revoke-a3',expiresAtMs:grant2.expiresAtMs,grantSeq:3,prevDigest:grant2.grantDigest});
+  const revokedA=signSourceLeaseGrant('guard-v1',guardPrivate,{streamId:SID,epoch:1,status:'revoked',holderNodeId:'node-a',leaseId:'lease-a',commandId:'revoke-a3',expiresAtMs:grant2.expiresAtMs,maxTransactionDurationMs:dbA.maxTransactionDurationMs,grantSeq:3,prevDigest:grant2.grantDigest});
   await dbA.transaction(exec=>installSourceLeaseGrant(exec,sourceResolver,revokedA));await dbControl.transaction(exec=>installSourceLeaseGrant(exec,sourceResolver,revokedA));
 
   // Live Redis partition: old A can still reach A-PG, but its control-issued
@@ -202,7 +202,7 @@ async function main(): Promise<void> {
   assert.equal(Number((await poolB.query('SELECT sequence FROM ha_outbox_receiver_checkpoint WHERE stream_id=$1',[SID])).rows[0].sequence),6);
   const evil=signRedisFenceRecord('guard-v1',guardPrivate,{streamId:SID,epoch:2,nodeId:'evil',authoritySystemId:idA,nodeCredentialKeyId:'node-a-hsm',commandId:'split-brain',claimedAtMs:Date.now()});
   await assert.rejects(fenceStore.claim(evil),/conflicting|disagrees|rollback|future/);
-  const grantB=signSourceLeaseGrant('guard-v1',guardPrivate,{streamId:SID,epoch:2,status:'active',holderNodeId:'node-b',leaseId:'lease-b',commandId:'grant-b1',expiresAtMs:Date.now()+60_000,grantSeq:1,prevDigest:null});
+  const grantB=signSourceLeaseGrant('guard-v1',guardPrivate,{streamId:SID,epoch:2,status:'active',holderNodeId:'node-b',leaseId:'lease-b',commandId:'grant-b1',expiresAtMs:Date.now()+60_000,maxTransactionDurationMs:dbB.maxTransactionDurationMs,grantSeq:1,prevDigest:null});
   await dbB.transaction((exec)=>installSourceLeaseGrant(exec,sourceResolver,grantB));
   await promoteReceiverToSource(dbB,sourceResolver,bundle,bpcPairMutationSanitizer,2,E2,sourceResolver,fenced);
   const wrongAuthority=await buildPromotionReadinessAttestation(dbB,fenced,'guard-v1','guard-v1',guardPrivate);await assert.rejects(controller.markActive('promote-b',wrongAuthority,sourceResolver),/independent snapshot authority/);

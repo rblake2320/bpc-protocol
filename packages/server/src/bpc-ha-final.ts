@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS bpc_ha.source_lease (
   lease_id text NOT NULL,
   command_id text NOT NULL,
   expires_at_ms bigint NOT NULL CHECK (expires_at_ms BETWEEN 0 AND ${MAX_MS}),
+  max_transaction_duration_ms bigint NOT NULL CHECK (max_transaction_duration_ms BETWEEN 1 AND 300000),
   grant_seq bigint NOT NULL CHECK (grant_seq BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}),
   prev_digest text CHECK (prev_digest IS NULL OR prev_digest ~ '^[0-9a-f]{64}$'),
   grant_digest text NOT NULL CHECK (grant_digest ~ '^[0-9a-f]{64}$'),
@@ -175,7 +176,7 @@ CREATE TABLE IF NOT EXISTS bpc_ha.schema_meta (
 `.trim();
 
 export const BPC_HA_SCHEMA_VERSION=1;
-export const BPC_HA_SCHEMA_MANIFEST='d467c28dd1fc0be804cfd5f91b60ee3e65d2aeedd1cd631a8e867c7dad2f1c09';
+export const BPC_HA_SCHEMA_MANIFEST='1ddc6704aa83197c50d2872b9898c090c069ae0ac49793292548ac813a0fe9ca';
 const HA_READY_STATE=new WeakMap<object,{db:PgTransactor;manifest:string}>();
 export interface BpcHaReadyToken{readonly __bpcHaReady:never}
 export async function bpcHaSchemaManifest(exec:PgExecutor):Promise<string>{
@@ -192,18 +193,19 @@ async function requireBpcHaReady(token:BpcHaReadyToken,db:PgTransactor):Promise<
 
 export interface SourceLeaseGrant {
   streamId: string; epoch: number; status: 'active' | 'revoked'; holderNodeId: string;
-  leaseId: string; commandId: string; expiresAtMs: number; grantSeq: number;
+  leaseId: string; commandId: string; expiresAtMs: number; maxTransactionDurationMs:number;grantSeq: number;
   prevDigest: string | null; grantDigest: string; keyId: string; signature: string;
 }
 export type BareSourceLeaseGrant = Omit<SourceLeaseGrant, 'grantDigest' | 'keyId' | 'signature'>;
 function leaseMessage(value: BareSourceLeaseGrant, digest: string): Buffer {
   return frame('bpc-source-lease/v1', value.streamId, value.epoch, value.status, value.holderNodeId,
-    value.leaseId, value.commandId, value.expiresAtMs, value.grantSeq, value.prevDigest, digest);
+    value.leaseId, value.commandId, value.expiresAtMs,value.maxTransactionDurationMs, value.grantSeq, value.prevDigest, digest);
 }
 function validateBareLease(value: BareSourceLeaseGrant): void {
   id(value.streamId, STREAM_RE, 'streamId'); id(value.holderNodeId, ID_RE, 'holderNodeId');
   id(value.leaseId, ID_RE, 'leaseId'); id(value.commandId, ID_RE, 'commandId');
   safeInt(value.epoch, 'epoch', 1, MAX_EPOCH); safeInt(value.expiresAtMs, 'expiresAtMs', 0, MAX_MS);
+  safeInt(value.maxTransactionDurationMs,'maxTransactionDurationMs',1,300_000);
   safeInt(value.grantSeq, 'grantSeq', 1);
   if (value.status !== 'active' && value.status !== 'revoked') throw new ContractValidationError('invalid lease status');
   if (value.prevDigest !== null && !HEX64.test(value.prevDigest)) throw new ContractValidationError('invalid prevDigest');
@@ -227,12 +229,13 @@ function leaseFromRow(row: Record<string, unknown>): SourceLeaseGrant {
     status: String(row.status) as SourceLeaseGrant['status'], holderNodeId: String(row.holder_node_id),
     leaseId: String(row.lease_id), commandId: String(row.command_id),
     expiresAtMs: safeInt(row.expires_at_ms, 'expiresAtMs', 0, MAX_MS),
+    maxTransactionDurationMs:safeInt(row.max_transaction_duration_ms,'maxTransactionDurationMs',1,300_000),
     grantSeq: safeInt(row.grant_seq, 'grantSeq', 1), prevDigest: row.prev_digest === null ? null : String(row.prev_digest),
     grantDigest: String(row.grant_digest), keyId: String(row.key_id), signature: String(row.signature),
   };
 }
-const LEASE_COLS = 'stream_id,epoch,status,holder_node_id,lease_id,command_id,expires_at_ms,grant_seq,prev_digest,grant_digest,key_id,signature';
-const leaseValues = (g: SourceLeaseGrant): unknown[] => [g.streamId,g.epoch,g.status,g.holderNodeId,g.leaseId,g.commandId,g.expiresAtMs,g.grantSeq,g.prevDigest,g.grantDigest,g.keyId,g.signature];
+const LEASE_COLS = 'stream_id,epoch,status,holder_node_id,lease_id,command_id,expires_at_ms,max_transaction_duration_ms,grant_seq,prev_digest,grant_digest,key_id,signature';
+const leaseValues = (g: SourceLeaseGrant): unknown[] => [g.streamId,g.epoch,g.status,g.holderNodeId,g.leaseId,g.commandId,g.expiresAtMs,g.maxTransactionDurationMs,g.grantSeq,g.prevDigest,g.grantDigest,g.keyId,g.signature];
 
 export async function installSourceLeaseGrant(exec: PgExecutor, resolver: PublicKeyResolver, grant: SourceLeaseGrant): Promise<void> {
   verifySourceLeaseGrant(resolver, grant);
@@ -249,22 +252,22 @@ export async function installSourceLeaseGrant(exec: PgExecutor, resolver: Public
     throw new ContractValidationError('lease grant does not advance the signed chain');
   }
   if (current && grant.epoch < current.epoch) throw new ContractValidationError('lease epoch regression');
-  const first = (await exec.query('SELECT holder_node_id,lease_id,status FROM bpc_ha.source_lease_history WHERE stream_id=$1 AND epoch=$2 ORDER BY grant_seq LIMIT 1', [grant.streamId, grant.epoch])).rows[0];
-  if (first && (String(first.holder_node_id) !== grant.holderNodeId || String(first.lease_id) !== grant.leaseId)) {
-    throw new ContractValidationError('holder/lease identity cannot pivot within an epoch');
+  const first = (await exec.query('SELECT holder_node_id,lease_id,status,max_transaction_duration_ms FROM bpc_ha.source_lease_history WHERE stream_id=$1 AND epoch=$2 ORDER BY grant_seq LIMIT 1', [grant.streamId, grant.epoch])).rows[0];
+  if (first && (String(first.holder_node_id) !== grant.holderNodeId || String(first.lease_id) !== grant.leaseId||safeInt(first.max_transaction_duration_ms,'epoch transaction window',1,300_000)!==grant.maxTransactionDurationMs)) {
+    throw new ContractValidationError('holder/lease/transaction-window identity cannot pivot within an epoch');
   }
   const revoked = (await exec.query("SELECT 1 FROM bpc_ha.source_lease_history WHERE stream_id=$1 AND epoch=$2 AND status='revoked' LIMIT 1", [grant.streamId, grant.epoch])).rows[0];
   if (revoked && grant.status === 'active') throw new ContractValidationError('revoked epoch cannot reactivate');
   const priorMax=(await exec.query('SELECT max(expires_at_ms)::text value FROM bpc_ha.source_lease_history WHERE stream_id=$1 AND epoch=$2',[grant.streamId,grant.epoch])).rows[0]?.value;
   if(priorMax!==null&&priorMax!==undefined&&grant.expiresAtMs<safeInt(priorMax,'prior maximum expiry',0,MAX_MS))throw new ContractValidationError('lease expiry cannot decrease within an epoch');
   const values = leaseValues(grant);
-  const inserted = await exec.query(`INSERT INTO bpc_ha.source_lease_history (${LEASE_COLS}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, values);
+  const inserted = await exec.query(`INSERT INTO bpc_ha.source_lease_history (${LEASE_COLS}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, values);
   if (inserted.rowCount !== 1) throw new ContractValidationError('lease history insert failed');
   if (!current) {
-    const head = await exec.query(`INSERT INTO bpc_ha.source_lease (${LEASE_COLS}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, values);
+    const head = await exec.query(`INSERT INTO bpc_ha.source_lease (${LEASE_COLS}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, values);
     if (head.rowCount !== 1) throw new ContractValidationError('lease head insert failed');
   } else {
-    const head = await exec.query(`UPDATE bpc_ha.source_lease SET epoch=$2,status=$3,holder_node_id=$4,lease_id=$5,command_id=$6,expires_at_ms=$7,grant_seq=$8,prev_digest=$9,grant_digest=$10,key_id=$11,signature=$12 WHERE stream_id=$1 AND grant_digest=$13`, [...values, current.grantDigest]);
+    const head = await exec.query(`UPDATE bpc_ha.source_lease SET epoch=$2,status=$3,holder_node_id=$4,lease_id=$5,command_id=$6,expires_at_ms=$7,max_transaction_duration_ms=$8,grant_seq=$9,prev_digest=$10,grant_digest=$11,key_id=$12,signature=$13 WHERE stream_id=$1 AND grant_digest=$14`, [...values, current.grantDigest]);
     if (head.rowCount !== 1) throw new ContractValidationError('lease head forward-CAS failed');
   }
 }
@@ -295,7 +298,7 @@ export class PgSourceLeaseFence {
     if (!latest || safeInt(latest.grant_seq, 'latest grantSeq', 1) !== lease.grantSeq || String(latest.grant_digest) !== lease.grantDigest) {
       throw new ContractValidationError('source lease head/history mismatch');
     }
-    if (lease.status !== 'active' || lease.epoch !== this.binding.epoch || lease.holderNodeId !== this.binding.holderNodeId || lease.leaseId !== this.binding.leaseId || lease.grantDigest !== this.binding.grantDigest) {
+    if (lease.status !== 'active' || lease.epoch !== this.binding.epoch || lease.holderNodeId !== this.binding.holderNodeId || lease.leaseId !== this.binding.leaseId || lease.grantDigest !== this.binding.grantDigest||lease.maxTransactionDurationMs!==this.binding.maxTransactionDurationMs) {
       throw new ContractValidationError('source lease binding is stale or revoked');
     }
     const dbNow = safeInt(row.db_now_ms, 'database clock', 0, MAX_MS);
@@ -444,7 +447,7 @@ export class BpcCutoverController {
   }
   private async transition(commandId:string,phase:'FENCED'|'ACTIVE',quorum?:BpcRedisQuorumFenceStore):Promise<CutoverReceipt>{return this.db.transaction(async exec=>{const row=(await exec.query(`SELECT ${CUTOVER_COLS},(extract(epoch FROM pg_catalog.clock_timestamp())*1000)::bigint::text control_now FROM bpc_ha.cutover_head WHERE command_id=$1 FOR UPDATE`,[commandId])).rows[0];if(!row)throw new ContractValidationError('cutover intent missing');const current=cutoverFromRow(row);verifyCutoverReceipt(this.resolver,current);const alreadyFenced=phase==='FENCED'&&(current.phase==='FENCED'||current.phase==='ACTIVE');if(phase==='ACTIVE'&&current.phase==='ACTIVE')return current;if((phase==='FENCED'&&!['PREPARING','FENCED','ACTIVE'].includes(current.phase))||(phase==='ACTIVE'&&current.phase!=='FENCED'))throw new ContractValidationError('cutover phase transition out of order');
       if(phase==='FENCED'){
-        const leaseRow=(await exec.query(`SELECT ${LEASE_COLS} FROM bpc_ha.source_lease WHERE stream_id=$1`,[current.streamId])).rows[0];if(!leaseRow)throw new ContractValidationError('old source lease evidence missing');const lease=leaseFromRow(leaseRow);verifySourceLeaseGrant(this.resolver,lease);if(lease.status!=='revoked'||lease.grantDigest!==current.oldLeaseDigest||lease.epoch!==current.previousEpoch||lease.expiresAtMs!==current.oldLeaseExpiresAtMs)throw new ContractValidationError('old source lease is not exactly revoked');const controlNow=safeInt(row.control_now,'control clock',0,MAX_MS);if(controlNow<lease.expiresAtMs+this.maxClockSkewMs+current.sourceTransactionWindowMs)throw new ContractValidationError('old source lease expiry plus signed transaction window has not been proven');if(!quorum)throw new ContractValidationError('Redis quorum required');const redis=await quorum.currentForControl(CONTROL_REDIS_READ);if(redis.streamId!==current.streamId||redis.epoch!==current.targetEpoch||redis.nodeId!==current.targetNodeId||redis.commandId!==current.commandId||redisFenceRecordDigest(redis)!==current.redisClaimDigest)throw new ContractValidationError('Redis quorum does not match the signed cutover intent');
+        const leaseRow=(await exec.query(`SELECT ${LEASE_COLS} FROM bpc_ha.source_lease WHERE stream_id=$1`,[current.streamId])).rows[0];if(!leaseRow)throw new ContractValidationError('old source lease evidence missing');const lease=leaseFromRow(leaseRow);verifySourceLeaseGrant(this.resolver,lease);if(lease.status!=='revoked'||lease.grantDigest!==current.oldLeaseDigest||lease.epoch!==current.previousEpoch||lease.expiresAtMs!==current.oldLeaseExpiresAtMs||lease.maxTransactionDurationMs!==current.sourceTransactionWindowMs)throw new ContractValidationError('old source lease is not exactly revoked or its transaction window is not bound');const controlNow=safeInt(row.control_now,'control clock',0,MAX_MS);if(controlNow<lease.expiresAtMs+this.maxClockSkewMs+current.sourceTransactionWindowMs)throw new ContractValidationError('old source lease expiry plus signed transaction window has not been proven');if(!quorum)throw new ContractValidationError('Redis quorum required');const redis=await quorum.currentForControl(CONTROL_REDIS_READ);if(redis.streamId!==current.streamId||redis.epoch!==current.targetEpoch||redis.nodeId!==current.targetNodeId||redis.commandId!==current.commandId||redisFenceRecordDigest(redis)!==current.redisClaimDigest)throw new ContractValidationError('Redis quorum does not match the signed cutover intent');
         if(alreadyFenced){const verified=await verifyCutoverChain(exec,this.resolver,current.streamId);const witness=(await exec.query('SELECT epoch,state_digest FROM bpc_ha.epoch_witness WHERE stream_id=$1 FOR SHARE',[current.streamId])).rows[0];if(!verified||verified.stateDigestSigned!==current.stateDigestSigned||!witness||safeInt(witness.epoch,'witnessEpoch',1,MAX_EPOCH)!==current.targetEpoch||String(witness.state_digest)!==current.stateDigestSigned)throw new ContractValidationError('FENCED retry lost its signed PostgreSQL witness');return current;}
       }
       const next=signCutoverReceipt(this.guardKeyId,this.guardKey,{...current,phase,prevStateDigest:current.stateDigestSigned});const vals=cutoverValues(next);if((await exec.query(`INSERT INTO bpc_ha.cutover_history(${CUTOVER_COLS}) VALUES(${vals.map((_,i)=>'$'+(i+1)).join(',')})`,vals)).rowCount!==1)throw new ContractValidationError('cutover history transition failed');if((await exec.query(`UPDATE bpc_ha.cutover_head SET command_id=$2,phase=$3,previous_epoch=$4,target_epoch=$5,target_node_id=$6,target_source_epoch=$7,manifest_digest=$8,final_source_sequence=$9,state_digest=$10,redis_claim_digest=$11,old_lease_digest=$12,old_lease_expires_at_ms=$13,source_transaction_window_ms=$14,prev_state_digest=$15,state_digest_signed=$16,key_id=$17,signature=$18 WHERE stream_id=$1 AND state_digest_signed=$19`,[...vals,current.stateDigestSigned])).rowCount!==1)throw new ContractValidationError('cutover head forward-CAS failed');if(phase==='FENCED'){const witness=await exec.query('UPDATE bpc_ha.epoch_witness SET epoch=$2,state_digest=$3 WHERE stream_id=$1 AND epoch=$4',[next.streamId,next.targetEpoch,next.stateDigestSigned,next.previousEpoch]);if(witness.rowCount!==1)throw new ContractValidationError('epoch witness forward-CAS failed');}return next;});}
