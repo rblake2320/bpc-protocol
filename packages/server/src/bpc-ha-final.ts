@@ -5,9 +5,11 @@
  *
  * These primitives deliberately keep control state in `bpc_ha`, separate from
  * the attested pair/outbox schema. The runtime database role must not hold DDL
- * privileges after provisioning.
+ * privileges after provisioning. Production node-identity provers must use a
+ * non-exportable TPM/HSM key; a software test prover demonstrates the protocol
+ * but does not establish non-clonable custody.
  */
-import { createHash, createPrivateKey, sign as edSign, verify as edVerify, type KeyObject } from 'node:crypto';
+import { createHash, createPrivateKey, randomBytes, sign as edSign, verify as edVerify, type KeyObject } from 'node:crypto';
 import type { Redis } from 'ioredis';
 
 import { ContractValidationError, assertHeaderConformant, canonicalOpDigest, canonicalize, type MutationSanitizer, type OutboxRecord, type SanitizedMutation } from './ha-outbox-contract.js';
@@ -48,6 +50,7 @@ function frame(...parts: (string | number | null)[]): Buffer {
 const sha256 = (value: string | Buffer): string => createHash('sha256').update(value).digest('hex');
 
 export interface PublicKeyResolver { resolve(keyId: string): KeyObject | null }
+export interface NodeIdentityProver{readonly keyId:string;prove(challenge:Uint8Array):Promise<string>}
 function publicKey(resolver: PublicKeyResolver, keyId: string): KeyObject {
   id(keyId, KEY_RE, 'keyId');
   const key = resolver.resolve(keyId);
@@ -73,6 +76,8 @@ function verify(resolver: PublicKeyResolver, keyId: string, message: Buffer, sig
   if (!ok) throw new ContractValidationError('invalid signature');
 }
 function publicKeyFingerprint(resolver:PublicKeyResolver,keyId:string):string{return sha256(publicKey(resolver,keyId).export({format:'der',type:'spki'}));}
+const nodeIdentityMessage=(challenge:Uint8Array)=>Buffer.concat([frame('bpc-node-identity/v1'),Buffer.from(challenge)]);
+export function signNodeIdentityChallenge(keyId:string,key:KeyObject|string,challenge:Uint8Array):string{return sign(keyId,key,nodeIdentityMessage(challenge));}
 
 export const BPC_HA_SCHEMA = `
 CREATE SCHEMA IF NOT EXISTS bpc_ha;
@@ -264,20 +269,20 @@ export async function installSourceLeaseGrant(exec: PgExecutor, resolver: Public
   }
 }
 
-export interface SourceLeaseBinding { streamId: string; epoch: number; holderNodeId: string; authoritySystemId:string; leaseId: string; grantDigest: string; redisClaimDigest:string; maxClockSkewMs: number; maxTransactionDurationMs:number; activationDigest?:string }
+export interface SourceLeaseBinding { streamId: string; epoch: number; holderNodeId: string; authoritySystemId:string; nodeCredentialKeyId:string; leaseId: string; grantDigest: string; redisClaimDigest:string; maxClockSkewMs: number; maxTransactionDurationMs:number; activationDigest?:string }
 const FENCE_CAPABILITIES = new WeakMap<PgSourceLeaseFence, PgTransactor>();
 export class PgSourceLeaseFence {
-  private constructor(private readonly db: PgTransactor, private readonly resolver: PublicKeyResolver, private readonly binding: SourceLeaseBinding,private readonly quorum:BpcRedisQuorumFenceStore) {
+  private constructor(private readonly db: PgTransactor, private readonly resolver: PublicKeyResolver, private readonly binding: SourceLeaseBinding,private readonly quorum:BpcRedisQuorumFenceStore,private readonly nodeIdentity:NodeIdentityProver) {
     id(binding.streamId, STREAM_RE, 'streamId'); id(binding.holderNodeId, ID_RE, 'holderNodeId'); id(binding.leaseId, ID_RE, 'leaseId');
-    if(!/^\d+$/.test(binding.authoritySystemId))throw new ContractValidationError('invalid authoritySystemId');
+    if(!/^\d+$/.test(binding.authoritySystemId))throw new ContractValidationError('invalid authoritySystemId');id(binding.nodeCredentialKeyId,KEY_RE,'nodeCredentialKeyId');if(nodeIdentity.keyId!==binding.nodeCredentialKeyId)throw new ContractValidationError('node identity prover does not match the signed authority binding');
     safeInt(binding.epoch, 'epoch', 1, MAX_EPOCH); safeInt(binding.maxClockSkewMs, 'maxClockSkewMs', 0, 60_000);safeInt(binding.maxTransactionDurationMs,'maxTransactionDurationMs',1,300_000);if(db.maxTransactionDurationMs!==binding.maxTransactionDurationMs)throw new ContractValidationError('source transaction window is not bound to the configured PgTransactor');
     if (!HEX64.test(binding.grantDigest)) throw new ContractValidationError('invalid grantDigest');
     if (!HEX64.test(binding.redisClaimDigest)) throw new ContractValidationError('invalid redisClaimDigest');
     if(binding.epoch>1&&(!binding.activationDigest||!HEX64.test(binding.activationDigest)))throw new ContractValidationError('promoted source requires a signed ACTIVE cutover digest');
   }
-  static async open(db: PgTransactor, ready:BpcHaReadyToken,resolver: PublicKeyResolver, binding: SourceLeaseBinding,quorum:BpcRedisQuorumFenceStore): Promise<PgSourceLeaseFence> {
+  static async open(db: PgTransactor, ready:BpcHaReadyToken,resolver: PublicKeyResolver, binding: SourceLeaseBinding,quorum:BpcRedisQuorumFenceStore,nodeIdentity:NodeIdentityProver): Promise<PgSourceLeaseFence> {
     await requireBpcHaReady(ready,db);
-    const fence = new PgSourceLeaseFence(db, resolver, binding,quorum);
+    const fence = new PgSourceLeaseFence(db, resolver, binding,quorum,nodeIdentity);
     await db.transaction(async(exec) => {await fence.assertWritableInTx(exec);await exec.query('INSERT INTO bpc_ha.authority_stream(stream_id) VALUES($1) ON CONFLICT DO NOTHING',[binding.streamId]);});
     FENCE_CAPABILITIES.set(fence, db);
     return fence;
@@ -296,8 +301,9 @@ export class PgSourceLeaseFence {
     const dbNow = safeInt(row.db_now_ms, 'database clock', 0, MAX_MS);
     if (dbNow + this.binding.maxClockSkewMs >= lease.expiresAtMs) throw new ContractValidationError('source lease expired (fail closed)');
     if(this.binding.epoch>1){const active=(await exec.query('SELECT state_digest_signed,receipt,readiness FROM bpc_ha.source_activation WHERE stream_id=$1 AND epoch=$2',[this.binding.streamId,this.binding.epoch])).rows[0];if(!active||String(active.state_digest_signed)!==this.binding.activationDigest)throw new ContractValidationError('promoted source ACTIVE receipt missing or stale');const receipt=active.receipt as CutoverReceipt,readiness=active.readiness as PromotionReadinessAttestation;verifyCutoverReceipt(this.resolver,receipt);verifyPromotionReadinessAttestation(this.resolver,readiness);if(receipt.phase!=='ACTIVE'||receipt.streamId!==this.binding.streamId||receipt.targetEpoch!==this.binding.epoch||receipt.stateDigestSigned!==this.binding.activationDigest||readiness.fencedDigest!==receipt.prevStateDigest||readiness.targetSystemId!==this.binding.authoritySystemId)throw new ContractValidationError('promoted source ACTIVE/readiness binding invalid');}
-    const redis=await this.quorum.current();if(redis.streamId!==this.binding.streamId||redis.epoch!==this.binding.epoch||redis.nodeId!==this.binding.holderNodeId||redisFenceRecordDigest(redis)!==this.binding.redisClaimDigest)throw new ContractValidationError('external Redis fence authority is missing, stale, or conflicting');
+    const redis=await this.quorum.current();if(redis.streamId!==this.binding.streamId||redis.epoch!==this.binding.epoch||redis.nodeId!==this.binding.holderNodeId||redis.nodeCredentialKeyId!==this.binding.nodeCredentialKeyId||redisFenceRecordDigest(redis)!==this.binding.redisClaimDigest)throw new ContractValidationError('external Redis fence authority is missing, stale, or conflicting');
     const systemId=String((await exec.query('SELECT system_identifier::text value FROM pg_catalog.pg_control_system()')).rows[0]?.value);if(systemId!==this.binding.authoritySystemId||redis.authoritySystemId!==systemId)throw new ContractValidationError('source authority PostgreSQL identity does not match its signed fence');
+    const challenge=frame('bpc-source-write/v1',this.binding.streamId,this.binding.epoch,systemId,this.binding.grantDigest,this.binding.redisClaimDigest,randomBytes(32).toString('base64url'));const proof=await this.nodeIdentity.prove(challenge);verify(this.resolver,this.binding.nodeCredentialKeyId,nodeIdentityMessage(challenge),proof);
   }
 }
 
@@ -308,13 +314,13 @@ export function createHaPairAuthority(db: PgTransactor, ready: SchemaReadyToken,
   return __internalCreateHaPairStore(db, ready, opts, (exec) => fence.assertWritableInTx(exec));
 }
 
-export interface RedisFenceRecord { streamId: string; epoch: number; nodeId: string; authoritySystemId:string; commandId: string; claimedAtMs: number; keyId: string; signature: string }
+export interface RedisFenceRecord { streamId: string; epoch: number; nodeId: string; authoritySystemId:string; nodeCredentialKeyId:string; commandId: string; claimedAtMs: number; keyId: string; signature: string }
 type BareRedisFenceRecord = Omit<RedisFenceRecord, 'keyId' | 'signature'>;
 function redisFenceMessage(value: BareRedisFenceRecord): Buffer {
-  return frame('bpc-redis-fence/v1', value.streamId, value.epoch, value.nodeId,value.authoritySystemId, value.commandId, value.claimedAtMs);
+  return frame('bpc-redis-fence/v1', value.streamId, value.epoch, value.nodeId,value.authoritySystemId,value.nodeCredentialKeyId, value.commandId, value.claimedAtMs);
 }
 export function signRedisFenceRecord(keyId: string, key: KeyObject | string, bare: BareRedisFenceRecord): RedisFenceRecord {
-  id(bare.streamId, STREAM_RE, 'streamId'); id(bare.nodeId, ID_RE, 'nodeId'); id(bare.commandId, ID_RE, 'commandId');if(!/^\d+$/.test(bare.authoritySystemId))throw new ContractValidationError('invalid authoritySystemId');
+  id(bare.streamId, STREAM_RE, 'streamId'); id(bare.nodeId, ID_RE, 'nodeId'); id(bare.commandId, ID_RE, 'commandId');id(bare.nodeCredentialKeyId,KEY_RE,'nodeCredentialKeyId');if(!/^\d+$/.test(bare.authoritySystemId))throw new ContractValidationError('invalid authoritySystemId');
   safeInt(bare.epoch, 'epoch', 1, MAX_EPOCH); safeInt(bare.claimedAtMs, 'claimedAtMs', 0, MAX_MS);
   return { ...bare, keyId, signature: sign(keyId, key, redisFenceMessage(bare)) };
 }
@@ -339,7 +345,7 @@ export class BpcRedisFenceStore {
     let value: unknown; try { value = JSON.parse(raw); } catch { throw new ContractValidationError('BPC_FENCE_CORRUPT'); }
     if (!value || typeof value !== 'object') throw new ContractValidationError('BPC_FENCE_CORRUPT');
     const v = value as Partial<RedisFenceRecord>;
-    id(v.streamId, STREAM_RE, 'streamId'); id(v.nodeId, ID_RE, 'nodeId'); id(v.commandId, ID_RE, 'commandId');if(!/^\d+$/.test(String(v.authoritySystemId)))throw new ContractValidationError('invalid authoritySystemId');
+    id(v.streamId, STREAM_RE, 'streamId'); id(v.nodeId, ID_RE, 'nodeId'); id(v.commandId, ID_RE, 'commandId');id(v.nodeCredentialKeyId,KEY_RE,'nodeCredentialKeyId');if(!/^\d+$/.test(String(v.authoritySystemId)))throw new ContractValidationError('invalid authoritySystemId');
     safeInt(v.epoch, 'epoch', 1, MAX_EPOCH); safeInt(v.claimedAtMs, 'claimedAtMs', 0, MAX_MS);
     verify(this.resolver, String(v.keyId), redisFenceMessage(v as BareRedisFenceRecord), String(v.signature));
     return v as RedisFenceRecord;

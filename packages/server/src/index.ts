@@ -229,6 +229,7 @@ export {
   promoteReceiverToSource,
   signSourceLeaseGrant,
   signRedisFenceRecord,
+  signNodeIdentityChallenge,
   redisFenceRecordDigest,
   pairSnapshotManifestDigest,
   signCutoverReceipt,
@@ -248,6 +249,7 @@ export type {
   SourceLeaseBinding,
   SourceLeaseGrant,
   BpcHaReadyToken,
+  NodeIdentityProver,
 } from './bpc-ha-final.js';
 export type {
   FetchLike,
