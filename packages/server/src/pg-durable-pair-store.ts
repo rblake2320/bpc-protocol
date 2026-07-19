@@ -230,6 +230,10 @@ const HA_FENCE_INTERNAL=Symbol('bpc.ha.pair.fence.internal');
 type ControlledMutation=(exec:PgExecutor,header:OutboxRecordHeader,action:string,payload:readonly unknown[])=>Promise<{rows:Record<string,unknown>[];rowCount:number}>;
 interface InternalHaFence { readonly [HA_FENCE_INTERNAL]:{check:(exec:PgExecutor)=>Promise<void>;mutate?:ControlledMutation;append?:NonNullable<ConstructorParameters<typeof PgDurableOutbox<BpcPairMutation,BpcPairMutation>>[2]['governedAppend']>} }
 export class PgTransactionalPairStore implements AtomicPairStore {
+  // Source-side compare/read phases deliberately avoid SELECT FOR UPDATE:
+  // PostgreSQL requires UPDATE privilege for that syntax. The required
+  // SERIALIZABLE transactor detects a conflicting writer, while governed
+  // mutation functions retain the actual write locks under owner authority.
   private readonly outbox:PgDurableOutbox<BpcPairMutation,BpcPairMutation>;
   private readonly codec:Aes256GcmPairPayloadCodec;
   private readonly headers=new WeakMap<object,OutboxRecordHeader>();
@@ -241,7 +245,7 @@ export class PgTransactionalPairStore implements AtomicPairStore {
   private async conditionalStatus(pairId:string,predicate:(pair:Readonly<StoredPair>)=>boolean,status:StoredPair['status']):Promise<boolean>{
     if(!ID.test(pairId))throw new ContractValidationError('pairId invalid');
     return this.outbox.withOutboxTx(async(tx,e)=>{
-      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[pairId])).rows[0];if(!row)return false;
+      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1',[pairId])).rows[0];if(!row)return false;
       const current=rowToPair(row);if(!predicate(freezePair(current)))return false;
       const next=normalizePair({...current,status},false),aad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.set.v1' as const,pairId};
       await this.append(tx,e,{kind:aad.kind,pairId,sealed:this.codec.sealPair(next,aad)});await upsertPair(this.controlled(e),next);return true;
@@ -258,7 +262,7 @@ export class PgTransactionalPairStore implements AtomicPairStore {
   async atomicMutate(pairId:string,mutate:PairAtomicMutation):Promise<StoredPair|undefined>{
     if(!ID.test(pairId)||typeof mutate!=='function')throw new ContractValidationError('atomic mutation input invalid');
     return this.outbox.withOutboxTx(async(tx,e)=>{
-      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[pairId])).rows[0];
+      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1',[pairId])).rows[0];
       if(!row)return undefined;
       const current=rowToPair(row),candidate=mutate(freezePair(current));
       if(candidate===undefined)return structuredClone(current);
@@ -280,7 +284,7 @@ export class PgTransactionalPairStore implements AtomicPairStore {
     const pairAad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.approve.v1' as const,pairId:pair.id};
     const mutation:BpcPairMutation={kind:'bpc.pair.approve.v1',token,requestedAt:expected.requestedAt,expectedPending:this.codec.sealRegistration(expectedRegistration,pendingAad),pairId:pair.id,sealed:this.codec.sealPair(pair,pairAad)};
     return this.outbox.withOutboxTx(async(tx,e)=>{
-      const row=(await e.query('SELECT registration,requested_at FROM bpc_pending WHERE token=$1 FOR UPDATE',[token])).rows[0];
+      const row=(await e.query('SELECT registration,requested_at FROM bpc_pending WHERE token=$1',[token])).rows[0];
       if(!row)return false;
       if(Number(row['requested_at'])!==expected.requestedAt||!sameCanonical(normalizeRegistration(row['registration']),expectedRegistration))return false;
       const active=Number((await e.query("SELECT count(*)::text AS count FROM bpc_pairs WHERE status='active'")).rows[0]?.['count']);
@@ -300,7 +304,7 @@ export class PgTransactionalPairStore implements AtomicPairStore {
     const newAad={...oldAad,pairId:replacement.id};
     const mutation:BpcPairMutation={kind:'bpc.pair.rotate.v1',oldPairId:expectedOld.id,expectedOld:this.codec.sealPair(expectedOld,oldAad),newPairId:replacement.id,sealed:this.codec.sealPair(replacement,newAad)};
     return this.outbox.withOutboxTx(async(tx,e)=>{
-      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[expectedOld.id])).rows[0];
+      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1',[expectedOld.id])).rows[0];
       if(!row||!sameCanonical(normalizePair(rowToPair(row),false),expectedOld))return false;
       if(expectedOld.status!=='active'||(await e.query('SELECT 1 FROM bpc_pairs WHERE id=$1',[replacement.id])).rows.length)return false;
       await this.append(tx,e,mutation);
@@ -311,7 +315,7 @@ export class PgTransactionalPairStore implements AtomicPairStore {
     if(!ID.test(pairId)||!Number.isSafeInteger(at)||at<0)throw new ContractValidationError('successful-use claim input invalid');
     const captured={...structuredClone(expected),pubJwk:canonicalAuthorizationJwk(expected.pubJwk)};
     return this.outbox.withOutboxTx(async(tx,e)=>{
-      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[pairId])).rows[0];
+      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1',[pairId])).rows[0];
       if(!row)return 'missing';
       const current=rowToPair(row);
       if(current.status==='expired'){
