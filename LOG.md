@@ -262,3 +262,15 @@
 - Replaced the two-PostgreSQL drill's in-process adapter with the authenticated
   socket path and recorded zero post-convergence loss plus convergence time.
 - This is bounded mechanism evidence; issue #16 remains open.
+
+## 2026-07-18: Frozen HA acceptance
+
+- Added a signed three-member Redis monotonic epoch quorum, external control
+  witness/cutover chain, and guard-signed source lease
+  history enforced inside the authoritative PostgreSQL transaction.
+- Added source-signed snapshot manifests, tail convergence, signed promotion
+  receipts, and a promoted-source epoch initialization.
+- Added an actual child publisher SIGKILL/restart and a live Redis TCP partition
+  while the old source retains PostgreSQL access.
+- The acceptance command records backlog, zero recoverable data-loss RPO, and
+  measured crash recovery, resynchronization, and promotion RTO.

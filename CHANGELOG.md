@@ -4,6 +4,14 @@ All notable changes to BPC Protocol are documented in this file.
 
 ## [Unreleased] -- 2026-07-16
 
+- Added the frozen #16 HA acceptance composition: signed three-member Redis epoch
+  fencing, guard-signed expiring source leases enforced at PostgreSQL
+  pre-commit, signed snapshot/tail promotion, and actual publisher process
+  death/restart across A/B authorities plus an external control PostgreSQL.
+- Added measured per-fault backlog, data-loss RPO, resynchronization time, and
+  RTO evidence. A partitioned old source is rejected inside its authoritative
+  database transaction while the promoted source originates the next epoch.
+
 - Added an authenticated, replay-resistant HTTP durable-outbox transport with
   exact-path authorization, bounded raw-body verification, durable receiver
   nonces, request-attempt-bound response MACs, and decision-bound receipts.

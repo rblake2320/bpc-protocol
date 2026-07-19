@@ -18,6 +18,7 @@ import {
   canonicalize,
   type MutationSanitizer,
   type OutboxRecord,
+  type OutboxRecordHeader,
   type PublisherBackpressure,
   type SanitizedMutation,
 } from './ha-outbox-contract.js';
@@ -216,8 +217,9 @@ export class Aes256GcmPairPayloadCodec implements PairPayloadCodec {
 
 function affectedOne(result:{rowCount:number},label:string){if(result.rowCount!==1)throw new ContractValidationError(`${label} affected ${result.rowCount}; expected 1`);}
 function affectedZeroOrOne(result:{rowCount:number},label:string){if(result.rowCount!==0&&result.rowCount!==1)throw new ContractValidationError(`${label} affected ${result.rowCount}; expected 0 or 1`);}
-async function upsertPair(exec:PgExecutor,p:CanonicalStoredPair){affectedOne(await exec.query(`INSERT INTO bpc_pairs (id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT(id) DO UPDATE SET name=$2,scope=$3,mode=$4,secret_hash=$5,pub_jwk=$6,status=$7,created=$8,last_active=$9,requests=$10,failed_sigs=$11,cumulative_failures=$12,first_failure_at=$13,max_requests=$14,kind=$15,canary_class=$16,expires_at=$17`,[p.id,p.name,p.scope,p.mode,p.secretHash,JSON.stringify(p.pubJwk),p.status,p.created,p.lastActive,p.requests,p.failedSigs,p.cumulativeFailures??null,p.firstFailureAt??null,p.maxRequests??null,p.kind??'legitimate',p.canaryClass??null,p.expiresAt??null]),'pair upsert');}
-async function insertPair(exec:PgExecutor,p:CanonicalStoredPair){affectedOne(await exec.query(`INSERT INTO bpc_pairs (id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,[p.id,p.name,p.scope,p.mode,p.secretHash,JSON.stringify(p.pubJwk),p.status,p.created,p.lastActive,p.requests,p.failedSigs,p.cumulativeFailures??null,p.firstFailureAt??null,p.maxRequests??null,p.kind??'legitimate',p.canaryClass??null,p.expiresAt??null]),'pair insert');}
+function pairParams(p:CanonicalStoredPair):unknown[]{return[p.id,p.name,p.scope,p.mode,p.secretHash,JSON.stringify(p.pubJwk),p.status,p.created,p.lastActive,p.requests,p.failedSigs,p.cumulativeFailures??null,p.firstFailureAt??null,p.maxRequests??null,p.kind??'legitimate',p.canaryClass??null,p.expiresAt??null];}
+async function upsertPair(exec:PgExecutor,p:CanonicalStoredPair){affectedOne(await exec.query(`INSERT INTO bpc_pairs (id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT(id) DO UPDATE SET name=$2,scope=$3,mode=$4,secret_hash=$5,pub_jwk=$6,status=$7,created=$8,last_active=$9,requests=$10,failed_sigs=$11,cumulative_failures=$12,first_failure_at=$13,max_requests=$14,kind=$15,canary_class=$16,expires_at=$17`,pairParams(p)),'pair upsert');}
+async function insertPair(exec:PgExecutor,p:CanonicalStoredPair){affectedOne(await exec.query(`INSERT INTO bpc_pairs (id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,pairParams(p)),'pair insert');}
 async function upsertPending(exec:PgExecutor,token:string,r:CanonicalPairRegistration,requestedAt:number){affectedOne(await exec.query('INSERT INTO bpc_pending(token,registration,requested_at) VALUES($1,$2,$3) ON CONFLICT(token) DO UPDATE SET registration=$2,requested_at=$3',[token,JSON.stringify(r),requestedAt]),'pending upsert');}
 function rowToPair(row:Record<string,unknown>):StoredPair{const canonical=normalizePair({id:String(row['id']),name:String(row['name']),scope:String(row['scope']),mode:String(row['mode']),secretHash:String(row['secret_hash']),pubJwk:row['pub_jwk'],status:String(row['status']),created:Number(row['created']),lastActive:row['last_active']==null?null:Number(row['last_active']),requests:Number(row['requests']),failedSigs:Number(row['failed_sigs']),...(row['cumulative_failures']==null?{}:{cumulativeFailures:databaseFloatToDecimal(row['cumulative_failures'])}),...(row['first_failure_at']==null?{}:{firstFailureAt:Number(row['first_failure_at'])}),...(row['max_requests']==null?{}:{maxRequests:Number(row['max_requests'])}),kind:String(row['kind']??'legitimate'),...(row['canary_class']==null?{}:{canaryClass:String(row['canary_class'])}),...(row['expires_at']==null?{}:{expiresAt:Number(row['expires_at'])})},true);return{...canonical,cumulativeFailures:canonical.cumulativeFailures===undefined?undefined:Number(canonical.cumulativeFailures)};}
 function sameCanonical(left:unknown,right:unknown):boolean{return canonicalize(left)===canonicalize(right);}
@@ -225,18 +227,30 @@ function freezePair(pair:StoredPair):Readonly<StoredPair>{const copy=structuredC
 function assertApprovalPair(registration:CanonicalPairRegistration,pair:CanonicalStoredPair):void{if(!hasInitialPairState(pair as StoredPair)||!pairMatchesRegistration(pair as StoredPair,registration))throw new ContractValidationError('approved pair does not match pending registration/initial state');}
 
 export interface PgTransactionalPairStoreOptions { streamId:string; fenceToken:bigint; keyring:PairSealKeyring; maxPendingRows:number; backpressure?:PublisherBackpressure; scopeDeadlineMs?:number }
+const HA_FENCE_INTERNAL=Symbol('bpc.ha.pair.fence.internal');
+type ControlledMutation=(exec:PgExecutor,header:OutboxRecordHeader,action:string,payload:readonly unknown[])=>Promise<{rows:Record<string,unknown>[];rowCount:number}>;
+interface InternalHaFence { readonly [HA_FENCE_INTERNAL]:{check:(exec:PgExecutor)=>Promise<void>;mutate?:ControlledMutation;append?:NonNullable<ConstructorParameters<typeof PgDurableOutbox<BpcPairMutation,BpcPairMutation>>[2]['governedAppend']>} }
 export class PgTransactionalPairStore implements AtomicPairStore {
+  // Source-side compare/read phases deliberately avoid SELECT FOR UPDATE:
+  // PostgreSQL requires UPDATE privilege for that syntax. The required
+  // SERIALIZABLE transactor detects a conflicting writer, while governed
+  // mutation functions retain the actual write locks under owner authority.
   private readonly outbox:PgDurableOutbox<BpcPairMutation,BpcPairMutation>;
   private readonly codec:Aes256GcmPairPayloadCodec;
-  constructor(db:PgTransactor,ready:SchemaReadyToken,private readonly opts:PgTransactionalPairStoreOptions){if(typeof opts.fenceToken!=='bigint'||opts.fenceToken<0n)throw new ContractValidationError('fenceToken invalid');this.codec=new Aes256GcmPairPayloadCodec(opts.keyring.activeKeyId,opts.keyring.resolveKey);this.outbox=new PgDurableOutbox(db,ready,{streamId:opts.streamId,sanitizer:bpcPairMutationSanitizer,maxPendingRows:opts.maxPendingRows,backpressure:opts.backpressure??'fail-authoritative-mutation',scopeDeadlineMs:opts.scopeDeadlineMs});}
-  private async commit(m:BpcPairMutation,dml:(exec:PgExecutor)=>Promise<void>){const clean=normalizeMutation(m) as BpcPairMutation;await this.outbox.withOutboxTx(async(tx,exec)=>{await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:clean,fenceToken:this.opts.fenceToken});await dml(exec);});}
+  private readonly headers=new WeakMap<object,OutboxRecordHeader>();
+  private readonly mutate?:ControlledMutation;
+  constructor(db:PgTransactor,ready:SchemaReadyToken,private readonly opts:PgTransactionalPairStoreOptions,internal?:InternalHaFence){if(typeof opts.fenceToken!=='bigint'||opts.fenceToken<0n)throw new ContractValidationError('fenceToken invalid');this.codec=new Aes256GcmPairPayloadCodec(opts.keyring.activeKeyId,opts.keyring.resolveKey);const authority=internal?.[HA_FENCE_INTERNAL];this.mutate=authority?.mutate;const check=authority?.check??(async(exec:PgExecutor)=>{const present=(await exec.query("SELECT pg_catalog.to_regclass('bpc_ha.authority_stream')::text value")).rows[0]?.value;if(present){const row=(await exec.query('SELECT 1 FROM bpc_ha.authority_stream LIMIT 1')).rows[0];if(row)throw new ContractValidationError('HA-governed pair authority requires createHaPairAuthority');}});this.outbox=new PgDurableOutbox(db,ready,{streamId:opts.streamId,sanitizer:bpcPairMutationSanitizer,maxPendingRows:opts.maxPendingRows,backpressure:opts.backpressure??'fail-authoritative-mutation',scopeDeadlineMs:opts.scopeDeadlineMs,preCommitCheck:check,governedAppend:authority?.append});}
+  private async append(tx:Parameters<PgDurableOutbox<BpcPairMutation,BpcPairMutation>['appendInTx']>[0],exec:PgExecutor,mutation:BpcPairMutation):Promise<OutboxRecordHeader>{const header=await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:mutation,fenceToken:this.opts.fenceToken});this.headers.set(exec as object,header);return header;}
+  private controlled(exec:PgExecutor):PgExecutor{if(!this.mutate)return exec;const mutate=this.mutate,header=this.headers.get(exec as object);if(!header)throw new ContractValidationError('controlled mutation requires a durable outbox row in the same transaction');return{query:async(sql:string,params:unknown[]=[])=>{const compact=sql.replace(/\s+/g,' ').trim().toLowerCase();if(compact.startsWith('insert into bpc_pairs'))return mutate(exec,header,compact.includes('on conflict')?'pair-upsert':'pair-insert',params);if(compact.startsWith('delete from bpc_pairs'))return mutate(exec,header,'pair-delete',params);if(compact.startsWith('insert into bpc_pending'))return mutate(exec,header,'pending-upsert',params);if(compact.startsWith('delete from bpc_pending'))return mutate(exec,header,'pending-delete',params);return exec.query(sql,params);}};}
+  private async controlledComposite(exec:PgExecutor,action:'pair-approve'|'pair-rotate',payload:readonly unknown[]):Promise<void>{if(!this.mutate)throw new ContractValidationError('controlled composite mutation requires HA authority');const header=this.headers.get(exec as object);if(!header)throw new ContractValidationError('controlled composite mutation requires a durable outbox row in the same transaction');affectedOne(await this.mutate(exec,header,action,payload),action);}
+  private async commit(m:BpcPairMutation,dml:(exec:PgExecutor)=>Promise<void>){const clean=normalizeMutation(m) as BpcPairMutation;await this.outbox.withOutboxTx(async(tx,exec)=>{await this.append(tx,exec,clean);await dml(this.controlled(exec));});}
   private async conditionalStatus(pairId:string,predicate:(pair:Readonly<StoredPair>)=>boolean,status:StoredPair['status']):Promise<boolean>{
     if(!ID.test(pairId))throw new ContractValidationError('pairId invalid');
     return this.outbox.withOutboxTx(async(tx,e)=>{
-      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[pairId])).rows[0];if(!row)return false;
+      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1',[pairId])).rows[0];if(!row)return false;
       const current=rowToPair(row);if(!predicate(freezePair(current)))return false;
       const next=normalizePair({...current,status},false),aad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.set.v1' as const,pairId};
-      await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:{kind:aad.kind,pairId,sealed:this.codec.sealPair(next,aad)},fenceToken:this.opts.fenceToken});await upsertPair(e,next);return true;
+      await this.append(tx,e,{kind:aad.kind,pairId,sealed:this.codec.sealPair(next,aad)});await upsertPair(this.controlled(e),next);return true;
     });
   }
   async get(id:string){if(!ID.test(id))throw new ContractValidationError('pairId invalid');return this.outbox.withOutboxTx(async(_t,e)=>{const r=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1',[id])).rows[0];return r?rowToPair(r):undefined;});}
@@ -250,7 +264,7 @@ export class PgTransactionalPairStore implements AtomicPairStore {
   async atomicMutate(pairId:string,mutate:PairAtomicMutation):Promise<StoredPair|undefined>{
     if(!ID.test(pairId)||typeof mutate!=='function')throw new ContractValidationError('atomic mutation input invalid');
     return this.outbox.withOutboxTx(async(tx,e)=>{
-      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[pairId])).rows[0];
+      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1',[pairId])).rows[0];
       if(!row)return undefined;
       const current=rowToPair(row),candidate=mutate(freezePair(current));
       if(candidate===undefined)return structuredClone(current);
@@ -258,8 +272,8 @@ export class PgTransactionalPairStore implements AtomicPairStore {
       if(next.id!==pairId)throw new ContractValidationError('atomic mutation cannot change pair identity');
       const aad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.set.v1' as const,pairId};
       const sealed=this.codec.sealPair(next,aad);
-      await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:{kind:aad.kind,pairId,sealed},fenceToken:this.opts.fenceToken});
-      await upsertPair(e,next);
+      await this.append(tx,e,{kind:aad.kind,pairId,sealed});
+      await upsertPair(this.controlled(e),next);
       return rowToPair({...row,id:next.id,name:next.name,scope:next.scope,mode:next.mode,secret_hash:next.secretHash,pub_jwk:next.pubJwk,status:next.status,created:next.created,last_active:next.lastActive,requests:next.requests,failed_sigs:next.failedSigs,cumulative_failures:next.cumulativeFailures??null,first_failure_at:next.firstFailureAt??null,max_requests:next.maxRequests??null,kind:next.kind??'legitimate',canary_class:next.canaryClass??null,expires_at:next.expiresAt??null});
     });
   }
@@ -272,15 +286,15 @@ export class PgTransactionalPairStore implements AtomicPairStore {
     const pairAad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.approve.v1' as const,pairId:pair.id};
     const mutation:BpcPairMutation={kind:'bpc.pair.approve.v1',token,requestedAt:expected.requestedAt,expectedPending:this.codec.sealRegistration(expectedRegistration,pendingAad),pairId:pair.id,sealed:this.codec.sealPair(pair,pairAad)};
     return this.outbox.withOutboxTx(async(tx,e)=>{
-      const row=(await e.query('SELECT registration,requested_at FROM bpc_pending WHERE token=$1 FOR UPDATE',[token])).rows[0];
+      const row=(await e.query('SELECT registration,requested_at FROM bpc_pending WHERE token=$1',[token])).rows[0];
       if(!row)return false;
       if(Number(row['requested_at'])!==expected.requestedAt||!sameCanonical(normalizeRegistration(row['registration']),expectedRegistration))return false;
       const active=Number((await e.query("SELECT count(*)::text AS count FROM bpc_pairs WHERE status='active'")).rows[0]?.['count']);
       if(!Number.isSafeInteger(active)||active>=maxActivePairs)throw new ContractValidationError(`Maximum pair capacity (${maxActivePairs}) reached`);
       if((await e.query('SELECT 1 FROM bpc_pairs WHERE id=$1',[pair.id])).rows.length)throw new ContractValidationError('replacement pair identity already exists');
-      await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:mutation,fenceToken:this.opts.fenceToken});
-      affectedOne(await e.query('DELETE FROM bpc_pending WHERE token=$1 AND requested_at=$2',[token,expected.requestedAt]),'pending approval delete');
-      await insertPair(e,pair);
+      await this.append(tx,e,mutation);
+      if(this.mutate)await this.controlledComposite(e,'pair-approve',[token,JSON.stringify(expectedRegistration),expected.requestedAt,maxActivePairs,...pairParams(pair)]);
+      else{affectedOne(await e.query('DELETE FROM bpc_pending WHERE token=$1 AND requested_at=$2',[token,expected.requestedAt]),'pending approval delete');await insertPair(e,pair);}
       return true;
     });
   }
@@ -292,18 +306,19 @@ export class PgTransactionalPairStore implements AtomicPairStore {
     const newAad={...oldAad,pairId:replacement.id};
     const mutation:BpcPairMutation={kind:'bpc.pair.rotate.v1',oldPairId:expectedOld.id,expectedOld:this.codec.sealPair(expectedOld,oldAad),newPairId:replacement.id,sealed:this.codec.sealPair(replacement,newAad)};
     return this.outbox.withOutboxTx(async(tx,e)=>{
-      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[expectedOld.id])).rows[0];
+      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1',[expectedOld.id])).rows[0];
       if(!row||!sameCanonical(normalizePair(rowToPair(row),false),expectedOld))return false;
       if(expectedOld.status!=='active'||(await e.query('SELECT 1 FROM bpc_pairs WHERE id=$1',[replacement.id])).rows.length)return false;
-      await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:mutation,fenceToken:this.opts.fenceToken});
-      const rotated={...expectedOld,status:'rotated' as const};await upsertPair(e,rotated);await insertPair(e,replacement);return true;
+      await this.append(tx,e,mutation);
+      if(this.mutate)await this.controlledComposite(e,'pair-rotate',[...pairParams(expectedOld),...pairParams(replacement)]);
+      else{const rotated={...expectedOld,status:'rotated' as const};await upsertPair(e,rotated);await insertPair(e,replacement);}return true;
     });
   }
   async claimSuccessfulUse(pairId:string,at:number,expected:SuccessfulUsePolicy):Promise<SuccessfulUseClaim>{
     if(!ID.test(pairId)||!Number.isSafeInteger(at)||at<0)throw new ContractValidationError('successful-use claim input invalid');
     const captured={...structuredClone(expected),pubJwk:canonicalAuthorizationJwk(expected.pubJwk)};
     return this.outbox.withOutboxTx(async(tx,e)=>{
-      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[pairId])).rows[0];
+      const row=(await e.query('SELECT * FROM bpc_pairs WHERE id=$1',[pairId])).rows[0];
       if(!row)return 'missing';
       const current=rowToPair(row);
       if(current.status==='expired'){
@@ -313,23 +328,30 @@ export class PgTransactionalPairStore implements AtomicPairStore {
       if(current.status!=='active')return 'inactive';
       if(current.expiresAt!==undefined&&current.expiresAt<at){
         const expired=normalizePair({...current,status:'expired'},false),aad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.set.v1' as const,pairId};
-        await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:{kind:aad.kind,pairId,sealed:this.codec.sealPair(expired,aad)},fenceToken:this.opts.fenceToken});await upsertPair(e,expired);return 'time-expired';
+        await this.append(tx,e,{kind:aad.kind,pairId,sealed:this.codec.sealPair(expired,aad)});await upsertPair(this.controlled(e),expired);return 'time-expired';
       }
       if(current.maxRequests&&current.maxRequests>0&&current.requests>=current.maxRequests){
         const expired=normalizePair({...current,status:'expired'},false),aad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.set.v1' as const,pairId};
-        await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:{kind:aad.kind,pairId,sealed:this.codec.sealPair(expired,aad)},fenceToken:this.opts.fenceToken});await upsertPair(e,expired);return 'usage-exhausted';
+        await this.append(tx,e,{kind:aad.kind,pairId,sealed:this.codec.sealPair(expired,aad)});await upsertPair(this.controlled(e),expired);return 'usage-exhausted';
       }
       if(!successfulUsePolicyMatches(current,captured))return 'policy-changed';
       const requests=current.requests+1;
       if(!Number.isSafeInteger(requests))throw new ContractValidationError('pair request counter exhausted');
       const next=normalizePair({...current,requests,lastActive:at,failedSigs:0,cumulativeFailures:0,firstFailureAt:null,status:current.maxRequests&&current.maxRequests>0&&requests>=current.maxRequests?'expired':current.status},false);
       const aad={domain:'bpc-pair-payload' as const,version:'1' as const,streamId:this.opts.streamId,kind:'bpc.pair.set.v1' as const,pairId};
-      await this.outbox.appendInTx(tx,{streamId:this.opts.streamId,rawMutation:{kind:aad.kind,pairId,sealed:this.codec.sealPair(next,aad)},fenceToken:this.opts.fenceToken});await upsertPair(e,next);return 'claimed';
+      await this.append(tx,e,{kind:aad.kind,pairId,sealed:this.codec.sealPair(next,aad)});await upsertPair(this.controlled(e),next);return 'claimed';
     });
   }
   async expireIfElapsed(pairId:string,now:number):Promise<boolean>{if(!Number.isSafeInteger(now)||now<0)throw new ContractValidationError('expiry check timestamp invalid');return this.conditionalStatus(pairId,(pair)=>pair.status==='active'&&pair.expiresAt!==undefined&&pair.expiresAt<now,'expired');}
   async expireIfUsageExhausted(pairId:string):Promise<boolean>{return this.conditionalStatus(pairId,(pair)=>pair.status==='active'&&!!pair.maxRequests&&pair.maxRequests>0&&pair.requests>=pair.maxRequests,'expired');}
   async lockIfFailureThreshold(pairId:string,minimumFailures:number):Promise<boolean>{if(!Number.isSafeInteger(minimumFailures)||minimumFailures<1)throw new ContractValidationError('failure threshold invalid');return this.conditionalStatus(pairId,(pair)=>pair.status==='active'&&pair.failedSigs>=minimumFailures,'locked');}
+}
+
+/** Package-internal HA factory. Deliberately omitted from the package entry
+ * point; the public `createHaPairAuthority` validates the unforgeable fence
+ * capability before reaching this constructor path. */
+export function __internalCreateHaPairStore(db:PgTransactor,ready:SchemaReadyToken,opts:PgTransactionalPairStoreOptions,check:(exec:PgExecutor)=>Promise<void>,mutate?:ControlledMutation,append?:InternalHaFence[typeof HA_FENCE_INTERNAL]['append']):PgTransactionalPairStore{
+  return new PgTransactionalPairStore(db,ready,opts,{[HA_FENCE_INTERNAL]:{check,mutate,append}});
 }
 
 export class PgPairMutationApplier implements MutationApplier<BpcPairMutation>{private readonly codec:Aes256GcmPairPayloadCodec;constructor(private readonly streamId:string,keyring:PairSealKeyring){if(!streamId||streamId.length>512)throw new ContractValidationError('streamId invalid');this.codec=new Aes256GcmPairPayloadCodec(keyring.activeKeyId,keyring.resolveKey);}async applyInTx(exec:PgExecutor,record:OutboxRecord<BpcPairMutation>){if(record.streamId!==this.streamId)throw new ContractValidationError('pair mutation stream mismatch');const m=normalizeMutation(record.mutation) as BpcPairMutation;switch(m.kind){case'bpc.pair.set.v1':await upsertPair(exec,this.codec.openPair(m.sealed,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,pairId:m.pairId}));return;case'bpc.pair.delete.v1':affectedZeroOrOne(await exec.query('DELETE FROM bpc_pairs WHERE id=$1',[m.pairId]),'pair delete');return;case'bpc.pending.set.v1':await upsertPending(exec,m.token,this.codec.openRegistration(m.sealed,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,token:m.token,requestedAt:m.requestedAt}),m.requestedAt);return;case'bpc.pending.delete.v1':affectedZeroOrOne(await exec.query('DELETE FROM bpc_pending WHERE token=$1',[m.token]),'pending delete');return;case'bpc.pair.approve.v1':{const pending=this.codec.openRegistration(m.expectedPending,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,token:m.token,requestedAt:m.requestedAt}),approved=this.codec.openPair(m.sealed,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,pairId:m.pairId});if(approved.id!==m.pairId)throw new ContractValidationError('replica approval envelope identity mismatch');assertApprovalPair(pending,approved);const row=(await exec.query('SELECT registration,requested_at FROM bpc_pending WHERE token=$1 FOR UPDATE',[m.token])).rows[0];if(!row||Number(row['requested_at'])!==m.requestedAt||!sameCanonical(normalizeRegistration(row['registration']),pending))throw new ContractValidationError('replica pending approval precondition failed');if((await exec.query('SELECT 1 FROM bpc_pairs WHERE id=$1',[m.pairId])).rows.length)throw new ContractValidationError('replica approval pair identity already exists');affectedOne(await exec.query('DELETE FROM bpc_pending WHERE token=$1 AND requested_at=$2',[m.token,m.requestedAt]),'replica pending approval delete');await insertPair(exec,approved);return;}case'bpc.pair.rotate.v1':{const expected=this.codec.openPair(m.expectedOld,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,pairId:m.oldPairId}),replacement=this.codec.openPair(m.sealed,{domain:'bpc-pair-payload',version:'1',streamId:this.streamId,kind:m.kind,pairId:m.newPairId});if(expected.id!==m.oldPairId||replacement.id!==m.newPairId||expected.status!=='active'||!hasInitialPairState(replacement as StoredPair)||!rotationPolicyMatches(expected as StoredPair,replacement as StoredPair))throw new ContractValidationError('replica rotation identity/state/policy inheritance failed');const row=(await exec.query('SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE',[m.oldPairId])).rows[0];if(!row||!sameCanonical(normalizePair(rowToPair(row),false),expected))throw new ContractValidationError('replica rotation precondition failed');if((await exec.query('SELECT 1 FROM bpc_pairs WHERE id=$1',[m.newPairId])).rows.length)throw new ContractValidationError('replica rotation pair identity already exists');await upsertPair(exec,{...expected,status:'rotated'});await insertPair(exec,replacement);return;}}}}

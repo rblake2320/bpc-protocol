@@ -168,6 +168,32 @@ describe('PgDurableOutbox / receiver / publisher / fence (#16, adversarial LOGIC
     expect(h.sequence).toBe(1); expect(h.fenceToken).toBe('0'); expect(db.rowCount(SID)).toBe(1);
     expect('secret' in (db.state.rows[0].mutation as object)).toBe(false);
   });
+
+  it('runs the external source-fence check after mutation work and rolls back on denial', async () => {
+    let checks = 0;
+    const fenced = new PgDurableOutbox(db, ready, {
+      streamId: SID, sanitizer, maxPendingRows: 100,
+      backpressure: 'fail-authoritative-mutation',
+      preCommitCheck: async () => { checks++; throw new ContractValidationError('source lease expired (fail closed)'); },
+    });
+    await expect(fenced.withOutboxTx(async (tx, exec) => {
+      await fenced.appendInTx(tx, { streamId: SID, rawMutation: { pairId: 'blocked' }, fenceToken: 0n });
+      await exec.query('UPDATE ha_outbox_source_checkpoint SET sequence = $2 WHERE stream_id = $1', [SID, 99]);
+    })).rejects.toThrow(/lease expired/);
+    expect(checks).toBe(1);
+    expect(db.rowCount(SID)).toBe(0);
+    expect(db.srcSeq(SID)).toBe(0);
+  });
+
+  it('does not invoke the source-fence check for a read-only scope', async () => {
+    let checks = 0;
+    const fenced = new PgDurableOutbox(db, ready, {
+      streamId: SID, sanitizer, maxPendingRows: 100,
+      backpressure: 'fail-authoritative-mutation', preCommitCheck: async () => { checks++; },
+    });
+    await fenced.withOutboxTx(async () => 'read');
+    expect(checks).toBe(0);
+  });
   it('snapshots raw append input before the first awaited query (TOCTOU)', async () => {
     const entered = deferred(); const release = deferred();
     db.queryHook = async (sql) => { if (sql.includes('SELECT fence_token')) { entered.resolve(); await release.promise; } };

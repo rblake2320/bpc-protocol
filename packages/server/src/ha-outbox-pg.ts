@@ -160,6 +160,8 @@ export interface PgExecutor {
  *    ROLLBACK — the server aborts the tx when the connection drops.
  */
 export interface PgTransactor {
+  /** Hard upper bound enforced by the adapter for one transaction attempt. */
+  readonly maxTransactionDurationMs?: number;
   transaction<T>(fn: (exec: PgExecutor) => Promise<T>, opts?: { signal?: AbortSignal }): Promise<T>;
   /**
    * Optional migration-only entry point. The adapter must acquire the listed
@@ -913,6 +915,14 @@ export interface PgOutboxOptions<Raw, Clean> {
   backpressure: PublisherBackpressure;
   /** (R12) upper bound on one withOutboxTx scope (body + drain); default 30s. */
   scopeDeadlineMs?: number;
+  /** Optional external source-authority fence. When a mutation was appended in
+   *  this scope, the hook runs after all caller DML and immediately before the
+   *  transaction callback returns. A rejection rolls the entire mutation and
+   *  outbox row back. */
+  preCommitCheck?: (exec: PgExecutor) => Promise<void>;
+  /** Optional database-authority append path for restricted runtime roles that
+   * cannot directly mutate outbox/checkpoint/fence tables. */
+  governedAppend?: (exec:PgExecutor,input:{streamId:string;mutation:SanitizedMutation<Clean>;fenceToken:FenceToken;maxPendingRows:number;backpressure:PublisherBackpressure})=>Promise<OutboxRecordHeader>;
 }
 
 /**
@@ -925,6 +935,7 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
   readonly sanitizer: MutationSanitizer<Raw, Clean>;
   private readonly schema: string;
   private readonly scopeDeadlineMs: number;
+  private readonly mutatingScopes = new WeakSet<object>();
   constructor(private readonly db: PgTransactor, ready: SchemaReadyToken, private readonly opts: PgOutboxOptions<Raw, Clean>) {
     if (!Number.isSafeInteger(opts.maxPendingRows) || opts.maxPendingRows <= 0) {
       throw new ContractValidationError('maxPendingRows must be a positive safe integer');
@@ -943,7 +954,13 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
       await enterCriticalTx(exec, this.schema);
       // hand the caller ONLY the capability-scoped proxy (never the raw exec), so
       // their own mutations are also liveness-checked and drained/rolled back.
-      return withBoundTx(exec, this.db, this.schema, (tx, scoped) => fn(tx, scoped));
+      return withBoundTx(exec, this.db, this.schema, async (tx, scoped) => {
+        const result = await fn(tx, scoped);
+        if (this.mutatingScopes.has(tx as object) && this.opts.preCommitCheck) {
+          await this.opts.preCommitCheck(scoped);
+        }
+        return result;
+      });
     }, { signal }));
   }
 
@@ -954,6 +971,7 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
     // Reject a forged, foreign or expired capability before inspecting caller
     // input or invoking its sanitizer.
     const exec = execOfBound(tx, this.db, this.schema);
+    this.mutatingScopes.add(tx as object);
     // Snapshot and sanitize synchronously before the first await. A caller cannot
     // mutate raw input while fence/admission/checkpoint queries are pending.
     const captured = snapshotAppendInput(input);
@@ -962,6 +980,7 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
     const streamId = captured.streamId;
     if (streamId !== this.opts.streamId) throw new ContractValidationError('streamId mismatch for this outbox');
     const fenceDecimal = fenceTokenToDecimal(captured.fenceToken);
+    if(this.opts.governedAppend){const header=await this.opts.governedAppend(exec,{streamId,mutation,fenceToken:captured.fenceToken,maxPendingRows:this.opts.maxPendingRows,backpressure:this.opts.backpressure});assertHeaderConformant(header);return header;}
 
     // (h) validate the presented fence token against the authoritative persisted
     // token under a row lock; stale token fails closed.
