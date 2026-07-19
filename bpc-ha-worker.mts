@@ -71,13 +71,15 @@ try {
     const publicKey = createPublicKey(required('BPC_HA_GUARD_PUBLIC_KEY'));
     const nodePublicKey=createPublicKey(required('BPC_HA_NODE_PUBLIC_KEY')),nodePrivateKey=createPrivateKey(required('BPC_HA_NODE_PRIVATE_KEY'));
     const sealKey = Buffer.from(required('BPC_HA_SEAL_KEY'), 'base64url');
+    const mutationSecret=Buffer.from(required('BPC_HA_MUTATION_TICKET_SECRET'),'base64url');
     let denied = false;
     try {
       const redisClients=required('BPC_HA_REDIS_URLS').split(',').map(url=>{const r=new Redis(url,{connectTimeout:400,maxRetriesPerRequest:0,retryStrategy:()=>null});r.on('error',()=>{});return r;});
       const resolver={ resolve: (keyId:string) => keyId === 'guard-v1' ? publicKey:keyId===binding.nodeCredentialKeyId?nodePublicKey:null };
       const controlPool=new Pool({connectionString:required('BPC_HA_CONTROL_PG_URL'),max:1});controlPool.on('error',()=>{});const controlDb=new NodePostgresTransactor(controlPool as never);const controlReady=await provisionBpcHaSchema(controlDb);
       const quorum=await BpcRedisQuorumFenceStore.open(redisClients,resolver,await PgRedisFenceWitness.open(controlDb,controlReady,resolver),'bpc:ha:final');
-      const fence = await PgSourceLeaseFence.open(db,haReady,resolver, binding,quorum,{keyId:binding.nodeCredentialKeyId,prove:async challenge=>signNodeIdentityChallenge(binding.nodeCredentialKeyId,nodePrivateKey,challenge)});
+      const mutationSigner={keyId:'mutation-v1',async sign(message:Uint8Array){return createHmac('sha256',mutationSecret).update(message).digest('hex');}};
+      const fence = await PgSourceLeaseFence.open(db,haReady,resolver, binding,quorum,{keyId:binding.nodeCredentialKeyId,prove:async challenge=>signNodeIdentityChallenge(binding.nodeCredentialKeyId,nodePrivateKey,challenge)},mutationSigner);
       const store = createHaPairAuthority(db, ready, {
         streamId: required('BPC_HA_STREAM_ID'), fenceToken: BigInt(binding.epoch),
         keyring: { activeKeyId: 'seal-v1', resolveKey: () => sealKey }, maxPendingRows: 100,
@@ -88,7 +90,7 @@ try {
       if (!denied) throw error;
     }
     process.stdout.write(`${JSON.stringify({ ok: true, denied, redisPartitionObserved })}\n`);
-    sealKey.fill(0);
+    sealKey.fill(0);mutationSecret.fill(0);
   } else {
     throw new Error(`unknown worker mode ${mode}`);
   }

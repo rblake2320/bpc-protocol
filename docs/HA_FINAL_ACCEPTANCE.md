@@ -15,6 +15,19 @@ and outbox append. The lease
 expires according to the source database clock. Losing connectivity to Redis
 therefore cannot let the former source renew itself or bypass expiry.
 
+The source database uses a separate provisioner/owner role and runtime role.
+`provisionBpcRuntimeMutationBoundary` revokes the runtime role's direct
+`INSERT`, `UPDATE`, and `DELETE` authority on `bpc_pairs` and `bpc_pending`,
+revokes object-creation authority, and rejects superuser, `BYPASSRLS`, owner
+membership, inherited DML, or schema-creation bypasses. Pair mutations cross a
+fixed-search-path `SECURITY DEFINER` function only after a single-use,
+transaction-bound HMAC ticket has been issued by the governed source fence.
+The database owns the ticket clock, consumes its nonce durably, verifies the
+active signed lease and exact payload digest, and keeps the verification key
+unreadable by the runtime role. Production ticket signing must use a
+non-exportable HSM/TPM policy key shared with the database provisioner; the
+acceptance drill's in-memory HMAC signer is test evidence only.
+
 Promotion writes a signed PREPARING record to the control database before the
 Redis effect. It freezes A with a signed revocation plus control-clock lease
 expiry, requires an exact signed majority Redis claim, and advances an external
@@ -50,6 +63,10 @@ The acceptance command proves:
 - A deterministic transaction barrier starts mutation/outbox DML while A is
   valid, revokes A before callback return, and proves the pre-commit check rolls
   the whole transaction back. This is distinct from rejecting at construction.
+- The exact login used by node A cannot directly insert, update, or delete pair
+  or pending rows, cannot read the mutation-ticket key, and cannot invoke the
+  controlled function with a fabricated ticket. The same credentials succeed
+  through `createHaPairAuthority`, proving the least-privilege path is usable.
 
 The snapshot key (`source-v1`) and control/lease key (`guard-v1`) are distinct
 Ed25519 identities in the executable drill. Deployments must keep those keys in

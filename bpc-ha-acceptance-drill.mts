@@ -22,6 +22,7 @@ import {
   bpcPairMutationSanitizer, buildPairSnapshotBundle, createHttpOutboxReceiver,
   buildPromotionReadinessAttestation, importPairSnapshotBundle, installActiveCutoverReceipt, installSourceLeaseGrant, pairSnapshotManifestDigest, promoteReceiverToSource, provisionSchemaVersion,
   provisionBpcHaSchema,
+  assertBpcHaSchemaReady, provisionBpcRuntimeMutationBoundary,
   redisFenceRecordDigest, signRedisFenceRecord, signSourceLeaseGrant, type AckReceipt, type AckReceiptVerifier,
   signNodeIdentityChallenge,
   type BpcPairMutation, type OutboxRecord, type ReceiverDecision,
@@ -37,6 +38,7 @@ const { Pool } = pg;
 const poolA = new Pool({ connectionString: URL_A, max: 8 }); poolA.on('error', () => {});
 const poolB = new Pool({ connectionString: URL_B, max: 8 }); poolB.on('error', () => {});
 const poolControl = new Pool({ connectionString: URL_CONTROL, max: 4 }); poolControl.on('error', () => {});
+let poolRuntimeA:pg.Pool|null=null;
 const dbA = new NodePostgresTransactor(poolA as never,{statementTimeoutMs:800,transactionTimeoutMs:1_000});
 const dbB = new NodePostgresTransactor(poolB as never);
 const dbControl = new NodePostgresTransactor(poolControl as never);
@@ -45,6 +47,7 @@ const SID = 'bpc:pair:ha-final/v1';
 const E1 = 'bpc-e:1', E2 = 'bpc-e:2';
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const sealKey = Buffer.alloc(32, 51);
+const mutationTicketSecret=Buffer.alloc(32,59);const mutationTicketSigner={keyId:'mutation-v1',async sign(message:Uint8Array){return createHmac('sha256',mutationTicketSecret).update(message).digest('hex');}};
 const requestSecret = Buffer.alloc(32, 53), responseSecret = Buffer.alloc(32, 55), ackSecret = Buffer.alloc(32, 57);
 const { publicKey: guardPublic, privateKey: guardPrivate } = generateKeyPairSync('ed25519');
 const { publicKey: sourcePublic, privateKey: sourcePrivate } = generateKeyPairSync('ed25519');
@@ -88,6 +91,7 @@ function workerEnv(mode: string, receiverUrl: string, leaseBinding?: object, red
     BPC_HA_GUARD_PUBLIC_KEY:guardPublic.export({type:'spki',format:'pem'}).toString(),
     BPC_HA_NODE_PUBLIC_KEY:nodeAPublic.export({type:'spki',format:'pem'}).toString(),BPC_HA_NODE_PRIVATE_KEY:nodeAPrivate.export({type:'pkcs8',format:'pem'}).toString(),
     BPC_HA_SEAL_KEY:sealKey.toString('base64url'), BPC_HA_REDIS_PROBE_URL:redisProbeUrl,
+    BPC_HA_MUTATION_TICKET_SECRET:mutationTicketSecret.toString('base64url'),
     BPC_HA_REDIS_URLS:redisProbeUrl ? [redisProbeUrl,redisProbeUrl,redisProbeUrl].join(',') : REDIS_URLS.join(','),BPC_HA_CONTROL_PG_URL:URL_CONTROL };
 }
 function spawnWorker(env: NodeJS.ProcessEnv): ChildProcess {
@@ -110,7 +114,10 @@ let server: Server | null = null;
 async function main(): Promise<void> {
   await Promise.all(redisMembers.map(r=>r.flushdb())); await reset(poolA); await reset(poolB); await reset(poolControl);
   const idA=await systemId(poolA), idB=await systemId(poolB), idControl=await systemId(poolControl); assert.equal(new Set([idA,idB,idControl]).size,3);
-  const readyA=await provisionSchemaVersion(dbA,'public'); let readyB=await provisionSchemaVersion(dbB,'public');const haReadyA=await provisionBpcHaSchema(dbA);let haReadyB=await provisionBpcHaSchema(dbB);const haReadyControl=await provisionBpcHaSchema(dbControl);
+  const readyA=await provisionSchemaVersion(dbA,'public'); let readyB=await provisionSchemaVersion(dbB,'public');const haReadyA=await provisionBpcHaSchema(dbA);let haReadyB=await provisionBpcHaSchema(dbB);const haReadyControl=await provisionBpcHaSchema(dbControl);await poolA.query('INSERT INTO bpc_ha.mutation_ticket_key(key_id,secret) VALUES($1,$2)',['mutation-v1',mutationTicketSecret]);await poolB.query('INSERT INTO bpc_ha.mutation_ticket_key(key_id,secret) VALUES($1,$2)',['mutation-v1',mutationTicketSecret]);
+  await poolA.query("DO $$ BEGIN IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bpc_runtime_acceptance') THEN REASSIGN OWNED BY bpc_runtime_acceptance TO bpc_test; DROP OWNED BY bpc_runtime_acceptance; DROP ROLE bpc_runtime_acceptance; END IF; CREATE ROLE bpc_runtime_acceptance LOGIN PASSWORD 'bpc-runtime-test-only'; END $$");
+  await provisionBpcRuntimeMutationBoundary(dbA,'bpc_runtime_acceptance','mutation-v1',mutationTicketSecret);
+  const runtimeUrl=new URL(URL_A);runtimeUrl.username='bpc_runtime_acceptance';runtimeUrl.password='bpc-runtime-test-only';poolRuntimeA=new Pool({connectionString:runtimeUrl.toString(),max:4});poolRuntimeA.on('error',()=>{});const dbRuntimeA=new NodePostgresTransactor(poolRuntimeA as never,{statementTimeoutMs:800,transactionTimeoutMs:1_000});const readyRuntimeA=await assertSchemaReady(dbRuntimeA,'public');const haReadyRuntimeA=await assertBpcHaSchemaReady(dbRuntimeA);
   await assert.rejects(PgRedisFenceWitness.open(dbControl,haReadyA,sourceResolver),/schema-readiness capability/);
   const statusConstraint=String((await poolA.query("SELECT conname FROM pg_catalog.pg_constraint WHERE conrelid='bpc_ha.source_lease'::regclass AND contype='c' AND pg_catalog.pg_get_constraintdef(oid) LIKE '%status%'")).rows[0].conname);await poolA.query(`ALTER TABLE bpc_ha.source_lease DROP CONSTRAINT ${statusConstraint}`);await assert.rejects(provisionBpcHaSchema(dbA),/schema attestation failed/);await poolA.query(`ALTER TABLE bpc_ha.source_lease ADD CONSTRAINT ${statusConstraint} CHECK (status IN ('active','revoked'))`);
   await poolA.query('INSERT INTO ha_outbox_fence(stream_id,fence_token) VALUES($1,1)',[SID]);
@@ -130,8 +137,12 @@ async function main(): Promise<void> {
   const grant1=signSourceLeaseGrant('guard-v1',guardPrivate,{streamId:SID,epoch:1,status:'active',holderNodeId:'node-a',leaseId:'lease-a',commandId:'grant-a1',expiresAtMs:aLeaseExpiry,maxTransactionDurationMs:dbA.maxTransactionDurationMs,grantSeq:1,prevDigest:null});
   await dbA.transaction((exec)=>installSourceLeaseGrant(exec,sourceResolver,grant1));await dbControl.transaction((exec)=>installSourceLeaseGrant(exec,sourceResolver,grant1));
   const binding1={streamId:SID,epoch:1,holderNodeId:'node-a',authoritySystemId:idA,nodeCredentialKeyId:'node-a-hsm',leaseId:'lease-a',grantDigest:grant1.grantDigest,redisClaimDigest:redisFenceRecordDigest(redisA),maxClockSkewMs:25,maxTransactionDurationMs:dbA.maxTransactionDurationMs};
-  const makeStoreA=async(binding:typeof binding1)=>createHaPairAuthority(dbA,readyA,{streamId:SID,fenceToken:1n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbA,haReadyA,sourceResolver,binding,fenceStore,nodeAIdentity));
+  const makeStoreA=async(binding:typeof binding1)=>createHaPairAuthority(dbRuntimeA,readyRuntimeA,{streamId:SID,fenceToken:1n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbRuntimeA,haReadyRuntimeA,sourceResolver,binding,fenceStore,nodeAIdentity,mutationTicketSigner));
   let storeA=await makeStoreA(binding1);
+  await assert.rejects(poolRuntimeA.query("INSERT INTO bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,kind) VALUES('bypass','x','read','production',$1,$2,'active',1,NULL,0,0,'legitimate')",[Buffer.alloc(32,1).toString('base64url'),pair(1).pubJwk]),/permission denied/);
+  await assert.rejects(poolRuntimeA.query("UPDATE bpc_pairs SET status='revoked' WHERE id='missing'"),/permission denied/);await assert.rejects(poolRuntimeA.query("DELETE FROM bpc_pending WHERE token='missing'"),/permission denied/);
+  await assert.rejects(poolRuntimeA.query("SELECT bpc_ha.apply_pair_mutation('{}'::jsonb,'pair-delete','[]'::jsonb)"),/mutation ticket|invalid controlled/i);
+  await assert.rejects(poolRuntimeA.query('SELECT secret FROM bpc_ha.mutation_ticket_key'),/permission denied/);
 
   let receiver=new PgReceiverCheckpoint<BpcPairMutation>(dbB,SID,bpcPairMutationSanitizer,new PgPairMutationApplier(SID,keyring),readyB);
   const nonceStore=await PgReplayNonceStore.open(dbB,'public'); let holdAck=false; let releaseAck:()=>void=()=>{};
@@ -143,7 +154,7 @@ async function main(): Promise<void> {
   const publisher=()=>new PgDurablePublisher(dbA,SID,transport,'fail-authoritative-mutation',bpcPairMutationSanitizer,ackVerifier,readyA,{leaseMs:2_000});
   const drain=async()=>{for(let i=0;i<20;i++){await publisher().drainOnce();const n=Number((await poolA.query('SELECT count(*)::int n FROM ha_outbox_rows WHERE stream_id=$1 AND acked_at IS NULL AND quarantined_at IS NULL',[SID])).rows[0].n);if(n===0)return;await sleep(50);}throw new Error('drain did not converge');};
 
-  await storeA.set(pair(1)); await drain();
+  await storeA.set(pair(1));assert.equal(Number((await poolA.query("SELECT count(*)::int n FROM bpc_pairs WHERE id='pair-1'")).rows[0].n),1); await drain();
 
   // Actual publisher process death after B committed but before its ACK reached A.
   await storeA.set(pair(2)); holdAck=true; ackGate=new Promise<void>((resolve)=>{releaseAck=resolve;});
@@ -159,7 +170,7 @@ async function main(): Promise<void> {
   // Capture C=3, discard the old receiver authority, and bootstrap a genuinely
   // fresh B solely from the signed source snapshot.
   const snapshotAtC=await buildPairSnapshotBundle<BpcPairMutation>(dbA,SID,3,'source-v1',sourcePrivate);
-  await reset(poolB);readyB=await provisionSchemaVersion(dbB,'public');haReadyB=await provisionBpcHaSchema(dbB);
+  await reset(poolB);readyB=await provisionSchemaVersion(dbB,'public');haReadyB=await provisionBpcHaSchema(dbB);await poolB.query('INSERT INTO bpc_ha.mutation_ticket_key(key_id,secret) VALUES($1,$2)',['mutation-v1',mutationTicketSecret]);
   await poolB.query('INSERT INTO ha_outbox_fence(stream_id,fence_token) VALUES($1,1)',[SID]);
   await poolB.query('INSERT INTO ha_outbox_receiver_checkpoint(stream_id,source_epoch,sequence) VALUES($1,$2,0)',[SID,E1]);
   receiver=new PgReceiverCheckpoint<BpcPairMutation>(dbB,SID,bpcPairMutationSanitizer,new PgPairMutationApplier(SID,keyring),readyB);
@@ -176,7 +187,7 @@ async function main(): Promise<void> {
   // writer from the quorum after DML, then release the callback. The real
   // pre-commit hook must reject and roll back the entire transaction.
   await poolA.query('CREATE TABLE IF NOT EXISTS precommit_probe(id int primary key)');
-  const liveFence=await PgSourceLeaseFence.open(dbA,haReadyA,sourceResolver,binding2,fenceStore,nodeAIdentity);
+  const liveFence=await PgSourceLeaseFence.open(dbA,haReadyA,sourceResolver,binding2,fenceStore,nodeAIdentity,mutationTicketSigner);
   const guardedOutbox=new PgDurableOutbox(dbA,readyA,{streamId:SID,sanitizer:bpcPairMutationSanitizer,maxPendingRows:100,backpressure:'fail-authoritative-mutation',preCommitCheck:(exec)=>liveFence.assertWritableInTx(exec)});
   let entered!:()=>void,released!:()=>void;const enteredP=new Promise<void>(r=>entered=r),releaseP=new Promise<void>(r=>released=r);
   const inFlight=guardedOutbox.withOutboxTx(async(tx,exec)=>{await guardedOutbox.appendInTx(tx,{streamId:SID,rawMutation:{kind:'bpc.pair.delete.v1',pairId:'precommit-probe'},fenceToken:1n});await exec.query('INSERT INTO precommit_probe(id) VALUES(1)');entered();await releaseP;});
@@ -209,9 +220,9 @@ async function main(): Promise<void> {
   const aliasedGuard=await buildPromotionReadinessAttestation(dbB,fenced,'guard-alias','guard-alias',guardPrivate);await assert.rejects(controller.markActive('promote-b',aliasedGuard,sourceResolver),/independent snapshot authority/);
   const readiness=await buildPromotionReadinessAttestation(dbB,fenced,bundle.manifest.keyId,'source-v1',sourcePrivate);const active=await controller.markActive('promote-b',readiness,sourceResolver);await installActiveCutoverReceipt(dbB,sourceResolver,active,readiness);
   const bindingB={streamId:SID,epoch:2,holderNodeId:'node-b',authoritySystemId:idB,nodeCredentialKeyId:'node-b-hsm',leaseId:'lease-b',grantDigest:grantB.grantDigest,redisClaimDigest:redisFenceRecordDigest(redisB),maxClockSkewMs:25,maxTransactionDurationMs:dbB.maxTransactionDurationMs,activationDigest:active.stateDigestSigned};
-  const storeB=createHaPairAuthority(dbB,readyB,{streamId:SID,fenceToken:2n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbB,haReadyB,sourceResolver,bindingB,fenceStore,nodeBIdentity));
-  await assert.rejects(PgSourceLeaseFence.open(dbB,haReadyB,sourceResolver,bindingB,fenceStore,nodeAIdentity),/node identity prover/);
-  const cloneBinding={...bindingB,authoritySystemId:idA};await assert.rejects(async()=>{const clonedStore=createHaPairAuthority(dbB,readyB,{streamId:SID,fenceToken:2n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbB,haReadyB,sourceResolver,cloneBinding,fenceStore,nodeBIdentity));await clonedStore.set(pair(99));},/PostgreSQL identity|readiness binding/);assert.equal(Number((await poolB.query("SELECT count(*)::int n FROM bpc_pairs WHERE id='pair-99'")).rows[0].n),0);
+  const storeB=createHaPairAuthority(dbB,readyB,{streamId:SID,fenceToken:2n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbB,haReadyB,sourceResolver,bindingB,fenceStore,nodeBIdentity,mutationTicketSigner));
+  await assert.rejects(PgSourceLeaseFence.open(dbB,haReadyB,sourceResolver,bindingB,fenceStore,nodeAIdentity,mutationTicketSigner),/node identity prover/);
+  const cloneBinding={...bindingB,authoritySystemId:idA};await assert.rejects(async()=>{const clonedStore=createHaPairAuthority(dbB,readyB,{streamId:SID,fenceToken:2n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbB,haReadyB,sourceResolver,cloneBinding,fenceStore,nodeBIdentity,mutationTicketSigner));await clonedStore.set(pair(99));},/PostgreSQL identity|readiness binding/);assert.equal(Number((await poolB.query("SELECT count(*)::int n FROM bpc_pairs WHERE id='pair-99'")).rows[0].n),0);
   await storeB.set(pair(7)); const promotionRtoMs=Date.now()-cutoverAt;
   const rollbackAt=Date.now();await redisMembers[1]!.set('bpc:ha:final',JSON.stringify(redisA));await redisMembers[2]!.set('bpc:ha:final',JSON.stringify(redisA));
   await assert.rejects(fenceStore.current(),/rollback|disagrees|future/);await assert.rejects(storeB.set(pair(8)),/rollback|disagrees|future/);assert.equal(Number((await poolB.query("SELECT count(*)::int n FROM bpc_pairs WHERE id='pair-8'")).rows[0].n),0);
@@ -236,4 +247,4 @@ async function main(): Promise<void> {
 }
 
 try { await main(); }
-finally { if(server)await new Promise<void>((resolve)=>server!.close(()=>resolve()));await poolA.end().catch(()=>{});await poolB.end().catch(()=>{});await poolControl.end().catch(()=>{});for(const redis of redisMembers)redis.disconnect();sealKey.fill(0);requestSecret.fill(0);responseSecret.fill(0);ackSecret.fill(0); }
+finally { if(server)await new Promise<void>((resolve)=>server!.close(()=>resolve()));await poolRuntimeA?.end().catch(()=>{});await poolA.end().catch(()=>{});await poolB.end().catch(()=>{});await poolControl.end().catch(()=>{});for(const redis of redisMembers)redis.disconnect();sealKey.fill(0);mutationTicketSecret.fill(0);requestSecret.fill(0);responseSecret.fill(0);ackSecret.fill(0); }

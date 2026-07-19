@@ -213,6 +213,8 @@ export {
   BPC_HA_SCHEMA_MANIFEST,
   bpcHaSchemaManifest,
   provisionBpcHaSchema,
+  assertBpcHaSchemaReady,
+  provisionBpcRuntimeMutationBoundary,
   BpcRedisQuorumFenceStore,
   BpcCutoverController,
   PgRedisFenceWitness,
@@ -250,6 +252,7 @@ export type {
   SourceLeaseGrant,
   BpcHaReadyToken,
   NodeIdentityProver,
+  DbMutationTicketSigner,
 } from './bpc-ha-final.js';
 export type {
   FetchLike,
