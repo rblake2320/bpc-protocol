@@ -26,7 +26,7 @@ const HEX64 = /^[0-9a-f]{64}$/;
 const B64U = /^[A-Za-z0-9_-]+$/;
 const MAX_EPOCH = 2 ** 40;
 const MAX_MS = 8.64e15;
-const GOVERNED_DML_TABLES=['public.bpc_pairs','public.bpc_pending','public.ha_outbox_meta','public.ha_outbox_fence','public.ha_outbox_source_checkpoint','public.ha_outbox_receiver_checkpoint','public.ha_outbox_rows','public.ha_outbox_publisher_lease','public.ha_outbox_quarantine','public.ha_outbox_applied','bpc_ha.authority_stream','bpc_ha.cutover_head','bpc_ha.cutover_history','bpc_ha.epoch_witness','bpc_ha.mutation_ticket_key','bpc_ha.mutation_ticket_nonce','bpc_ha.promotion_attestation','bpc_ha.promotion_receipt','bpc_ha.redis_membership','bpc_ha.schema_meta','bpc_ha.source_activation','bpc_ha.source_lease','bpc_ha.source_lease_history'] as const;
+const GOVERNED_DML_TABLES=['public.bpc_pairs','public.bpc_pending','public.ha_outbox_meta','public.ha_outbox_fence','public.ha_outbox_source_checkpoint','public.ha_outbox_receiver_checkpoint','public.ha_outbox_rows','public.ha_outbox_publisher_lease','public.ha_outbox_quarantine','public.ha_outbox_applied','bpc_ha.authority_stream','bpc_ha.cutover_head','bpc_ha.cutover_history','bpc_ha.epoch_witness','bpc_ha.local_mutation_proof','bpc_ha.mutation_ticket_key','bpc_ha.mutation_ticket_nonce','bpc_ha.promotion_attestation','bpc_ha.promotion_receipt','bpc_ha.redis_membership','bpc_ha.schema_meta','bpc_ha.source_activation','bpc_ha.source_lease','bpc_ha.source_lease_history'] as const;
 
 function safeInt(value: unknown, label: string, min = 0, max = Number.MAX_SAFE_INTEGER): number {
   const n = typeof value === 'bigint' || typeof value === 'string' ? Number(value) : value;
@@ -186,6 +186,17 @@ CREATE TABLE IF NOT EXISTS bpc_ha.mutation_ticket_nonce (
   expires_at_ms bigint NOT NULL CHECK(expires_at_ms BETWEEN 0 AND ${MAX_MS}),
   used_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
 );
+CREATE TABLE IF NOT EXISTS bpc_ha.local_mutation_proof (
+  stream_id text NOT NULL,
+  source_epoch text NOT NULL,
+  sequence bigint NOT NULL CHECK(sequence BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}),
+  op_digest text NOT NULL CHECK(op_digest ~ '^[0-9a-f]{64}$'),
+  applied boolean NOT NULL DEFAULT false,
+  mutation_action text,
+  payload_digest text CHECK(payload_digest IS NULL OR payload_digest ~ '^[0-9a-f]{64}$'),
+  PRIMARY KEY(stream_id,source_epoch,sequence),
+  FOREIGN KEY(stream_id,source_epoch,sequence) REFERENCES public.ha_outbox_rows(stream_id,source_epoch,sequence) ON DELETE RESTRICT
+);
 CREATE OR REPLACE FUNCTION bpc_ha.constant_time_equal(left_value bytea,right_value bytea)
 RETURNS boolean LANGUAGE plpgsql IMMUTABLE STRICT SET search_path=pg_catalog AS $fn$
 DECLARE difference integer := octet_length(left_value) # octet_length(right_value); i integer;
@@ -196,18 +207,28 @@ BEGIN
   RETURN difference=0 AND octet_length(left_value)=32 AND octet_length(right_value)=32;
 END $fn$;
 REVOKE ALL ON FUNCTION bpc_ha.constant_time_equal(bytea,bytea) FROM PUBLIC;
+CREATE OR REPLACE FUNCTION bpc_ha.require_local_mutation_proof()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $fn$
+BEGIN
+  PERFORM 1 FROM bpc_ha.local_mutation_proof p WHERE p.stream_id=NEW.stream_id AND p.source_epoch=NEW.source_epoch AND p.sequence=NEW.sequence AND p.op_digest=NEW.op_digest AND p.applied AND p.mutation_action IS NOT NULL AND p.payload_digest IS NOT NULL;
+  IF NOT FOUND THEN RAISE EXCEPTION 'governed outbox row lacks its atomic local mutation proof'; END IF;
+  RETURN NULL;
+END $fn$;
+REVOKE ALL ON FUNCTION bpc_ha.require_local_mutation_proof() FROM PUBLIC;
+DROP TRIGGER IF EXISTS require_local_mutation_proof ON bpc_ha.local_mutation_proof;
+CREATE CONSTRAINT TRIGGER require_local_mutation_proof AFTER INSERT OR UPDATE ON bpc_ha.local_mutation_proof DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bpc_ha.require_local_mutation_proof();
 CREATE OR REPLACE FUNCTION bpc_ha.append_governed_outbox(ticket jsonb,max_pending bigint,fence_value numeric,mutation jsonb)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $fn$
 DECLARE k record; l record; cp record; pending bigint; now_ms bigint; message text; mutation_digest text; policy_digest text;
 BEGIN
-  IF max_pending<1 OR (SELECT count(*) FROM jsonb_object_keys(ticket))<>15 OR ticket->>'action'<>'outbox-append' OR ticket->>'mac' !~ '^[0-9a-f]{64}$' OR ticket->>'opDigest' !~ '^[0-9a-f]{64}$' THEN RAISE EXCEPTION 'invalid outbox ticket'; END IF;
+  IF max_pending<1 OR max_pending>9007199254740991 OR (SELECT count(*) FROM jsonb_object_keys(ticket))<>16 OR ticket->>'action'<>'outbox-append' OR ticket->>'mac' !~ '^[0-9a-f]{64}$' OR ticket->>'opDigest' !~ '^[0-9a-f]{64}$' OR ticket->>'maxPendingRows' !~ '^[1-9][0-9]{0,15}$' OR (ticket->>'maxPendingRows')::bigint<>max_pending THEN RAISE EXCEPTION 'invalid outbox ticket or admission limit mismatch'; END IF;
   SELECT * INTO k FROM bpc_ha.mutation_ticket_key WHERE key_id=ticket->>'keyId' AND active FOR SHARE; IF NOT FOUND THEN RAISE EXCEPTION 'unknown ticket key'; END IF;
   SELECT * INTO l FROM bpc_ha.source_lease WHERE stream_id=ticket->>'streamId' FOR SHARE; IF NOT FOUND OR l.status<>'active' OR l.epoch::text<>ticket->>'epoch' OR l.lease_id<>ticket->>'leaseId' OR l.grant_digest<>ticket->>'grantDigest' THEN RAISE EXCEPTION 'stale source lease'; END IF;
   now_ms:=floor(extract(epoch FROM pg_catalog.clock_timestamp())*1000)::bigint;
   IF ticket->>'txid'<>pg_catalog.txid_current()::text OR (ticket->>'expiresAtMs')::bigint<now_ms OR (ticket->>'expiresAtMs')::bigint>=l.expires_at_ms THEN RAISE EXCEPTION 'outbox ticket or lease expired'; END IF;
   mutation_digest:=encode(public.digest(convert_to(jsonb_build_array(fence_value::text,mutation)::text,'UTF8'),'sha256'),'hex'); IF mutation_digest<>ticket->>'payloadDigest' THEN RAISE EXCEPTION 'outbox payload mismatch'; END IF;
-  policy_digest:=encode(public.digest(convert_to(jsonb_build_object('action','outbox-append','mutation',mutation,'payload',jsonb_build_array(fence_value::text,mutation),'streamId',ticket->>'streamId','sourceEpoch',ticket->>'sourceEpoch','sequence',ticket->>'sequence','fenceToken',fence_value::text,'epoch',ticket->>'epoch','leaseId',ticket->>'leaseId','grantDigest',ticket->>'grantDigest','holderNodeId',l.holder_node_id,'leaseExpiresAtMs',l.expires_at_ms::text)::text,'UTF8'),'sha256'),'hex');IF policy_digest<>ticket->>'policyDigest' THEN RAISE EXCEPTION 'outbox policy mismatch'; END IF;
-  message:=concat_ws('|','bpc-db-mutation/v1',ticket->>'keyId',ticket->>'nonce',ticket->>'streamId',ticket->>'epoch',ticket->>'leaseId',ticket->>'grantDigest',ticket->>'txid',ticket->>'expiresAtMs',ticket->>'sourceEpoch',ticket->>'sequence',ticket->>'opDigest',ticket->>'action',ticket->>'payloadDigest',ticket->>'policyDigest');
+  policy_digest:=encode(public.digest(convert_to(jsonb_build_object('action','outbox-append','mutation',mutation,'payload',jsonb_build_array(fence_value::text,mutation),'streamId',ticket->>'streamId','sourceEpoch',ticket->>'sourceEpoch','sequence',ticket->>'sequence','fenceToken',fence_value::text,'epoch',ticket->>'epoch','leaseId',ticket->>'leaseId','grantDigest',ticket->>'grantDigest','holderNodeId',l.holder_node_id,'leaseExpiresAtMs',l.expires_at_ms::text,'maxPendingRows',ticket->>'maxPendingRows')::text,'UTF8'),'sha256'),'hex');IF policy_digest<>ticket->>'policyDigest' THEN RAISE EXCEPTION 'outbox policy mismatch'; END IF;
+  message:=concat_ws('|','bpc-db-mutation/v1',ticket->>'keyId',ticket->>'nonce',ticket->>'streamId',ticket->>'epoch',ticket->>'leaseId',ticket->>'grantDigest',ticket->>'txid',ticket->>'expiresAtMs',ticket->>'sourceEpoch',ticket->>'sequence',ticket->>'opDigest',ticket->>'action',ticket->>'maxPendingRows',ticket->>'payloadDigest',ticket->>'policyDigest');
   IF NOT bpc_ha.constant_time_equal(public.hmac(convert_to(message,'UTF8'),k.secret,'sha256'),decode(ticket->>'mac','hex')) THEN RAISE EXCEPTION 'invalid outbox ticket MAC'; END IF;
   PERFORM 1 FROM public.ha_outbox_fence WHERE stream_id=ticket->>'streamId' AND fence_token=fence_value FOR UPDATE;IF NOT FOUND THEN RAISE EXCEPTION 'stream fence missing or stale'; END IF;
   SELECT source_epoch,sequence INTO cp FROM public.ha_outbox_source_checkpoint WHERE stream_id=ticket->>'streamId' FOR UPDATE;
@@ -215,6 +236,7 @@ BEGIN
   SELECT count(*) INTO pending FROM public.ha_outbox_rows WHERE stream_id=ticket->>'streamId' AND acked_at IS NULL AND quarantined_at IS NULL;IF pending>=max_pending THEN RAISE EXCEPTION 'authoritative outbox backpressure'; END IF;
   INSERT INTO bpc_ha.mutation_ticket_nonce(nonce,expires_at_ms) VALUES(ticket->>'nonce',(ticket->>'expiresAtMs')::bigint);
   INSERT INTO public.ha_outbox_rows(stream_id,source_epoch,sequence,fence_token,op_digest,mutation) VALUES(ticket->>'streamId',ticket->>'sourceEpoch',(ticket->>'sequence')::bigint,fence_value,ticket->>'opDigest',mutation);
+  INSERT INTO bpc_ha.local_mutation_proof(stream_id,source_epoch,sequence,op_digest) VALUES(ticket->>'streamId',ticket->>'sourceEpoch',(ticket->>'sequence')::bigint,ticket->>'opDigest');
   UPDATE public.ha_outbox_source_checkpoint SET sequence=(ticket->>'sequence')::bigint WHERE stream_id=ticket->>'streamId'; IF NOT FOUND THEN RAISE EXCEPTION 'checkpoint advance failed'; END IF;
 END $fn$;
 REVOKE ALL ON FUNCTION bpc_ha.append_governed_outbox(jsonb,bigint,numeric,jsonb) FROM PUBLIC;
@@ -228,7 +250,7 @@ DECLARE
 BEGIN
   IF action NOT IN ('pair-upsert','pair-insert','pair-delete','pending-upsert','pending-delete','pair-approve','pair-rotate') THEN RAISE EXCEPTION 'unsupported controlled mutation'; END IF;
   IF jsonb_typeof(ticket) <> 'object' OR jsonb_typeof(payload) <> 'array' THEN RAISE EXCEPTION 'invalid controlled mutation shape'; END IF;
-  IF (SELECT count(*) FROM jsonb_object_keys(ticket)) <> 15 THEN RAISE EXCEPTION 'invalid mutation ticket fields'; END IF;
+  IF (SELECT count(*) FROM jsonb_object_keys(ticket)) <> 16 OR ticket->>'maxPendingRows'<>'0' THEN RAISE EXCEPTION 'invalid mutation ticket fields'; END IF;
   IF ticket->>'mac' !~ '^[0-9a-f]{64}$' OR ticket->>'payloadDigest' !~ '^[0-9a-f]{64}$' OR ticket->>'nonce' !~ '^[A-Za-z0-9_-]{22,128}$' THEN RAISE EXCEPTION 'invalid mutation ticket encoding'; END IF;
   SELECT * INTO k FROM bpc_ha.mutation_ticket_key WHERE key_id=ticket->>'keyId' AND active FOR SHARE;
   IF NOT FOUND THEN RAISE EXCEPTION 'unknown or revoked mutation ticket key'; END IF;
@@ -238,8 +260,8 @@ BEGIN
   IF ticket->>'txid' <> pg_catalog.txid_current()::text OR (ticket->>'expiresAtMs')::bigint < now_ms OR (ticket->>'expiresAtMs')::bigint > now_ms+30000 OR now_ms >= l.expires_at_ms OR (ticket->>'expiresAtMs')::bigint >= l.expires_at_ms THEN RAISE EXCEPTION 'mutation ticket or source lease expired'; END IF;
   IF action <> ticket->>'action' OR encode(public.digest(convert_to(payload::text,'UTF8'),'sha256'),'hex') <> ticket->>'payloadDigest' THEN RAISE EXCEPTION 'mutation ticket payload mismatch'; END IF;
   SELECT r.mutation,r.fence_token INTO outbox_mutation,outbox_fence FROM public.ha_outbox_rows r WHERE r.stream_id=ticket->>'streamId' AND r.source_epoch=ticket->>'sourceEpoch' AND r.sequence=(ticket->>'sequence')::bigint AND r.op_digest=ticket->>'opDigest' AND r.xmin::text=(((ticket->>'txid')::bigint % 4294967296)::text);IF NOT FOUND THEN RAISE EXCEPTION 'mutation ticket is not coupled to a current-transaction outbox row'; END IF;
-  policy_digest:=encode(public.digest(convert_to(jsonb_build_object('action',action,'mutation',outbox_mutation,'payload',payload,'streamId',ticket->>'streamId','sourceEpoch',ticket->>'sourceEpoch','sequence',ticket->>'sequence','fenceToken',outbox_fence::text,'epoch',ticket->>'epoch','leaseId',ticket->>'leaseId','grantDigest',ticket->>'grantDigest','holderNodeId',l.holder_node_id,'leaseExpiresAtMs',l.expires_at_ms::text)::text,'UTF8'),'sha256'),'hex');IF policy_digest<>ticket->>'policyDigest' THEN RAISE EXCEPTION 'mutation policy mismatch'; END IF;
-  message := concat_ws('|','bpc-db-mutation/v1',ticket->>'keyId',ticket->>'nonce',ticket->>'streamId',ticket->>'epoch',ticket->>'leaseId',ticket->>'grantDigest',ticket->>'txid',ticket->>'expiresAtMs',ticket->>'sourceEpoch',ticket->>'sequence',ticket->>'opDigest',ticket->>'action',ticket->>'payloadDigest',ticket->>'policyDigest');
+  policy_digest:=encode(public.digest(convert_to(jsonb_build_object('action',action,'mutation',outbox_mutation,'payload',payload,'streamId',ticket->>'streamId','sourceEpoch',ticket->>'sourceEpoch','sequence',ticket->>'sequence','fenceToken',outbox_fence::text,'epoch',ticket->>'epoch','leaseId',ticket->>'leaseId','grantDigest',ticket->>'grantDigest','holderNodeId',l.holder_node_id,'leaseExpiresAtMs',l.expires_at_ms::text,'maxPendingRows',ticket->>'maxPendingRows')::text,'UTF8'),'sha256'),'hex');IF policy_digest<>ticket->>'policyDigest' THEN RAISE EXCEPTION 'mutation policy mismatch'; END IF;
+  message := concat_ws('|','bpc-db-mutation/v1',ticket->>'keyId',ticket->>'nonce',ticket->>'streamId',ticket->>'epoch',ticket->>'leaseId',ticket->>'grantDigest',ticket->>'txid',ticket->>'expiresAtMs',ticket->>'sourceEpoch',ticket->>'sequence',ticket->>'opDigest',ticket->>'action',ticket->>'maxPendingRows',ticket->>'payloadDigest',ticket->>'policyDigest');
   IF NOT bpc_ha.constant_time_equal(public.hmac(convert_to(message,'UTF8'),k.secret,'sha256'),decode(ticket->>'mac','hex')) THEN RAISE EXCEPTION 'invalid mutation ticket MAC'; END IF;
   INSERT INTO bpc_ha.mutation_ticket_nonce(nonce,expires_at_ms) VALUES(ticket->>'nonce',(ticket->>'expiresAtMs')::bigint);
   IF action='pair-approve' THEN
@@ -281,6 +303,8 @@ BEGIN
     ELSE DELETE FROM public.bpc_pending WHERE token=payload->>0; END IF;
   END IF;
   GET DIAGNOSTICS affected = ROW_COUNT;
+  UPDATE bpc_ha.local_mutation_proof SET applied=true,mutation_action=action,payload_digest=ticket->>'payloadDigest' WHERE stream_id=ticket->>'streamId' AND source_epoch=ticket->>'sourceEpoch' AND sequence=(ticket->>'sequence')::bigint AND op_digest=ticket->>'opDigest' AND NOT applied;
+  IF NOT FOUND THEN RAISE EXCEPTION 'local mutation proof missing or already completed'; END IF;
   RETURN affected;
 END $fn$;
 REVOKE ALL ON FUNCTION bpc_ha.apply_pair_mutation(jsonb,text,jsonb) FROM PUBLIC
@@ -298,7 +322,7 @@ REVOKE ALL ON FUNCTION bpc_ha.read_source_lease_for_write(text) FROM PUBLIC
 `.trim();
 
 export const BPC_HA_SCHEMA_VERSION=1;
-export const BPC_HA_SCHEMA_MANIFEST='eab28ffab742efdb594cc7a1472b5ca6b49d312eeaad791e16700526306a0534';
+export const BPC_HA_SCHEMA_MANIFEST='93d43e17a3dfe19f70a6861cdf05811600fb1ca6ba0c442c14aa875d2b7c1160';
 const HA_READY_STATE=new WeakMap<object,{db:PgTransactor;manifest:string}>();
 export interface BpcHaReadyToken{readonly __bpcHaReady:never}
 export async function bpcHaSchemaManifest(exec:PgExecutor):Promise<string>{
@@ -400,12 +424,12 @@ export interface SourceLeaseBinding { streamId: string; epoch: number; holderNod
 /** Production implementations must keep the shared HMAC key outside the
  * runtime process (TPM/HSM policy operation). The database holds its verifier
  * copy under the provisioner role; the runtime login cannot read it. */
-export interface DbMutationTicketRequest {readonly domain:'bpc-db-mutation/v1';readonly keyId:string;readonly nonce:string;readonly streamId:string;readonly epoch:string;readonly leaseId:string;readonly grantDigest:string;readonly txid:string;readonly expiresAtMs:string;readonly sourceEpoch:string;readonly sequence:string;readonly opDigest:string;readonly action:string;readonly payloadDigest:string;readonly policyDigest:string}
+export interface DbMutationTicketRequest {readonly domain:'bpc-db-mutation/v1';readonly keyId:string;readonly nonce:string;readonly streamId:string;readonly epoch:string;readonly leaseId:string;readonly grantDigest:string;readonly txid:string;readonly expiresAtMs:string;readonly sourceEpoch:string;readonly sequence:string;readonly opDigest:string;readonly action:string;readonly maxPendingRows:string;readonly payloadDigest:string;readonly policyDigest:string}
 export interface DbMutationPolicyContext {readonly canonicalPolicy:string}
 export function validateDbMutationPolicyContext(request:Readonly<DbMutationTicketRequest>,context:Readonly<DbMutationPolicyContext>,codec:PairPayloadCodec):void{
   if(sha256(context.canonicalPolicy)!==request.policyDigest)throw new ContractValidationError('mutation policy digest mismatch');
   let policy:Record<string,unknown>;try{policy=JSON.parse(context.canonicalPolicy) as Record<string,unknown>;}catch{throw new ContractValidationError('mutation policy is not JSON');}
-  const mutation=policy['mutation'] as Record<string,unknown>,payload=policy['payload'];if(!mutation||typeof mutation!=='object'||!Array.isArray(payload)||policy['action']!==request.action||policy['streamId']!==request.streamId||policy['sourceEpoch']!==request.sourceEpoch||policy['sequence']!==request.sequence)throw new ContractValidationError('mutation policy binding mismatch');bpcPairMutationSanitizer.assertSanitized(mutation);const clean=mutation as SanitizedMutation<BpcPairMutation>;
+  const mutation=policy['mutation'] as Record<string,unknown>,payload=policy['payload'];if(!mutation||typeof mutation!=='object'||!Array.isArray(payload)||policy['action']!==request.action||policy['streamId']!==request.streamId||policy['sourceEpoch']!==request.sourceEpoch||policy['sequence']!==request.sequence||policy['maxPendingRows']!==request.maxPendingRows)throw new ContractValidationError('mutation policy binding mismatch');const admissionLimit=safeInt(request.maxPendingRows,'maxPendingRows',0);if(request.action==='outbox-append'?admissionLimit<1:admissionLimit!==0)throw new ContractValidationError('mutation policy admission limit invalid');bpcPairMutationSanitizer.assertSanitized(mutation);const clean=mutation as SanitizedMutation<BpcPairMutation>;
   const fenceToken=String(policy['fenceToken']);if(canonicalOpDigest({streamId:request.streamId,sourceEpoch:request.sourceEpoch,sequence:safeInt(request.sequence,'policy sequence',1),fenceToken,mutation:mutation as SanitizedMutation<unknown>})!==request.opDigest)throw new ContractValidationError('mutation policy opDigest mismatch');
   const pairParams=(p:ReturnType<PairPayloadCodec['openPair']>)=>[p.id,p.name,p.scope,p.mode,p.secretHash,JSON.stringify(p.pubJwk),p.status,p.created,p.lastActive,p.requests,p.failedSigs,p.cumulativeFailures??null,p.firstFailureAt??null,p.maxRequests??null,p.kind??'legitimate',p.canaryClass??null,p.expiresAt??null];
   let expectedActions:Record<string,unknown[]>={'outbox-append':payload};
@@ -419,8 +443,9 @@ export function validateDbMutationPolicyContext(request:Readonly<DbMutationTicke
   const expected=expectedActions[request.action];if(!expected||canonicalize(payload)!==canonicalize(expected))throw new ContractValidationError('sealed mutation does not authorize the complete DML payload');
 }
 /** Separate policy boundary. A production implementation must authorize the
- * canonical outbox mutation -> action/payload mapping and current external
- * authority proof; it must not expose a general MAC oracle. */
+ * canonical outbox mutation -> action/payload mapping, independently governed
+ * approval-capacity/admission limits, and current external authority proof; it
+ * must not expose a general MAC oracle. */
 export interface DbMutationTicketSigner { readonly keyId:string; signTicket(request:Readonly<DbMutationTicketRequest>,context:Readonly<DbMutationPolicyContext>):Promise<string> }
 const FENCE_CAPABILITIES = new WeakMap<PgSourceLeaseFence, PgTransactor>();
 export class PgSourceLeaseFence {
@@ -459,14 +484,14 @@ export class PgSourceLeaseFence {
     const systemId=String((await exec.query('SELECT system_identifier::text value FROM pg_catalog.pg_control_system()')).rows[0]?.value);if(systemId!==this.binding.authoritySystemId||redis.authoritySystemId!==systemId)throw new ContractValidationError('source authority PostgreSQL identity does not match its signed fence');
     const challenge=frame('bpc-source-write/v1',this.binding.streamId,this.binding.epoch,systemId,this.binding.grantDigest,this.binding.redisClaimDigest,randomBytes(32).toString('base64url'));const proof=await this.nodeIdentity.prove(challenge);verify(this.resolver,this.binding.nodeCredentialKeyId,nodeIdentityMessage(challenge),proof);
   }
-  private async issueTicket(exec:PgExecutor,header:OutboxRecordHeader,action:string,payloadJson:string,mutationJson:string):Promise<Record<string,string>>{
-    const nonce=randomBytes(24).toString('base64url');const clock=(await exec.query("SELECT pg_catalog.txid_current()::text txid,(extract(epoch FROM pg_catalog.clock_timestamp())*1000)::bigint::text now_ms,expires_at_ms::text lease_expiry,encode(public.digest(convert_to(($1::jsonb)::text,'UTF8'),'sha256'),'hex') payload_digest,(jsonb_build_object('action',$3::text,'mutation',$4::jsonb,'payload',$1::jsonb,'streamId',$2::text,'sourceEpoch',$5::text,'sequence',$6::text,'fenceToken',$7::text,'epoch',epoch::text,'leaseId',lease_id,'grantDigest',grant_digest,'holderNodeId',holder_node_id,'leaseExpiresAtMs',expires_at_ms::text))::text policy_canonical FROM bpc_ha.source_lease WHERE stream_id=$2::text",[payloadJson,this.binding.streamId,action,mutationJson,header.sourceEpoch,String(header.sequence),String(header.fenceToken)])).rows[0];
+  private async issueTicket(exec:PgExecutor,header:OutboxRecordHeader,action:string,payloadJson:string,mutationJson:string,maxPendingRows=0):Promise<Record<string,string>>{
+    const nonce=randomBytes(24).toString('base64url'),admission=String(safeInt(maxPendingRows,'maxPendingRows',0));const clock=(await exec.query("SELECT pg_catalog.txid_current()::text txid,(extract(epoch FROM pg_catalog.clock_timestamp())*1000)::bigint::text now_ms,expires_at_ms::text lease_expiry,encode(public.digest(convert_to(($1::jsonb)::text,'UTF8'),'sha256'),'hex') payload_digest,(jsonb_build_object('action',$3::text,'mutation',$4::jsonb,'payload',$1::jsonb,'streamId',$2::text,'sourceEpoch',$5::text,'sequence',$6::text,'fenceToken',$7::text,'epoch',epoch::text,'leaseId',lease_id,'grantDigest',grant_digest,'holderNodeId',holder_node_id,'leaseExpiresAtMs',expires_at_ms::text,'maxPendingRows',$8::text))::text policy_canonical FROM bpc_ha.source_lease WHERE stream_id=$2::text",[payloadJson,this.binding.streamId,action,mutationJson,header.sourceEpoch,String(header.sequence),String(header.fenceToken),admission])).rows[0];
     const payloadDigest=String(clock?.payload_digest);if(!HEX64.test(payloadDigest))throw new ContractValidationError('database payload digest invalid');const txid=String(clock?.txid),nowMs=safeInt(clock?.now_ms,'database clock',0,MAX_MS),expiresAtMs=Math.min(nowMs+10_000,safeInt(clock?.lease_expiry,'lease expiry',0,MAX_MS)-this.binding.maxClockSkewMs-1);if(expiresAtMs<nowMs)throw new ContractValidationError('source lease cannot cover a mutation ticket');
-    const canonicalPolicy=String(clock?.policy_canonical),policyDigest=sha256(canonicalPolicy);const request=Object.freeze({domain:'bpc-db-mutation/v1' as const,keyId:this.mutationSigner.keyId,nonce,streamId:this.binding.streamId,epoch:String(this.binding.epoch),leaseId:this.binding.leaseId,grantDigest:this.binding.grantDigest,txid,expiresAtMs:String(expiresAtMs),sourceEpoch:header.sourceEpoch,sequence:String(header.sequence),opDigest:header.opDigest,action,payloadDigest,policyDigest}),context=Object.freeze({canonicalPolicy});const mac=await this.mutationSigner.signTicket(request,context);if(!/^[0-9a-f]{64}$/.test(mac))throw new ContractValidationError('mutation ticket signer returned invalid MAC');
+    const canonicalPolicy=String(clock?.policy_canonical),policyDigest=sha256(canonicalPolicy);const request=Object.freeze({domain:'bpc-db-mutation/v1' as const,keyId:this.mutationSigner.keyId,nonce,streamId:this.binding.streamId,epoch:String(this.binding.epoch),leaseId:this.binding.leaseId,grantDigest:this.binding.grantDigest,txid,expiresAtMs:String(expiresAtMs),sourceEpoch:header.sourceEpoch,sequence:String(header.sequence),opDigest:header.opDigest,action,maxPendingRows:admission,payloadDigest,policyDigest}),context=Object.freeze({canonicalPolicy});const mac=await this.mutationSigner.signTicket(request,context);if(!/^[0-9a-f]{64}$/.test(mac))throw new ContractValidationError('mutation ticket signer returned invalid MAC');
     const {domain:_domain,...ticketFields}=request;return {...ticketFields,mac};
   }
   async appendGovernedOutbox(exec:PgExecutor,input:{streamId:string;mutation:SanitizedMutation<unknown>;fenceToken:bigint;maxPendingRows:number}):Promise<OutboxRecordHeader>{
-    await this.assertWritableInTx(exec);if(input.streamId!==this.binding.streamId)throw new ContractValidationError('governed outbox stream mismatch');const fenceDecimal=String(input.fenceToken),mutationJson=JSON.stringify(input.mutation);const cp=(await exec.query('SELECT source_epoch,sequence FROM public.ha_outbox_source_checkpoint WHERE stream_id=$1',[input.streamId])).rows[0];if(!cp)throw new ContractValidationError('governed source checkpoint missing');const sourceEpoch=String(cp.source_epoch),sequence=safeInt(cp.sequence,'source sequence',0)+1;const opDigest=canonicalOpDigest({streamId:input.streamId,sourceEpoch,sequence,fenceToken:fenceDecimal,mutation:input.mutation});const header:OutboxRecordHeader={contractVersion:'1',streamId:input.streamId,sourceEpoch,sequence,fenceToken:fenceDecimal,opDigest};assertHeaderConformant(header);const payloadJson=JSON.stringify([fenceDecimal,input.mutation]);const ticket=await this.issueTicket(exec,header,'outbox-append',payloadJson,mutationJson);await exec.query('SELECT bpc_ha.append_governed_outbox($1::jsonb,$2,$3::numeric,$4::jsonb)',[JSON.stringify(ticket),input.maxPendingRows,fenceDecimal,mutationJson]);return header;
+    await this.assertWritableInTx(exec);if(input.streamId!==this.binding.streamId)throw new ContractValidationError('governed outbox stream mismatch');const fenceDecimal=String(input.fenceToken),mutationJson=JSON.stringify(input.mutation);const cp=(await exec.query('SELECT source_epoch,sequence FROM public.ha_outbox_source_checkpoint WHERE stream_id=$1',[input.streamId])).rows[0];if(!cp)throw new ContractValidationError('governed source checkpoint missing');const sourceEpoch=String(cp.source_epoch),sequence=safeInt(cp.sequence,'source sequence',0)+1;const opDigest=canonicalOpDigest({streamId:input.streamId,sourceEpoch,sequence,fenceToken:fenceDecimal,mutation:input.mutation});const header:OutboxRecordHeader={contractVersion:'1',streamId:input.streamId,sourceEpoch,sequence,fenceToken:fenceDecimal,opDigest};assertHeaderConformant(header);const payloadJson=JSON.stringify([fenceDecimal,input.mutation]);const ticket=await this.issueTicket(exec,header,'outbox-append',payloadJson,mutationJson,input.maxPendingRows);await exec.query('SELECT bpc_ha.append_governed_outbox($1::jsonb,$2,$3::numeric,$4::jsonb)',[JSON.stringify(ticket),input.maxPendingRows,fenceDecimal,mutationJson]);return header;
   }
   async applyControlledMutation(exec:PgExecutor,header:OutboxRecordHeader,action:string,payload:readonly unknown[]):Promise<{rows:Record<string,unknown>[];rowCount:number}>{
     await this.assertWritableInTx(exec);
