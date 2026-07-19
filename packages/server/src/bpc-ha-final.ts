@@ -226,7 +226,7 @@ AS $fn$
 DECLARE
   k record; l record; affected bigint; now_ms bigint; message text; outbox_mutation jsonb; outbox_fence numeric; policy_digest text;
 BEGIN
-  IF action NOT IN ('pair-upsert','pair-insert','pair-delete','pending-upsert','pending-delete') THEN RAISE EXCEPTION 'unsupported controlled mutation'; END IF;
+  IF action NOT IN ('pair-upsert','pair-insert','pair-delete','pending-upsert','pending-delete','pair-approve','pair-rotate') THEN RAISE EXCEPTION 'unsupported controlled mutation'; END IF;
   IF jsonb_typeof(ticket) <> 'object' OR jsonb_typeof(payload) <> 'array' THEN RAISE EXCEPTION 'invalid controlled mutation shape'; END IF;
   IF (SELECT count(*) FROM jsonb_object_keys(ticket)) <> 15 THEN RAISE EXCEPTION 'invalid mutation ticket fields'; END IF;
   IF ticket->>'mac' !~ '^[0-9a-f]{64}$' OR ticket->>'payloadDigest' !~ '^[0-9a-f]{64}$' OR ticket->>'nonce' !~ '^[A-Za-z0-9_-]{22,128}$' THEN RAISE EXCEPTION 'invalid mutation ticket encoding'; END IF;
@@ -242,7 +242,28 @@ BEGIN
   message := concat_ws('|','bpc-db-mutation/v1',ticket->>'keyId',ticket->>'nonce',ticket->>'streamId',ticket->>'epoch',ticket->>'leaseId',ticket->>'grantDigest',ticket->>'txid',ticket->>'expiresAtMs',ticket->>'sourceEpoch',ticket->>'sequence',ticket->>'opDigest',ticket->>'action',ticket->>'payloadDigest',ticket->>'policyDigest');
   IF NOT bpc_ha.constant_time_equal(public.hmac(convert_to(message,'UTF8'),k.secret,'sha256'),decode(ticket->>'mac','hex')) THEN RAISE EXCEPTION 'invalid mutation ticket MAC'; END IF;
   INSERT INTO bpc_ha.mutation_ticket_nonce(nonce,expires_at_ms) VALUES(ticket->>'nonce',(ticket->>'expiresAtMs')::bigint);
-  IF action IN ('pair-upsert','pair-insert') THEN
+  IF action='pair-approve' THEN
+    IF jsonb_array_length(payload)<>21 THEN RAISE EXCEPTION 'invalid approval payload'; END IF;
+    PERFORM 1 FROM public.bpc_pending WHERE token=payload->>0 AND registration=(payload->>1)::jsonb AND requested_at=(payload->>2)::bigint FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'pending approval precondition failed'; END IF;
+    IF (SELECT count(*) FROM public.bpc_pairs WHERE status='active') >= (payload->>3)::bigint THEN RAISE EXCEPTION 'maximum pair capacity reached'; END IF;
+    IF EXISTS(SELECT 1 FROM public.bpc_pairs WHERE id=payload->>4) THEN RAISE EXCEPTION 'approval pair identity already exists'; END IF;
+    DELETE FROM public.bpc_pending WHERE token=payload->>0 AND registration=(payload->>1)::jsonb AND requested_at=(payload->>2)::bigint;
+    IF NOT FOUND THEN RAISE EXCEPTION 'pending approval delete failed'; END IF;
+    INSERT INTO public.bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at)
+    VALUES(payload->>4,payload->>5,payload->>6,payload->>7,payload->>8,(payload->>9)::jsonb,payload->>10,(payload->>11)::bigint,(payload->>12)::bigint,(payload->>13)::bigint,(payload->>14)::bigint,(payload->>15)::double precision,(payload->>16)::bigint,(payload->>17)::bigint,payload->>18,payload->>19,(payload->>20)::bigint);
+  ELSIF action='pair-rotate' THEN
+    IF jsonb_array_length(payload)<>34 THEN RAISE EXCEPTION 'invalid rotation payload'; END IF;
+    UPDATE public.bpc_pairs SET status='rotated'
+    WHERE id=payload->>0 AND name=payload->>1 AND scope=payload->>2 AND mode=payload->>3 AND secret_hash=payload->>4 AND pub_jwk=(payload->>5)::jsonb AND status=payload->>6 AND created=(payload->>7)::bigint
+      AND last_active IS NOT DISTINCT FROM (payload->>8)::bigint AND requests=(payload->>9)::bigint AND failed_sigs=(payload->>10)::bigint
+      AND cumulative_failures IS NOT DISTINCT FROM (payload->>11)::double precision AND first_failure_at IS NOT DISTINCT FROM (payload->>12)::bigint
+      AND max_requests IS NOT DISTINCT FROM (payload->>13)::bigint AND kind=payload->>14 AND canary_class IS NOT DISTINCT FROM payload->>15 AND expires_at IS NOT DISTINCT FROM (payload->>16)::bigint;
+    IF NOT FOUND THEN RAISE EXCEPTION 'rotation old-pair precondition failed'; END IF;
+    IF EXISTS(SELECT 1 FROM public.bpc_pairs WHERE id=payload->>17) THEN RAISE EXCEPTION 'rotation replacement identity already exists'; END IF;
+    INSERT INTO public.bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at)
+    VALUES(payload->>17,payload->>18,payload->>19,payload->>20,payload->>21,(payload->>22)::jsonb,payload->>23,(payload->>24)::bigint,(payload->>25)::bigint,(payload->>26)::bigint,(payload->>27)::bigint,(payload->>28)::double precision,(payload->>29)::bigint,(payload->>30)::bigint,payload->>31,payload->>32,(payload->>33)::bigint);
+  ELSIF action IN ('pair-upsert','pair-insert') THEN
     IF jsonb_array_length(payload)<>17 THEN RAISE EXCEPTION 'invalid pair payload'; END IF;
     IF action='pair-insert' THEN
       INSERT INTO public.bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,cumulative_failures,first_failure_at,max_requests,kind,canary_class,expires_at)
@@ -277,7 +298,7 @@ REVOKE ALL ON FUNCTION bpc_ha.read_source_lease_for_write(text) FROM PUBLIC
 `.trim();
 
 export const BPC_HA_SCHEMA_VERSION=1;
-export const BPC_HA_SCHEMA_MANIFEST='9715603fc9b18ae6085da77abf090a391889ca8bd1caf3eab21a964f021e4fbb';
+export const BPC_HA_SCHEMA_MANIFEST='eab28ffab742efdb594cc7a1472b5ca6b49d312eeaad791e16700526306a0534';
 const HA_READY_STATE=new WeakMap<object,{db:PgTransactor;manifest:string}>();
 export interface BpcHaReadyToken{readonly __bpcHaReady:never}
 export async function bpcHaSchemaManifest(exec:PgExecutor):Promise<string>{
@@ -392,8 +413,8 @@ export function validateDbMutationPolicyContext(request:Readonly<DbMutationTicke
   else if(clean.kind==='bpc.pair.delete.v1')expectedActions['pair-delete']=[clean.pairId];
   else if(clean.kind==='bpc.pending.set.v1'){const opened=codec.openRegistration(clean.sealed,{domain:'bpc-pair-payload',version:'1',streamId:request.streamId,kind:clean.kind,token:clean.token,requestedAt:clean.requestedAt});expectedActions['pending-upsert']=[clean.token,JSON.stringify(opened),clean.requestedAt];}
   else if(clean.kind==='bpc.pending.delete.v1')expectedActions['pending-delete']=[clean.token];
-  else if(clean.kind==='bpc.pair.approve.v1'){const registration=codec.openRegistration(clean.expectedPending,{domain:'bpc-pair-payload',version:'1',streamId:request.streamId,kind:clean.kind,token:clean.token,requestedAt:clean.requestedAt}),opened=codec.openPair(clean.sealed,{domain:'bpc-pair-payload',version:'1',streamId:request.streamId,kind:clean.kind,pairId:clean.pairId});if(!hasInitialPairState(opened as never)||!pairMatchesRegistration(opened as never,registration))throw new ContractValidationError('approval sealed state/policy mismatch');expectedActions['pending-delete']=[clean.token,clean.requestedAt];expectedActions['pair-insert']=pairParams(opened);}
-  else if(clean.kind==='bpc.pair.rotate.v1'){const oldPair=codec.openPair(clean.expectedOld,{domain:'bpc-pair-payload',version:'1',streamId:request.streamId,kind:clean.kind,pairId:clean.oldPairId}),replacement=codec.openPair(clean.sealed,{domain:'bpc-pair-payload',version:'1',streamId:request.streamId,kind:clean.kind,pairId:clean.newPairId});if(oldPair.status!=='active'||!hasInitialPairState(replacement as never)||!rotationPolicyMatches(oldPair as never,replacement as never))throw new ContractValidationError('rotation sealed state/policy mismatch');expectedActions['pair-upsert']=pairParams({...oldPair,status:'rotated'});expectedActions['pair-insert']=pairParams(replacement);}
+  else if(clean.kind==='bpc.pair.approve.v1'){const registration=codec.openRegistration(clean.expectedPending,{domain:'bpc-pair-payload',version:'1',streamId:request.streamId,kind:clean.kind,token:clean.token,requestedAt:clean.requestedAt}),opened=codec.openPair(clean.sealed,{domain:'bpc-pair-payload',version:'1',streamId:request.streamId,kind:clean.kind,pairId:clean.pairId});if(!hasInitialPairState(opened as never)||!pairMatchesRegistration(opened as never,registration))throw new ContractValidationError('approval sealed state/policy mismatch');if(request.action==='pair-approve'){const limit=safeInt(payload[3],'approval capacity',1);expectedActions['pair-approve']=[clean.token,JSON.stringify(registration),clean.requestedAt,limit,...pairParams(opened)];}}
+  else if(clean.kind==='bpc.pair.rotate.v1'){const oldPair=codec.openPair(clean.expectedOld,{domain:'bpc-pair-payload',version:'1',streamId:request.streamId,kind:clean.kind,pairId:clean.oldPairId}),replacement=codec.openPair(clean.sealed,{domain:'bpc-pair-payload',version:'1',streamId:request.streamId,kind:clean.kind,pairId:clean.newPairId});if(oldPair.status!=='active'||!hasInitialPairState(replacement as never)||!rotationPolicyMatches(oldPair as never,replacement as never))throw new ContractValidationError('rotation sealed state/policy mismatch');expectedActions['pair-rotate']=[...pairParams(oldPair),...pairParams(replacement)];}
   if(request.action==='outbox-append'){if(canonicalize(payload)!==canonicalize([fenceToken,clean]))throw new ContractValidationError('outbox append payload does not match sanitized mutation');return;}
   const expected=expectedActions[request.action];if(!expected||canonicalize(payload)!==canonicalize(expected))throw new ContractValidationError('sealed mutation does not authorize the complete DML payload');
 }
@@ -450,7 +471,7 @@ export class PgSourceLeaseFence {
   async applyControlledMutation(exec:PgExecutor,header:OutboxRecordHeader,action:string,payload:readonly unknown[]):Promise<{rows:Record<string,unknown>[];rowCount:number}>{
     await this.assertWritableInTx(exec);
     assertHeaderConformant(header);
-    if(!['pair-upsert','pair-insert','pair-delete','pending-upsert','pending-delete'].includes(action))throw new ContractValidationError('unsupported controlled mutation');
+    if(!['pair-upsert','pair-insert','pair-delete','pending-upsert','pending-delete','pair-approve','pair-rotate'].includes(action))throw new ContractValidationError('unsupported controlled mutation');
     const payloadJson=JSON.stringify(payload),mutation=(await exec.query('SELECT mutation FROM public.ha_outbox_rows WHERE stream_id=$1 AND source_epoch=$2 AND sequence=$3 AND op_digest=$4',[header.streamId,header.sourceEpoch,header.sequence,header.opDigest])).rows[0]?.mutation;if(!mutation)throw new ContractValidationError('controlled mutation has no matching outbox mutation');const ticket=await this.issueTicket(exec,header,action,payloadJson,JSON.stringify(mutation));
     const result=await exec.query('SELECT bpc_ha.apply_pair_mutation($1::jsonb,$2,$3::jsonb)::text affected',[JSON.stringify(ticket),action,payloadJson]);
     return {rows:[],rowCount:safeInt(result.rows[0]?.affected,'controlled mutation affected rows',0)};
