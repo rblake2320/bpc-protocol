@@ -161,8 +161,29 @@ CREATE TABLE IF NOT EXISTS bpc_ha.authority_stream (
 CREATE TABLE IF NOT EXISTS bpc_ha.redis_membership (
   id smallint PRIMARY KEY CHECK(id=1),
   membership_digest text NOT NULL CHECK(membership_digest ~ '^[0-9a-f]{64}$')
+);
+CREATE TABLE IF NOT EXISTS bpc_ha.schema_meta (
+  id smallint PRIMARY KEY CHECK(id=1),
+  version integer NOT NULL CHECK(version=1),
+  manifest_digest text NOT NULL CHECK(manifest_digest ~ '^[0-9a-f]{64}$')
 )
 `.trim();
+
+export const BPC_HA_SCHEMA_VERSION=1;
+export const BPC_HA_SCHEMA_MANIFEST='d467c28dd1fc0be804cfd5f91b60ee3e65d2aeedd1cd631a8e867c7dad2f1c09';
+const HA_READY_STATE=new WeakMap<object,{db:PgTransactor;manifest:string}>();
+export interface BpcHaReadyToken{readonly __bpcHaReady:never}
+export async function bpcHaSchemaManifest(exec:PgExecutor):Promise<string>{
+  const relations=(await exec.query(`SELECT c.relname,c.relkind,c.relpersistence,c.relrowsecurity,c.relforcerowsecurity FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='bpc_ha' AND c.relkind IN ('r','p','v','m') ORDER BY c.relname`)).rows;
+  const columns=(await exec.query(`SELECT c.relname,a.attnum,a.attname,pg_catalog.format_type(a.atttypid,a.atttypmod) type,a.attnotnull,pg_catalog.pg_get_expr(d.adbin,d.adrelid) default_expr FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum WHERE n.nspname='bpc_ha' AND c.relkind IN ('r','p') AND a.attnum>0 AND NOT a.attisdropped ORDER BY c.relname,a.attnum`)).rows;
+  const constraints=(await exec.query(`SELECT c.relname,k.conname,k.contype,pg_catalog.pg_get_constraintdef(k.oid,true) definition FROM pg_catalog.pg_constraint k JOIN pg_catalog.pg_class c ON c.oid=k.conrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='bpc_ha' ORDER BY c.relname,k.conname`)).rows;
+  const indexes=(await exec.query(`SELECT t.relname table_name,i.relname index_name,pg_catalog.pg_get_indexdef(i.oid) definition FROM pg_catalog.pg_index x JOIN pg_catalog.pg_class t ON t.oid=x.indrelid JOIN pg_catalog.pg_class i ON i.oid=x.indexrelid JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='bpc_ha' ORDER BY t.relname,i.relname`)).rows;
+  const triggers=(await exec.query(`SELECT c.relname,t.tgname,t.tgenabled,pg_catalog.pg_get_triggerdef(t.oid,true) definition FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='bpc_ha' AND NOT t.tgisinternal ORDER BY c.relname,t.tgname`)).rows;
+  const policies=(await exec.query(`SELECT schemaname,tablename,policyname,permissive,roles,cmd,qual,with_check FROM pg_catalog.pg_policies WHERE schemaname='bpc_ha' ORDER BY tablename,policyname`)).rows;
+  return sha256(canonicalize({relations,columns,constraints,indexes,triggers,policies}));
+}
+export async function provisionBpcHaSchema(db:PgTransactor):Promise<BpcHaReadyToken>{const manifest=await db.transaction(async exec=>{const found=await bpcHaSchemaManifest(exec);if(found!==BPC_HA_SCHEMA_MANIFEST)throw new ContractValidationError(`bpc_ha schema attestation failed (${found})`);const inserted=await exec.query('INSERT INTO bpc_ha.schema_meta(id,version,manifest_digest) VALUES(1,$1,$2) ON CONFLICT(id) DO NOTHING',[BPC_HA_SCHEMA_VERSION,found]);if(inserted.rowCount===0){const row=(await exec.query('SELECT version,manifest_digest FROM bpc_ha.schema_meta WHERE id=1 FOR SHARE')).rows[0];if(!row||safeInt(row.version,'bpc_ha schema version',1,1)!==1||String(row.manifest_digest)!==found)throw new ContractValidationError('bpc_ha schema authority conflicts');}return found;});const token={} as BpcHaReadyToken;HA_READY_STATE.set(token,{db,manifest});return token;}
+async function requireBpcHaReady(token:BpcHaReadyToken,db:PgTransactor):Promise<void>{const state=HA_READY_STATE.get(token as object);if(!state||state.db!==db||state.manifest!==BPC_HA_SCHEMA_MANIFEST)throw new ContractValidationError('invalid bpc_ha schema-readiness capability');await db.transaction(async exec=>{const found=await bpcHaSchemaManifest(exec);const row=(await exec.query('SELECT version,manifest_digest FROM bpc_ha.schema_meta WHERE id=1 FOR SHARE')).rows[0];if(found!==BPC_HA_SCHEMA_MANIFEST||!row||safeInt(row.version,'bpc_ha schema version',1,1)!==1||String(row.manifest_digest)!==found)throw new ContractValidationError('bpc_ha schema attestation failed');});}
 
 export interface SourceLeaseGrant {
   streamId: string; epoch: number; status: 'active' | 'revoked'; holderNodeId: string;
@@ -254,7 +275,8 @@ export class PgSourceLeaseFence {
     if (!HEX64.test(binding.redisClaimDigest)) throw new ContractValidationError('invalid redisClaimDigest');
     if(binding.epoch>1&&(!binding.activationDigest||!HEX64.test(binding.activationDigest)))throw new ContractValidationError('promoted source requires a signed ACTIVE cutover digest');
   }
-  static async open(db: PgTransactor, resolver: PublicKeyResolver, binding: SourceLeaseBinding,quorum:BpcRedisQuorumFenceStore): Promise<PgSourceLeaseFence> {
+  static async open(db: PgTransactor, ready:BpcHaReadyToken,resolver: PublicKeyResolver, binding: SourceLeaseBinding,quorum:BpcRedisQuorumFenceStore): Promise<PgSourceLeaseFence> {
+    await requireBpcHaReady(ready,db);
     const fence = new PgSourceLeaseFence(db, resolver, binding,quorum);
     await db.transaction(async(exec) => {await fence.assertWritableInTx(exec);await exec.query('INSERT INTO bpc_ha.authority_stream(stream_id) VALUES($1) ON CONFLICT DO NOTHING',[binding.streamId]);});
     FENCE_CAPABILITIES.set(fence, db);
@@ -406,7 +428,8 @@ export function redisFenceRecordDigest(v:RedisFenceRecord):string{return sha256(
  * FENCED requires expiry of the old signed lease on the control-DB clock plus
  * an exact signed Redis quorum record. ACTIVE is a separate signed CAS. */
 export class BpcCutoverController {
-  constructor(private readonly db:PgTransactor,private readonly resolver:PublicKeyResolver,private readonly guardKeyId:string,private readonly guardKey:KeyObject|string,private readonly maxClockSkewMs=5_000){safeInt(maxClockSkewMs,'maxClockSkewMs',0,60_000);}
+  private constructor(private readonly db:PgTransactor,private readonly resolver:PublicKeyResolver,private readonly guardKeyId:string,private readonly guardKey:KeyObject|string,private readonly maxClockSkewMs=5_000){safeInt(maxClockSkewMs,'maxClockSkewMs',0,60_000);}
+  static async open(db:PgTransactor,ready:BpcHaReadyToken,resolver:PublicKeyResolver,guardKeyId:string,guardKey:KeyObject|string,maxClockSkewMs=5_000):Promise<BpcCutoverController>{await requireBpcHaReady(ready,db);return new BpcCutoverController(db,resolver,guardKeyId,guardKey,maxClockSkewMs);}
   async begin(input:Omit<BareCutover,'phase'|'prevStateDigest'>):Promise<CutoverReceipt>{
     return this.db.transaction(async exec=>{await exec.query('SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1,0))',[input.streamId]);const head=(await exec.query(`SELECT ${CUTOVER_COLS} FROM bpc_ha.cutover_head WHERE stream_id=$1 FOR UPDATE`,[input.streamId])).rows[0];let current:CutoverReceipt|null=null;if(head){current=cutoverFromRow(head);verifyCutoverReceipt(this.resolver,current);const same=current.commandId===input.commandId&&current.previousEpoch===input.previousEpoch&&current.targetEpoch===input.targetEpoch&&current.targetNodeId===input.targetNodeId&&current.targetSourceEpoch===input.targetSourceEpoch&&current.manifestDigest===input.manifestDigest&&current.finalSourceSequence===input.finalSourceSequence&&current.stateDigest===input.stateDigest&&current.redisClaimDigest===input.redisClaimDigest&&current.oldLeaseDigest===input.oldLeaseDigest&&current.oldLeaseExpiresAtMs===input.oldLeaseExpiresAtMs&&current.sourceTransactionWindowMs===input.sourceTransactionWindowMs;if(same)return current;if(current.phase!=='ACTIVE'||input.previousEpoch!==current.targetEpoch)throw new ContractValidationError('another cutover intent is already authoritative');}
       const witness=(await exec.query('SELECT epoch,state_digest FROM bpc_ha.epoch_witness WHERE stream_id=$1 FOR UPDATE',[input.streamId])).rows[0];const epoch=witness?safeInt(witness.epoch,'witnessEpoch',0,MAX_EPOCH):0;if(epoch!==input.previousEpoch)throw new ContractValidationError('cutover does not advance the external epoch witness');
@@ -427,7 +450,7 @@ export class BpcCutoverController {
  * latest verified cutover history. Empty/rollback/future state fails closed. */
 export class PgRedisFenceWitness{
   private constructor(private readonly db:PgTransactor,private readonly resolver:PublicKeyResolver){}
-  static async open(db:PgTransactor,resolver:PublicKeyResolver):Promise<PgRedisFenceWitness>{const witness=new PgRedisFenceWitness(db,resolver);await db.transaction(async exec=>{await exec.query('SELECT 1 FROM bpc_ha.epoch_witness LIMIT 1');});REDIS_WITNESS_CAPABILITIES.add(witness);return witness;}
+  static async open(db:PgTransactor,ready:BpcHaReadyToken,resolver:PublicKeyResolver):Promise<PgRedisFenceWitness>{await requireBpcHaReady(ready,db);const witness=new PgRedisFenceWitness(db,resolver);REDIS_WITNESS_CAPABILITIES.add(witness);return witness;}
   async pinMembership(runIds:string[]):Promise<void>{if(runIds.length<3||new Set(runIds).size!==runIds.length)throw new ContractValidationError('invalid Redis membership');const digest=sha256(frame('bpc-redis-membership/v1',...runIds));await this.db.transaction(async exec=>{const inserted=await exec.query('INSERT INTO bpc_ha.redis_membership(id,membership_digest) VALUES(1,$1) ON CONFLICT(id) DO NOTHING',[digest]);if(inserted.rowCount===0){const row=(await exec.query('SELECT membership_digest FROM bpc_ha.redis_membership WHERE id=1')).rows[0];if(!row||String(row.membership_digest)!==digest)throw new ContractValidationError('Redis membership substitution rejected');}});}
   async bootstrapGenesis(record:RedisFenceRecord):Promise<void>{if(record.epoch!==1)throw new ContractValidationError('Redis genesis must be epoch 1');verify(this.resolver,record.keyId,redisFenceMessage(record),record.signature);const digest=redisFenceRecordDigest(record);await this.db.transaction(async exec=>{const inserted=await exec.query('INSERT INTO bpc_ha.epoch_witness(stream_id,epoch,state_digest) VALUES($1,1,$2) ON CONFLICT(stream_id) DO NOTHING',[record.streamId,digest]);if(inserted.rowCount===0){const row=(await exec.query('SELECT epoch,state_digest FROM bpc_ha.epoch_witness WHERE stream_id=$1 FOR SHARE',[record.streamId])).rows[0];if(!row||safeInt(row.epoch,'genesis witness epoch',1,MAX_EPOCH)!==1||String(row.state_digest)!==digest)throw new ContractValidationError('conflicting governed Redis genesis');}});}
   async verify(record:RedisFenceRecord|null):Promise<void>{if(!record)throw new ContractValidationError('empty Redis fence state is not authoritative');await this.db.transaction(async exec=>{const witness=(await exec.query('SELECT epoch,state_digest FROM bpc_ha.epoch_witness WHERE stream_id=$1 FOR SHARE',[record.streamId])).rows[0];const epoch=witness?safeInt(witness.epoch,'witnessEpoch',0,MAX_EPOCH):0;if(epoch===0)throw new ContractValidationError('Redis genesis is not governed by a signed PostgreSQL witness');

@@ -21,6 +21,7 @@ import {
   PgSourceLeaseFence, assertSchemaReady, createHaPairAuthority,
   bpcPairMutationSanitizer, buildPairSnapshotBundle, createHttpOutboxReceiver,
   buildPromotionReadinessAttestation, importPairSnapshotBundle, installActiveCutoverReceipt, installSourceLeaseGrant, pairSnapshotManifestDigest, promoteReceiverToSource, provisionSchemaVersion,
+  provisionBpcHaSchema,
   redisFenceRecordDigest, signRedisFenceRecord, signSourceLeaseGrant, type AckReceipt, type AckReceiptVerifier,
   type BpcPairMutation, type OutboxRecord, type ReceiverDecision,
 } from './packages/server/dist/index.js';
@@ -105,13 +106,15 @@ let server: Server | null = null;
 async function main(): Promise<void> {
   await Promise.all(redisMembers.map(r=>r.flushdb())); await reset(poolA); await reset(poolB); await reset(poolControl);
   const idA=await systemId(poolA), idB=await systemId(poolB), idControl=await systemId(poolControl); assert.equal(new Set([idA,idB,idControl]).size,3);
-  const readyA=await provisionSchemaVersion(dbA,'public'); let readyB=await provisionSchemaVersion(dbB,'public');
+  const readyA=await provisionSchemaVersion(dbA,'public'); let readyB=await provisionSchemaVersion(dbB,'public');const haReadyA=await provisionBpcHaSchema(dbA);let haReadyB=await provisionBpcHaSchema(dbB);const haReadyControl=await provisionBpcHaSchema(dbControl);
+  await assert.rejects(PgRedisFenceWitness.open(dbControl,haReadyA,sourceResolver),/schema-readiness capability/);
+  const statusConstraint=String((await poolA.query("SELECT conname FROM pg_catalog.pg_constraint WHERE conrelid='bpc_ha.source_lease'::regclass AND contype='c' AND pg_catalog.pg_get_constraintdef(oid) LIKE '%status%'")).rows[0].conname);await poolA.query(`ALTER TABLE bpc_ha.source_lease DROP CONSTRAINT ${statusConstraint}`);await assert.rejects(provisionBpcHaSchema(dbA),/schema attestation failed/);await poolA.query(`ALTER TABLE bpc_ha.source_lease ADD CONSTRAINT ${statusConstraint} CHECK (status IN ('active','revoked'))`);
   await poolA.query('INSERT INTO ha_outbox_fence(stream_id,fence_token) VALUES($1,1)',[SID]);
   await poolA.query('INSERT INTO ha_outbox_source_checkpoint(stream_id,source_epoch,sequence) VALUES($1,$2,0)',[SID,E1]);
   await poolB.query('INSERT INTO ha_outbox_fence(stream_id,fence_token) VALUES($1,1)',[SID]);
   await poolB.query('INSERT INTO ha_outbox_receiver_checkpoint(stream_id,source_epoch,sequence) VALUES($1,$2,0)',[SID,E1]);
 
-  const redisWitness=await PgRedisFenceWitness.open(dbControl,sourceResolver);
+  const redisWitness=await PgRedisFenceWitness.open(dbControl,haReadyControl,sourceResolver);
   const fenceStore=await BpcRedisQuorumFenceStore.open(redisMembers,sourceResolver,redisWitness,'bpc:ha:final');
   const redisA=signRedisFenceRecord('guard-v1',guardPrivate,{streamId:SID,epoch:1,nodeId:'node-a',authoritySystemId:idA,commandId:'activate-a',claimedAtMs:Date.now()});
   await redisWitness.bootstrapGenesis(redisA);
@@ -123,7 +126,7 @@ async function main(): Promise<void> {
   const grant1=signSourceLeaseGrant('guard-v1',guardPrivate,{streamId:SID,epoch:1,status:'active',holderNodeId:'node-a',leaseId:'lease-a',commandId:'grant-a1',expiresAtMs:aLeaseExpiry,grantSeq:1,prevDigest:null});
   await dbA.transaction((exec)=>installSourceLeaseGrant(exec,sourceResolver,grant1));await dbControl.transaction((exec)=>installSourceLeaseGrant(exec,sourceResolver,grant1));
   const binding1={streamId:SID,epoch:1,holderNodeId:'node-a',authoritySystemId:idA,leaseId:'lease-a',grantDigest:grant1.grantDigest,redisClaimDigest:redisFenceRecordDigest(redisA),maxClockSkewMs:25,maxTransactionDurationMs:dbA.maxTransactionDurationMs};
-  const makeStoreA=async(binding:typeof binding1)=>createHaPairAuthority(dbA,readyA,{streamId:SID,fenceToken:1n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbA,sourceResolver,binding,fenceStore));
+  const makeStoreA=async(binding:typeof binding1)=>createHaPairAuthority(dbA,readyA,{streamId:SID,fenceToken:1n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbA,haReadyA,sourceResolver,binding,fenceStore));
   let storeA=await makeStoreA(binding1);
 
   let receiver=new PgReceiverCheckpoint<BpcPairMutation>(dbB,SID,bpcPairMutationSanitizer,new PgPairMutationApplier(SID,keyring),readyB);
@@ -152,7 +155,7 @@ async function main(): Promise<void> {
   // Capture C=3, discard the old receiver authority, and bootstrap a genuinely
   // fresh B solely from the signed source snapshot.
   const snapshotAtC=await buildPairSnapshotBundle<BpcPairMutation>(dbA,SID,3,'source-v1',sourcePrivate);
-  await reset(poolB);readyB=await provisionSchemaVersion(dbB,'public');
+  await reset(poolB);readyB=await provisionSchemaVersion(dbB,'public');haReadyB=await provisionBpcHaSchema(dbB);
   await poolB.query('INSERT INTO ha_outbox_fence(stream_id,fence_token) VALUES($1,1)',[SID]);
   await poolB.query('INSERT INTO ha_outbox_receiver_checkpoint(stream_id,source_epoch,sequence) VALUES($1,$2,0)',[SID,E1]);
   receiver=new PgReceiverCheckpoint<BpcPairMutation>(dbB,SID,bpcPairMutationSanitizer,new PgPairMutationApplier(SID,keyring),readyB);
@@ -168,12 +171,12 @@ async function main(): Promise<void> {
   // Begin a mutation while the lease and quorum are valid, partition this
   // writer from the quorum after DML, then release the callback. The real
   // pre-commit hook must reject and roll back the entire transaction.
-  await poolA.query('CREATE TABLE IF NOT EXISTS bpc_ha.precommit_probe(id int primary key)');
-  const liveFence=await PgSourceLeaseFence.open(dbA,sourceResolver,binding2,fenceStore);
+  await poolA.query('CREATE TABLE IF NOT EXISTS precommit_probe(id int primary key)');
+  const liveFence=await PgSourceLeaseFence.open(dbA,haReadyA,sourceResolver,binding2,fenceStore);
   const guardedOutbox=new PgDurableOutbox(dbA,readyA,{streamId:SID,sanitizer:bpcPairMutationSanitizer,maxPendingRows:100,backpressure:'fail-authoritative-mutation',preCommitCheck:(exec)=>liveFence.assertWritableInTx(exec)});
   let entered!:()=>void,released!:()=>void;const enteredP=new Promise<void>(r=>entered=r),releaseP=new Promise<void>(r=>released=r);
-  const inFlight=guardedOutbox.withOutboxTx(async(tx,exec)=>{await guardedOutbox.appendInTx(tx,{streamId:SID,rawMutation:{kind:'bpc.pair.delete.v1',pairId:'precommit-probe'},fenceToken:1n});await exec.query('INSERT INTO bpc_ha.precommit_probe(id) VALUES(1)');entered();await releaseP;});
-  await enteredP;redisMembers[1]!.disconnect();redisMembers[2]!.disconnect();released();await assert.rejects(inFlight,/majority|deadline|connection|closed|quorum/i);assert.equal(Number((await poolA.query('SELECT count(*)::int n FROM bpc_ha.precommit_probe')).rows[0].n),0);await redisMembers[1]!.connect();await redisMembers[2]!.connect();
+  const inFlight=guardedOutbox.withOutboxTx(async(tx,exec)=>{await guardedOutbox.appendInTx(tx,{streamId:SID,rawMutation:{kind:'bpc.pair.delete.v1',pairId:'precommit-probe'},fenceToken:1n});await exec.query('INSERT INTO precommit_probe(id) VALUES(1)');entered();await releaseP;});
+  await enteredP;redisMembers[1]!.disconnect();redisMembers[2]!.disconnect();released();await assert.rejects(inFlight,/majority|deadline|connection|closed|quorum/i);assert.equal(Number((await poolA.query('SELECT count(*)::int n FROM precommit_probe')).rows[0].n),0);await redisMembers[1]!.connect();await redisMembers[2]!.connect();
   const revokedA=signSourceLeaseGrant('guard-v1',guardPrivate,{streamId:SID,epoch:1,status:'revoked',holderNodeId:'node-a',leaseId:'lease-a',commandId:'revoke-a3',expiresAtMs:grant2.expiresAtMs,grantSeq:3,prevDigest:grant2.grantDigest});
   await dbA.transaction(exec=>installSourceLeaseGrant(exec,sourceResolver,revokedA));await dbControl.transaction(exec=>installSourceLeaseGrant(exec,sourceResolver,revokedA));
 
@@ -186,7 +189,7 @@ async function main(): Promise<void> {
   const tailAtCutover=bundle.manifest.finalSequence-Number((await poolB.query('SELECT sequence FROM ha_outbox_receiver_checkpoint WHERE stream_id=$1',[SID])).rows[0].sequence);assert.equal(tailAtCutover,3);
 
   const redisB=signRedisFenceRecord('guard-v1',guardPrivate,{streamId:SID,epoch:2,nodeId:'node-b',authoritySystemId:idB,commandId:'promote-b',claimedAtMs:Date.now()});
-  const controller=new BpcCutoverController(dbControl,sourceResolver,'guard-v1',guardPrivate,25);
+  const controller=await BpcCutoverController.open(dbControl,haReadyControl,sourceResolver,'guard-v1',guardPrivate,25);
   await controller.begin({streamId:SID,commandId:'promote-b',previousEpoch:1,targetEpoch:2,targetNodeId:'node-b',targetSourceEpoch:E2,manifestDigest:pairSnapshotManifestDigest(bundle.manifest),finalSourceSequence:bundle.manifest.finalSequence,stateDigest:bundle.manifest.stateDigest,redisClaimDigest:redisFenceRecordDigest(redisB),oldLeaseDigest:revokedA.grantDigest,oldLeaseExpiresAtMs:revokedA.expiresAtMs,sourceTransactionWindowMs:binding2.maxTransactionDurationMs});
   assert.equal(await fenceStore.claim(redisB),true);
   const fenced=await controller.markFenced('promote-b',fenceStore);
@@ -202,8 +205,8 @@ async function main(): Promise<void> {
   const aliasedGuard=await buildPromotionReadinessAttestation(dbB,fenced,'guard-alias','guard-alias',guardPrivate);await assert.rejects(controller.markActive('promote-b',aliasedGuard,sourceResolver),/independent snapshot authority/);
   const readiness=await buildPromotionReadinessAttestation(dbB,fenced,bundle.manifest.keyId,'source-v1',sourcePrivate);const active=await controller.markActive('promote-b',readiness,sourceResolver);await installActiveCutoverReceipt(dbB,sourceResolver,active,readiness);
   const bindingB={streamId:SID,epoch:2,holderNodeId:'node-b',authoritySystemId:idB,leaseId:'lease-b',grantDigest:grantB.grantDigest,redisClaimDigest:redisFenceRecordDigest(redisB),maxClockSkewMs:25,maxTransactionDurationMs:dbB.maxTransactionDurationMs,activationDigest:active.stateDigestSigned};
-  const storeB=createHaPairAuthority(dbB,readyB,{streamId:SID,fenceToken:2n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbB,sourceResolver,bindingB,fenceStore));
-  const cloneBinding={...bindingB,authoritySystemId:idA};await assert.rejects(async()=>{const clonedStore=createHaPairAuthority(dbB,readyB,{streamId:SID,fenceToken:2n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbB,sourceResolver,cloneBinding,fenceStore));await clonedStore.set(pair(99));},/PostgreSQL identity|readiness binding/);assert.equal(Number((await poolB.query("SELECT count(*)::int n FROM bpc_pairs WHERE id='pair-99'")).rows[0].n),0);
+  const storeB=createHaPairAuthority(dbB,readyB,{streamId:SID,fenceToken:2n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbB,haReadyB,sourceResolver,bindingB,fenceStore));
+  const cloneBinding={...bindingB,authoritySystemId:idA};await assert.rejects(async()=>{const clonedStore=createHaPairAuthority(dbB,readyB,{streamId:SID,fenceToken:2n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbB,haReadyB,sourceResolver,cloneBinding,fenceStore));await clonedStore.set(pair(99));},/PostgreSQL identity|readiness binding/);assert.equal(Number((await poolB.query("SELECT count(*)::int n FROM bpc_pairs WHERE id='pair-99'")).rows[0].n),0);
   await storeB.set(pair(7)); const promotionRtoMs=Date.now()-cutoverAt;
   const rollbackAt=Date.now();await redisMembers[1]!.set('bpc:ha:final',JSON.stringify(redisA));await redisMembers[2]!.set('bpc:ha:final',JSON.stringify(redisA));
   await assert.rejects(fenceStore.current(),/rollback|disagrees|future/);await assert.rejects(storeB.set(pair(8)),/rollback|disagrees|future/);assert.equal(Number((await poolB.query("SELECT count(*)::int n FROM bpc_pairs WHERE id='pair-8'")).rows[0].n),0);

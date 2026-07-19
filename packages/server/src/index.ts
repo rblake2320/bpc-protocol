@@ -209,6 +209,10 @@ export {
 } from './http-outbox-transport.js';
 export {
   BPC_HA_SCHEMA,
+  BPC_HA_SCHEMA_VERSION,
+  BPC_HA_SCHEMA_MANIFEST,
+  bpcHaSchemaManifest,
+  provisionBpcHaSchema,
   BpcRedisQuorumFenceStore,
   BpcCutoverController,
   PgRedisFenceWitness,
@@ -243,6 +247,7 @@ export type {
   RedisFenceRecord,
   SourceLeaseBinding,
   SourceLeaseGrant,
+  BpcHaReadyToken,
 } from './bpc-ha-final.js';
 export type {
   FetchLike,

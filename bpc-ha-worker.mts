@@ -11,6 +11,7 @@ import {
   PgSourceLeaseFence,
   createHaPairAuthority,
   assertSchemaReady,
+  provisionBpcHaSchema,
   bpcPairMutationSanitizer,
   type AckReceipt,
   type AckReceiptVerifier,
@@ -31,6 +32,7 @@ const ackBody = (a: Omit<AckReceipt, 'signature'>) => [a.receiverId,a.keyId,a.st
 
 try {
   const ready = await assertSchemaReady(db, 'public');
+  const haReady=await provisionBpcHaSchema(db);
   if (mode === 'publisher') {
     const secret = Buffer.from(required('BPC_HA_REQUEST_SECRET'), 'base64url');
     const responseSecret = Buffer.from(required('BPC_HA_RESPONSE_SECRET'), 'base64url');
@@ -71,9 +73,9 @@ try {
     try {
       const redisClients=required('BPC_HA_REDIS_URLS').split(',').map(url=>{const r=new Redis(url,{connectTimeout:400,maxRetriesPerRequest:0,retryStrategy:()=>null});r.on('error',()=>{});return r;});
       const resolver={ resolve: (keyId:string) => keyId === 'guard-v1' ? publicKey : null };
-      const controlPool=new Pool({connectionString:required('BPC_HA_CONTROL_PG_URL'),max:1});controlPool.on('error',()=>{});const controlDb=new NodePostgresTransactor(controlPool as never);
-      const quorum=await BpcRedisQuorumFenceStore.open(redisClients,resolver,await PgRedisFenceWitness.open(controlDb,resolver),'bpc:ha:final');
-      const fence = await PgSourceLeaseFence.open(db,resolver, binding,quorum);
+      const controlPool=new Pool({connectionString:required('BPC_HA_CONTROL_PG_URL'),max:1});controlPool.on('error',()=>{});const controlDb=new NodePostgresTransactor(controlPool as never);const controlReady=await provisionBpcHaSchema(controlDb);
+      const quorum=await BpcRedisQuorumFenceStore.open(redisClients,resolver,await PgRedisFenceWitness.open(controlDb,controlReady,resolver),'bpc:ha:final');
+      const fence = await PgSourceLeaseFence.open(db,haReady,resolver, binding,quorum);
       const store = createHaPairAuthority(db, ready, {
         streamId: required('BPC_HA_STREAM_ID'), fenceToken: BigInt(binding.epoch),
         keyring: { activeKeyId: 'seal-v1', resolveKey: () => sealKey }, maxPendingRows: 100,
