@@ -46,7 +46,7 @@ const sealKey = Buffer.alloc(32, 51);
 const requestSecret = Buffer.alloc(32, 53), responseSecret = Buffer.alloc(32, 55), ackSecret = Buffer.alloc(32, 57);
 const { publicKey: guardPublic, privateKey: guardPrivate } = generateKeyPairSync('ed25519');
 const { publicKey: sourcePublic, privateKey: sourcePrivate } = generateKeyPairSync('ed25519');
-const sourceResolver = { resolve: (keyId: string) => keyId === 'guard-v1' ? guardPublic : keyId==='source-v1'?sourcePublic:null };
+const sourceResolver = { resolve: (keyId: string) => keyId === 'guard-v1'||keyId==='guard-alias' ? guardPublic : keyId==='source-v1'?sourcePublic:null };
 const keyring = { activeKeyId: 'seal-v1', resolveKey: (keyId: string) => { if (keyId !== 'seal-v1') throw new Error('unknown seal key'); return sealKey; } };
 
 async function ddl(pool: pg.Pool, sql: string): Promise<void> {
@@ -198,10 +198,11 @@ async function main(): Promise<void> {
   await dbB.transaction((exec)=>installSourceLeaseGrant(exec,sourceResolver,grantB));
   await promoteReceiverToSource(dbB,sourceResolver,bundle,bpcPairMutationSanitizer,2,E2,sourceResolver,fenced);
   const wrongAuthority=await buildPromotionReadinessAttestation(dbB,fenced,'guard-v1','guard-v1',guardPrivate);await assert.rejects(controller.markActive('promote-b',wrongAuthority,sourceResolver),/independent snapshot authority/);
+  const aliasedGuard=await buildPromotionReadinessAttestation(dbB,fenced,'guard-alias','guard-alias',guardPrivate);await assert.rejects(controller.markActive('promote-b',aliasedGuard,sourceResolver),/independent snapshot authority/);
   const readiness=await buildPromotionReadinessAttestation(dbB,fenced,bundle.manifest.keyId,'source-v1',sourcePrivate);const active=await controller.markActive('promote-b',readiness,sourceResolver);await installActiveCutoverReceipt(dbB,sourceResolver,active,readiness);
   const bindingB={streamId:SID,epoch:2,holderNodeId:'node-b',authoritySystemId:idB,leaseId:'lease-b',grantDigest:grantB.grantDigest,redisClaimDigest:redisFenceRecordDigest(redisB),maxClockSkewMs:25,activationDigest:active.stateDigestSigned};
   const storeB=createHaPairAuthority(dbB,readyB,{streamId:SID,fenceToken:2n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbB,sourceResolver,bindingB,fenceStore));
-  const cloneBinding={...bindingB,authoritySystemId:idA};const clonedStore=createHaPairAuthority(dbB,readyB,{streamId:SID,fenceToken:2n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbB,sourceResolver,cloneBinding,fenceStore));await assert.rejects(clonedStore.set(pair(99)),/PostgreSQL identity|readiness binding/);assert.equal(Number((await poolB.query("SELECT count(*)::int n FROM bpc_pairs WHERE id='pair-99'")).rows[0].n),0);
+  const cloneBinding={...bindingB,authoritySystemId:idA};await assert.rejects(async()=>{const clonedStore=createHaPairAuthority(dbB,readyB,{streamId:SID,fenceToken:2n,keyring,maxPendingRows:100},await PgSourceLeaseFence.open(dbB,sourceResolver,cloneBinding,fenceStore));await clonedStore.set(pair(99));},/PostgreSQL identity|readiness binding/);assert.equal(Number((await poolB.query("SELECT count(*)::int n FROM bpc_pairs WHERE id='pair-99'")).rows[0].n),0);
   await storeB.set(pair(7)); const promotionRtoMs=Date.now()-cutoverAt;
   const rollbackAt=Date.now();await redisMembers[1]!.set('bpc:ha:final',JSON.stringify(redisA));await redisMembers[2]!.set('bpc:ha:final',JSON.stringify(redisA));
   await assert.rejects(fenceStore.current(),/rollback|disagrees|future/);await assert.rejects(storeB.set(pair(8)),/rollback|disagrees|future/);assert.equal(Number((await poolB.query("SELECT count(*)::int n FROM bpc_pairs WHERE id='pair-8'")).rows[0].n),0);
