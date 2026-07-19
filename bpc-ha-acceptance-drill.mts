@@ -5,7 +5,7 @@
  * partition, snapshot+tail resync, promotion, and measured per-fault RPO/RTO.
  */
 import assert from 'node:assert/strict';
-import { createHmac, generateKeyPairSync, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, generateKeyPairSync, timingSafeEqual } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import net from 'node:net';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -49,7 +49,7 @@ const E1 = 'bpc-e:1', E2 = 'bpc-e:2';
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const runtimeConnection=(base:string)=>{const value=new URL(base);value.username='bpc_runtime_acceptance';value.password='bpc-runtime-test-only';return value.toString();};
 const sealKey = Buffer.alloc(32, 51);
-const mutationTicketSecret=Buffer.alloc(32,59);const mutationTicketSigner={keyId:'mutation-v1',async signTicket(request:Record<string,string>){return createHmac('sha256',mutationTicketSecret).update([request.domain,request.keyId,request.nonce,request.streamId,request.epoch,request.leaseId,request.grantDigest,request.txid,request.expiresAtMs,request.sourceEpoch,request.sequence,request.opDigest,request.action,request.payloadDigest].join('|')).digest('hex');}};
+const mutationTicketSecret=Buffer.alloc(32,59);const mutationTicketSigner={keyId:'mutation-v1',async signTicket(request:Record<string,string>,context:{canonicalPolicy:string}){assert.equal(createHash('sha256').update(context.canonicalPolicy).digest('hex'),request.policyDigest);const policy=JSON.parse(context.canonicalPolicy) as {action:string;mutation:{kind:string}};const allowed:Record<string,string[]>= {'bpc.pair.set.v1':['outbox-reserve','outbox-append','pair-upsert'],'bpc.pair.delete.v1':['outbox-reserve','outbox-append','pair-delete'],'bpc.pending.set.v1':['outbox-reserve','outbox-append','pending-upsert'],'bpc.pending.delete.v1':['outbox-reserve','outbox-append','pending-delete'],'bpc.pair.approve.v1':['outbox-reserve','outbox-append','pending-delete','pair-insert'],'bpc.pair.rotate.v1':['outbox-reserve','outbox-append','pair-upsert']};assert.ok(allowed[policy.mutation.kind]?.includes(policy.action),'policy signer rejected mutation/action mapping');return createHmac('sha256',mutationTicketSecret).update([request.domain,request.keyId,request.nonce,request.streamId,request.epoch,request.leaseId,request.grantDigest,request.txid,request.expiresAtMs,request.sourceEpoch,request.sequence,request.opDigest,request.action,request.payloadDigest,request.policyDigest].join('|')).digest('hex');}};
 const requestSecret = Buffer.alloc(32, 53), responseSecret = Buffer.alloc(32, 55), ackSecret = Buffer.alloc(32, 57);
 const { publicKey: guardPublic, privateKey: guardPrivate } = generateKeyPairSync('ed25519');
 const { publicKey: sourcePublic, privateKey: sourcePrivate } = generateKeyPairSync('ed25519');
@@ -114,6 +114,7 @@ async function startRedisProxy(): Promise<{url:string; partition:()=>Promise<voi
 
 let server: Server | null = null;
 async function main(): Promise<void> {
+  const mismatchedPolicy=JSON.stringify({action:'pair-upsert',mutation:{kind:'bpc.pair.delete.v1'}});await assert.rejects(mutationTicketSigner.signTicket({policyDigest:createHash('sha256').update(mismatchedPolicy).digest('hex')} as Record<string,string>,{canonicalPolicy:mismatchedPolicy}),/policy signer rejected mutation\/action mapping/);
   await Promise.all(redisMembers.map(r=>r.flushdb())); await reset(poolA); await reset(poolB); await reset(poolControl);
   const idA=await systemId(poolA), idB=await systemId(poolB), idControl=await systemId(poolControl); assert.equal(new Set([idA,idB,idControl]).size,3);
   const readyA=await provisionSchemaVersion(dbA,'public'); let readyB=await provisionSchemaVersion(dbB,'public');const haReadyA=await provisionBpcHaSchema(dbA);let haReadyB=await provisionBpcHaSchema(dbB);const haReadyControl=await provisionBpcHaSchema(dbControl);await poolA.query('INSERT INTO bpc_ha.mutation_ticket_key(key_id,secret) VALUES($1,$2)',['mutation-v1',mutationTicketSecret]);await poolB.query('INSERT INTO bpc_ha.mutation_ticket_key(key_id,secret) VALUES($1,$2)',['mutation-v1',mutationTicketSecret]);
@@ -146,6 +147,7 @@ async function main(): Promise<void> {
   await assert.rejects(poolRuntimeA.query("INSERT INTO bpc_pairs(id,name,scope,mode,secret_hash,pub_jwk,status,created,last_active,requests,failed_sigs,kind) VALUES('bypass','x','read','production',$1,$2,'active',1,NULL,0,0,'legitimate')",[Buffer.alloc(32,1).toString('base64url'),pair(1).pubJwk]),/permission denied/);
   await assert.rejects(poolRuntimeA.query("UPDATE bpc_pairs SET status='revoked' WHERE id='missing'"),/permission denied/);await assert.rejects(poolRuntimeA.query("DELETE FROM bpc_pending WHERE token='missing'"),/permission denied/);
   await assert.rejects(poolRuntimeA.query("UPDATE ha_outbox_source_checkpoint SET sequence=99 WHERE stream_id=$1",[SID]),/permission denied/);await assert.rejects(poolRuntimeA.query("UPDATE ha_outbox_fence SET fence_token=99 WHERE stream_id=$1",[SID]),/permission denied/);await assert.rejects(poolRuntimeA.query("DELETE FROM ha_outbox_rows WHERE stream_id=$1",[SID]),/permission denied/);
+  await assert.rejects(poolRuntimeA.query("SELECT bpc_ha.reserve_outbox_append('{}'::jsonb,100,1,'{}'::jsonb)"),/authenticated outbox reservation|ticket/i);
   await assert.rejects(poolRuntimeA.query("SELECT bpc_ha.apply_pair_mutation('{}'::jsonb,'pair-delete','[]'::jsonb)"),/mutation ticket|invalid controlled/i);
   await assert.rejects(poolRuntimeA.query('SELECT secret FROM bpc_ha.mutation_ticket_key'),/permission denied/);
 
@@ -161,8 +163,9 @@ async function main(): Promise<void> {
 
   await storeA.set(pair(1));assert.equal(Number((await poolA.query("SELECT count(*)::int n FROM bpc_pairs WHERE id='pair-1'")).rows[0].n),1);
   await poolA.query('GRANT UPDATE ON ha_outbox_source_checkpoint TO bpc_runtime_acceptance');await assert.rejects(storeA.set(pair(90)),/posture drifted/);await poolA.query('REVOKE UPDATE ON ha_outbox_source_checkpoint FROM bpc_runtime_acceptance');
+  for(const [privilege,table] of [['INSERT','ha_outbox_source_checkpoint'],['DELETE','ha_outbox_source_checkpoint'],['INSERT','ha_outbox_fence'],['DELETE','ha_outbox_fence']] as const){await poolA.query(`GRANT ${privilege} ON ${table} TO bpc_runtime_acceptance`);await assert.rejects(storeA.set(pair(92)),/posture drifted/);await poolA.query(`REVOKE ${privilege} ON ${table} FROM bpc_runtime_acceptance`);}
   await poolA.query('GRANT EXECUTE ON FUNCTION bpc_ha.apply_pair_mutation(jsonb,text,jsonb) TO PUBLIC');await assert.rejects(storeA.set(pair(91)),/ownership\/ACL posture/);await poolA.query('REVOKE EXECUTE ON FUNCTION bpc_ha.apply_pair_mutation(jsonb,text,jsonb) FROM PUBLIC');
-  assert.equal(Number((await poolA.query("SELECT count(*)::int n FROM bpc_pairs WHERE id IN ('pair-90','pair-91')")).rows[0].n),0);await drain();
+  assert.equal(Number((await poolA.query("SELECT count(*)::int n FROM bpc_pairs WHERE id IN ('pair-90','pair-91','pair-92')")).rows[0].n),0);await drain();
 
   // Actual publisher process death after B committed but before its ACK reached A.
   await storeA.set(pair(2)); holdAck=true; ackGate=new Promise<void>((resolve)=>{releaseAck=resolve;});

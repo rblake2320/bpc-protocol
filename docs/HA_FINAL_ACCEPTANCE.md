@@ -23,14 +23,21 @@ revokes object-creation authority, and rejects superuser, `BYPASSRLS`, owner
 membership, inherited DML, or schema-creation bypasses. Pair mutations cross a
 fixed-search-path `SECURITY DEFINER` function only after a single-use,
 transaction-bound HMAC ticket has been issued by the governed source fence.
-The outbox row/checkpoint advance crosses a separate controlled function and
+The outbox admission/reservation itself requires a separate valid single-use
+ticket before it takes authoritative checkpoint or fence locks. The outbox
+row/checkpoint advance crosses a separate controlled function and
 the pair mutation ticket must bind to that exact current-transaction outbox
 tuple, so evidence cannot be fabricated or deleted by the source login.
 The database owns the ticket clock, consumes its nonce durably, verifies the
 active signed lease and exact payload digest, and keeps the verification key
 unreadable by the runtime role. Production ticket signing must use a
-non-exportable HSM/TPM policy key shared with the database provisioner; the
-acceptance drill's in-memory HMAC signer is test evidence only.
+non-exportable HSM/TPM policy key shared with the database provisioner. The
+signer is a separate policy boundary, not a general signing oracle: its policy
+must authorize the canonical outbox mutation and the requested action/payload
+mapping under the current external authority proof. The database boundary
+protects against stolen runtime database credentials; signer compromise is a
+separate key-custody/policy compromise and requires revocation and recovery.
+The acceptance drill's in-memory HMAC signer is test evidence only.
 
 Promotion writes a signed PREPARING record to the control database before the
 Redis effect. It freezes A with a signed revocation plus control-clock lease

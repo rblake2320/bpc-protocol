@@ -1,4 +1,4 @@
-import { createHmac, createPrivateKey, createPublicKey, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, createPrivateKey, createPublicKey, timingSafeEqual } from 'node:crypto';
 import pg from 'pg';
 import Redis from 'ioredis';
 
@@ -79,7 +79,7 @@ try {
       const resolver={ resolve: (keyId:string) => keyId === 'guard-v1' ? publicKey:keyId===binding.nodeCredentialKeyId?nodePublicKey:null };
       const controlPool=new Pool({connectionString:required('BPC_HA_CONTROL_PG_URL'),max:1});controlPool.on('error',()=>{});const controlDb=new NodePostgresTransactor(controlPool as never);const controlReady=await provisionBpcHaSchema(controlDb);
       const quorum=await BpcRedisQuorumFenceStore.open(redisClients,resolver,await PgRedisFenceWitness.open(controlDb,controlReady,resolver),'bpc:ha:final');
-      const mutationSigner={keyId:'mutation-v1',async signTicket(request:Record<string,string>){return createHmac('sha256',mutationSecret).update([request.domain,request.keyId,request.nonce,request.streamId,request.epoch,request.leaseId,request.grantDigest,request.txid,request.expiresAtMs,request.sourceEpoch,request.sequence,request.opDigest,request.action,request.payloadDigest].join('|')).digest('hex');}};
+      const mutationSigner={keyId:'mutation-v1',async signTicket(request:Record<string,string>,context:{canonicalPolicy:string}){if(createHash('sha256').update(context.canonicalPolicy).digest('hex')!==request.policyDigest)throw new Error('mutation policy digest mismatch');return createHmac('sha256',mutationSecret).update([request.domain,request.keyId,request.nonce,request.streamId,request.epoch,request.leaseId,request.grantDigest,request.txid,request.expiresAtMs,request.sourceEpoch,request.sequence,request.opDigest,request.action,request.payloadDigest,request.policyDigest].join('|')).digest('hex');}};
       const fence = await PgSourceLeaseFence.open(db,haReady,resolver, binding,quorum,{keyId:binding.nodeCredentialKeyId,prove:async challenge=>signNodeIdentityChallenge(binding.nodeCredentialKeyId,nodePrivateKey,challenge)},mutationSigner);
       const store = createHaPairAuthority(db, ready, {
         streamId: required('BPC_HA_STREAM_ID'), fenceToken: BigInt(binding.epoch),
