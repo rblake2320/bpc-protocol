@@ -55,7 +55,7 @@ async function ddl(pool: pg.Pool, sql: string): Promise<void> {
 async function reset(pool: pg.Pool): Promise<void> {
   await pool.query('DROP SCHEMA IF EXISTS bpc_ha CASCADE');
   await pool.query('DROP TABLE IF EXISTS bpc_transport_nonce,bpc_pending,bpc_pairs,ha_outbox_rows,ha_outbox_applied,ha_outbox_fence,ha_outbox_source_checkpoint,ha_outbox_receiver_checkpoint,ha_outbox_publisher_lease,ha_outbox_quarantine,ha_outbox_meta CASCADE');
-  await ddl(pool, HA_OUTBOX_PG_SCHEMA); await ddl(pool, BPC_TRANSPORT_NONCE_SCHEMA); await ddl(pool, BPC_HA_SCHEMA);
+  await ddl(pool, HA_OUTBOX_PG_SCHEMA); await ddl(pool, BPC_TRANSPORT_NONCE_SCHEMA); await pool.query(BPC_HA_SCHEMA);
 }
 const systemId = async (pool: pg.Pool) => String((await pool.query('SELECT system_identifier::text AS id FROM pg_control_system()')).rows[0].id);
 const pair = (n: number) => ({
