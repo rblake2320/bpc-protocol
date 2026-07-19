@@ -215,6 +215,7 @@ export {
   provisionBpcHaSchema,
   assertBpcHaSchemaReady,
   provisionBpcRuntimeMutationBoundary,
+  validateDbMutationPolicyContext,
   BpcRedisQuorumFenceStore,
   BpcCutoverController,
   PgRedisFenceWitness,
@@ -254,6 +255,7 @@ export type {
   NodeIdentityProver,
   DbMutationTicketSigner,
   DbMutationTicketRequest,
+  DbMutationPolicyContext,
 } from './bpc-ha-final.js';
 export type {
   FetchLike,

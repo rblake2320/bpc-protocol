@@ -23,9 +23,10 @@ revokes object-creation authority, and rejects superuser, `BYPASSRLS`, owner
 membership, inherited DML, or schema-creation bypasses. Pair mutations cross a
 fixed-search-path `SECURITY DEFINER` function only after a single-use,
 transaction-bound HMAC ticket has been issued by the governed source fence.
-The outbox admission/reservation itself requires a separate valid single-use
-ticket before it takes authoritative checkpoint or fence locks. The outbox
-row/checkpoint advance crosses a separate controlled function and
+Outbox admission, locking, row insertion, and checkpoint advance occur inside
+one authenticated controlled function, so no caller-controlled gap holds the
+authoritative locks. The outbox
+row/checkpoint advance crosses that controlled function and
 the pair mutation ticket must bind to that exact current-transaction outbox
 tuple, so evidence cannot be fabricated or deleted by the source login.
 The database owns the ticket clock, consumes its nonce durably, verifies the
@@ -34,7 +35,10 @@ unreadable by the runtime role. Production ticket signing must use a
 non-exportable HSM/TPM policy key shared with the database provisioner. The
 signer is a separate policy boundary, not a general signing oracle: its policy
 must authorize the canonical outbox mutation and the requested action/payload
-mapping under the current external authority proof. The database boundary
+mapping under the current external authority proof. The built-in validator
+recomputes `opDigest` and enforces exact action identity fields; a production
+signer must additionally open sealed pair material and validate every requested
+pair field before signing. The database boundary
 protects against stolen runtime database credentials; signer compromise is a
 separate key-custody/policy compromise and requires revocation and recovery.
 The acceptance drill's in-memory HMAC signer is test evidence only.
