@@ -38,7 +38,11 @@ must authorize the canonical outbox mutation and the requested action/payload
 mapping under the current external authority proof. The built-in validator
 recomputes `opDigest` and enforces exact action identity fields; a production
 signer must additionally open sealed pair material and validate every requested
-pair field before signing. The database boundary
+pair field before signing. The shipped validation helper sanitizes the mutation,
+recomputes `opDigest`, opens sealed pair/registration material through the
+injected codec, and compares the complete DML payload. The acceptance path uses
+that concrete policy and rejects malformed mutations and same-ID field changes.
+The database boundary
 protects against stolen runtime database credentials; signer compromise is a
 separate key-custody/policy compromise and requires revocation and recovery.
 The acceptance drill's in-memory HMAC signer is test evidence only.
