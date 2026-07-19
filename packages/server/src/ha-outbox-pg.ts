@@ -160,6 +160,8 @@ export interface PgExecutor {
  *    ROLLBACK — the server aborts the tx when the connection drops.
  */
 export interface PgTransactor {
+  /** Hard upper bound enforced by the adapter for one transaction attempt. */
+  readonly maxTransactionDurationMs?: number;
   transaction<T>(fn: (exec: PgExecutor) => Promise<T>, opts?: { signal?: AbortSignal }): Promise<T>;
   /**
    * Optional migration-only entry point. The adapter must acquire the listed

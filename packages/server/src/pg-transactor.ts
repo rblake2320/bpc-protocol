@@ -167,6 +167,8 @@ export class NodePostgresTransactor implements PgTransactor {
     this.onDisposalError = opts.onDisposalError;
   }
 
+  get maxTransactionDurationMs(): number { return this.transactionTimeoutMs; }
+
   async transaction<T>(fn: (exec: PgExecutor) => Promise<T>, opts?: { signal?: AbortSignal }): Promise<T> {
     return this.runTransaction(fn, opts);
   }

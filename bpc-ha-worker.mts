@@ -25,7 +25,7 @@ const mode = required('BPC_HA_WORKER_MODE');
 const { Pool } = pg;
 const pool = new Pool({ connectionString: required('BPC_HA_PG_URL'), max: 3 });
 pool.on('error', () => {});
-const db = new NodePostgresTransactor(pool as never);
+const db = new NodePostgresTransactor(pool as never,{transactionTimeoutMs:Number(process.env['BPC_HA_TRANSACTION_TIMEOUT_MS']??35_000)});
 
 const ackBody = (a: Omit<AckReceipt, 'signature'>) => [a.receiverId,a.keyId,a.streamId,a.sourceEpoch,a.sequence,a.opDigest,a.decision,a.issuedAt].join('|');
 
