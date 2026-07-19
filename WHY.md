@@ -220,3 +220,21 @@ insert. Likewise, quarantining one ordered mutation without blocking later
 sequence numbers would convert a terminal authentication failure into an
 ordering gap. The earliest unacknowledged row therefore remains authoritative
 even after it is quarantined; recovery must be explicit rather than skip-based.
+
+## 2026-07-18: Fence the database commit, not only the route
+
+Redis decides the monotonic writer epoch, but a source partitioned from Redis
+can still reach its own PostgreSQL database. Routing or process-local promotion
+checks cannot prevent that old source from committing. A control-signed lease
+is therefore installed in the source database and rechecked after the complete
+pair mutation and outbox work, immediately before the transaction returns to
+COMMIT. The control cannot promote B until A's lease expires; after expiry, A
+fails closed even while its database remains reachable.
+
+Promotion also needs state continuity, not just a new routing decision. A signs
+and exports every retained record through a frozen checkpoint; an empty B
+re-digests and applies that snapshot before receiving the remaining tail. A
+separate control database records a signed PREPARING/FENCED/ACTIVE chain and an
+epoch witness. A majority of three durable Redis authorities must agree on the
+exact signed target tuple before FENCED can commit. B's signed lease then gates
+the first promoted write.

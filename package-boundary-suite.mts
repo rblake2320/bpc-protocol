@@ -38,6 +38,8 @@ for (const workspace of workspaces) {
     assert(!names.some((name) => /unsafe.*mint|mint.*ready.*test/i.test(name)), '@bpc/server publishes a readiness-token bypass');
     assert(!('MemoryReplayNonceStore' in runtime) && !('createMemoryReplayNonceStoreForTests' in runtime),
       '@bpc/server publishes a non-durable replay authority');
+    assert(!('__internalCreateHaPairStore' in runtime), '@bpc/server publishes the package-internal HA fence bypass');
+    assert('createHaPairAuthority' in runtime, '@bpc/server does not publish the guarded HA pair-authority factory');
   }
   passed++;
   console.log(`  PASS ${manifest.name} entry points exist and import`);
