@@ -920,6 +920,9 @@ export interface PgOutboxOptions<Raw, Clean> {
    *  transaction callback returns. A rejection rolls the entire mutation and
    *  outbox row back. */
   preCommitCheck?: (exec: PgExecutor) => Promise<void>;
+  /** Optional database-authority append path for restricted runtime roles that
+   * cannot directly mutate outbox/checkpoint/fence tables. */
+  governedAppend?: (exec:PgExecutor,input:{streamId:string;mutation:SanitizedMutation<Clean>;fenceToken:FenceToken;maxPendingRows:number;backpressure:PublisherBackpressure})=>Promise<OutboxRecordHeader>;
 }
 
 /**
@@ -977,6 +980,7 @@ export class PgDurableOutbox<Raw, Clean> implements DurableOutbox<Raw, Clean, Pg
     const streamId = captured.streamId;
     if (streamId !== this.opts.streamId) throw new ContractValidationError('streamId mismatch for this outbox');
     const fenceDecimal = fenceTokenToDecimal(captured.fenceToken);
+    if(this.opts.governedAppend){const header=await this.opts.governedAppend(exec,{streamId,mutation,fenceToken:captured.fenceToken,maxPendingRows:this.opts.maxPendingRows,backpressure:this.opts.backpressure});assertHeaderConformant(header);return header;}
 
     // (h) validate the presented fence token against the authoritative persisted
     // token under a row lock; stale token fails closed.

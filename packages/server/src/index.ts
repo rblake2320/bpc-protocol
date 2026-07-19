@@ -253,6 +253,7 @@ export type {
   BpcHaReadyToken,
   NodeIdentityProver,
   DbMutationTicketSigner,
+  DbMutationTicketRequest,
 } from './bpc-ha-final.js';
 export type {
   FetchLike,
