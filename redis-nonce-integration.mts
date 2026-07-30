@@ -375,11 +375,11 @@ try {
   await establishContinuity(oomNamespace, 'epoch-before-oom');
   const oomStore = await governed(redis, oomNamespace);
   try {
-    const memoryInfo = await redis.info('memory');
-    const usedMatch = /^used_memory:(\d+)$/m.exec(memoryInfo);
-    if (!usedMatch) throw new Error('Redis INFO did not expose used_memory');
     await redis.config('SET', 'maxmemory-policy', 'noeviction');
-    await redis.config('SET', 'maxmemory', String(Math.max(1, Number(usedMatch[1]) - 1)));
+    // A limit derived from an INFO snapshot is racy: Redis can reclaim memory
+    // before the authorization write and make a nominally over-limit write
+    // succeed. One byte is deterministically below the server's baseline.
+    await redis.config('SET', 'maxmemory', '1');
 
     const oomRequest = requestFromHeaders(await client.signRequest('GET', '/api/data'));
     const oomResult = await verifyBPCRequest(
