@@ -1,0 +1,27 @@
+name: bpc-integration
+
+services:
+  redis:
+    image: redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    ports:
+      - "127.0.0.1:6388:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  postgres:
+    image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    environment:
+      POSTGRES_DB: bpc_test
+      POSTGRES_USER: bpc_test
+      POSTGRES_PASSWORD: bpc-test-only-password
+    ports:
+      - "127.0.0.1:5545:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bpc_test -d bpc_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

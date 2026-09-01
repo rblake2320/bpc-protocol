@@ -46,6 +46,7 @@ jobs:
       - run: python -m pip install -e packages/bpc-client
       - run: npm run build
       - run: npm run test:pack
+      - run: npm run test:installed
       - run: npm test
       - run: npm run test:adversarial
       - run: npm run test:interop

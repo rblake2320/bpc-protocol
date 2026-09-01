@@ -40,6 +40,7 @@ npm test
 npm run test:adversarial
 npm run test:interop
 npm run test:pack
+npm run test:installed
 ```
 
 Distributed replay testing uses built package entry points and a real Redis
@@ -71,6 +72,21 @@ verifies the publish manifest includes compiled `dist` entry points.
 `test:postgres` requires `BPC_TEST_POSTGRES_URL` and exercises the real
 PostgreSQL pair store, including authorization-affecting security fields and a
 full connection restart. It is not replaced by an in-memory store in CI.
+
+### Product readiness checks
+
+`npm run test:installed` packs every TypeScript workspace, installs the tarballs
+into a clean temporary consumer project, and proves the installed packages can
+sign and verify one request. It is a release gate, not merely a manifest check.
+
+`npm run test:integration` starts isolated Redis and PostgreSQL containers on
+loopback-only ports, runs the real adapter tests, then removes the containers
+and volumes. It never uses a shared local Redis or PostgreSQL service.
+
+For a composed BPC + TSK deployment, use the maintained `@tsk/bpc-bridge` and
+follow [the production composition contract](docs/TSK_COMPOSITION.md). The
+bridge requires both verifiers to accept and binds the BPC pair identity to the
+TSK client identity; neither protocol alone authorizes the composed product.
 
 ## Security Boundaries
 
