@@ -15,6 +15,7 @@
     "test:postgres": "tsx postgres-store-integration.mts",
     "test:interop": "tsx cross-language-integration.mts",
     "test:adversarial": "tsx adversarial-integration.mts",
+    "test:claims": "tsx claim-surface.test.mts",
     "test:installed": "tsx installed-artifact-smoke.mts",
     "test:integration": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-integration-tests.ps1",
     "test:pack": "npm pack --dry-run --workspaces",
