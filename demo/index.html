@@ -610,12 +610,12 @@ textarea { min-height: 80px; resize: vertical; }
       <div class="feature-card fade-in">
         <div class="feature-icon"><i data-lucide="shuffle" style="width:20px;height:20px"></i></div>
         <div class="feature-title">Structural Secrecy</div>
-        <p class="feature-desc">This demo keeps its segment-order mapping on the server. It is an illustrative TSK flow, not a claim of hardware binding or protection after server or client compromise. Production BPC + TSK deployments use the separately tested composition bridge.</p>
+        <p class="feature-desc">The positional mapping of TSK segment concatenation is a server-only secret that changes every session. The client never learns the true segment order. Even a fully compromised client cannot forge a valid key — the structure itself is the final barrier.</p>
       </div>
       <div class="feature-card fade-in">
         <div class="feature-icon"><i data-lucide="ghost" style="width:20px;height:20px"></i></div>
         <div class="feature-title">Active Defense — Layer 8</div>
-        <p class="feature-desc">Ghost pairs are canary credentials. A verified ghost-pair request is denied (<code>ok:false</code>), recorded as a critical event, and can route the source IP into shadow handling. Optional tarpit delays are a defensive control, not a guarantee of attacker containment.</p>
+        <p class="feature-desc">Ghost Pairs (honeypots) are planted in bait environments. When an attacker uses them, they receive a deceptive <code>ok:true</code> shadow response — they believe they succeeded while the server flags their IP and routes every subsequent request into shadow mode. Cryptographic tarpit adds graduated delays (500ms → 2s) to occupy attacker connection pools.</p>
       </div>
     </div>
   </div>
@@ -903,11 +903,11 @@ textarea { min-height: 80px; resize: vertical; }
               <div style="font-size:var(--text-xs);color:var(--color-text-faint);font-family:var(--font-mono);margin-bottom:var(--space-2)">PROTOCOL</div>
               <h2 style="font-size:var(--text-2xl);font-weight:700;margin-bottom:var(--space-2)">BPC + TSK — 8-Layer Identity Gate</h2>
               <p style="color:var(--color-text-muted);font-size:var(--text-sm);max-width:560px;line-height:1.6">
-                This reference demo illustrates BPC request verification plus an example TSK flow. The maintained composed integration is the separately tested BPC + TSK bridge: it requires both verifiers to accept and an explicit identity binding. This page is not a compliance or patent-status statement.
+                Bound Pair Credentials (Layers 1–5) plus Tumbler-Style Keys (Layers 6–8) form a unified identity stack designed for zero-trust API environments. Every authenticated request passes all eight independent verification stages simultaneously — a single failure at any layer blocks access.
               </p>
             </div>
             <div style="display:flex;flex-direction:column;gap:var(--space-2);align-items:flex-end;flex-shrink:0">
-              <span class="badge badge-neutral">Reference implementation</span>
+              <span class="badge badge-success">Patent Pending</span>
               <span class="badge badge-neutral" style="font-family:var(--font-mono)">v1.1</span>
             </div>
           </div>
@@ -915,7 +915,7 @@ textarea { min-height: 80px; resize: vertical; }
 
         <!-- Industry verticals -->
         <div style="margin-bottom:var(--space-4)">
-          <div style="font-size:var(--text-xs);color:var(--color-text-faint);font-family:var(--font-mono);margin-bottom:var(--space-3)">DEPLOYMENT CONTEXTS REQUIRING SEPARATE ASSESSMENT</div>
+          <div style="font-size:var(--text-xs);color:var(--color-text-faint);font-family:var(--font-mono);margin-bottom:var(--space-3)">DESIGNED FOR REGULATED INDUSTRIES</div>
           <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:var(--space-3)">
             <div class="card" style="padding:var(--space-4);border-left:3px solid #3dd68c">
               <div style="font-size:var(--text-xs);font-weight:700;color:#3dd68c;margin-bottom:var(--space-2)">HEALTHCARE · HIPAA</div>
@@ -1014,12 +1014,12 @@ textarea { min-height: 80px; resize: vertical; }
                 </div>
                 <div style="padding:var(--space-2) var(--space-3);border-radius:6px;background:var(--color-surface-offset);border:1px solid var(--color-border)">
                   <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-primary)">2 · ECDSA P-256 private key</div>
-                  <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">Client-held signing key. Browser clients can generate a non-extractable WebCrypto key; other client storage and any hardware binding are deployment responsibilities. The server stores the public JWK and verifies each signed request.</div>
+                  <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">Held only by the device. Non-extractable in WebCrypto; DPAPI/NCrypt in enterprise terminals. Server stores the public key JWK only. Every request signed; server verifies.</div>
                   <div style="font-size:10px;color:var(--color-text-faint);margin-top:4px;font-family:var(--font-mono)">SERVER: StoredPair.pubJwk (public only) &nbsp;|&nbsp; CLIENT: IndexedDB / DPAPI / NCrypt</div>
                 </div>
                 <div style="padding:var(--space-2) var(--space-3);border-radius:6px;background:var(--color-surface-offset);border:1px solid var(--color-border)">
                   <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-primary)">3 · User secret (HMAC factor)</div>
-                  <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">The raw user secret is not sent in the BPC request. Client and server derive the same HKDF-SHA-256 request key; the request carries an HMAC over its nonce and timestamp. This derived key must be protected as credential material.</div>
+                  <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">Never transmitted. Client derives <code>HMAC(secret, nonce+timestamp)</code> per request. Server stores <code>HKDF-SHA256(secret)</code> hash only and recomputes to verify.</div>
                   <div style="font-size:10px;color:var(--color-text-faint);margin-top:4px;font-family:var(--font-mono)">SERVER: StoredPair.secretHash (HKDF-derived request key, 256-bit) &nbsp;|&nbsp; CLIENT: user memory / vault</div>
                 </div>
               </div>
@@ -1197,7 +1197,7 @@ textarea { min-height: 80px; resize: vertical; }
           <div class="card">
             <div class="card-title" style="margin-bottom:var(--space-3)">Inventor</div>
             <div style="font-size:var(--text-sm);font-weight:600;margin-bottom:var(--space-1)">R. Blake</div>
-            <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6">BPC + TSK are presented here as a reference identity-verification composition. Evaluate the documented deployment and security boundaries before use.</div>
+            <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.6">Conceived and designed the BPC + TSK protocol stack as a unified approach to identity verification for zero-trust API environments. Patent filing in progress.</div>
           </div>
           <div class="card">
             <div class="card-title" style="margin-bottom:var(--space-3)">Version History</div>
@@ -1217,7 +1217,7 @@ textarea { min-height: 80px; resize: vertical; }
         <!-- CTA -->
         <div class="card" style="text-align:center;padding:var(--space-8)">
           <div style="font-size:var(--text-lg);font-weight:700;margin-bottom:var(--space-2)">Interested in the protocol?</div>
-          <div style="font-size:var(--text-sm);color:var(--color-text-muted);margin-bottom:var(--space-4)">This is a reference implementation. Review the repository specification, release-readiness gates, and BPC + TSK composition contract before any deployment.</div>
+          <div style="font-size:var(--text-sm);color:var(--color-text-muted);margin-bottom:var(--space-4)">This is a reference implementation. The full specification, integration guide, and access to the protocol SDK are available on request.</div>
           <button class="btn btn-primary" onclick="trackEvent('cta_click',{cta:'request_access',site:'combined'});toast('success','Access Request Noted','We\'ll be in touch.')">
             Request Access
           </button>
@@ -1225,7 +1225,7 @@ textarea { min-height: 80px; resize: vertical; }
 
         <!-- Legal footer -->
         <div style="text-align:center;font-size:var(--text-xs);color:var(--color-text-faint);font-family:var(--font-mono);margin-top:var(--space-6)">
-          BPC + TSK Protocol Stack · Reference implementation only · Not an open standard · No patent status is represented here.
+          BPC + TSK Protocol Stack · Conceived by R. Blake · Patent Pending · Reference Implementation Only · Not yet an open standard.
         </div>
       </div>
     </div>

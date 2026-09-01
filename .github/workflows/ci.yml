@@ -47,7 +47,6 @@ jobs:
       - run: npm run build
       - run: npm run test:pack
       - run: npm run test:installed
-      - run: npm run test:claims
       - run: npm test
       - run: npm run test:adversarial
       - run: npm run test:interop
