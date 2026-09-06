@@ -40,7 +40,7 @@ export class FileNonceBackend extends AtomicFile<Record<string,NonceEntry>> impl
 }
 
 export class FileAnomalyStore extends AtomicFile<Record<string,AnomalyEntry>> implements AnomalyStore{
- protected empty(){return{};} protected decode(v:Obj){for(const x of Object.values(v))if(!obj(x)||!Number.isSafeInteger(x.value)||x.value<0||!Number.isSafeInteger(x['expiresAt'])||(x['expiresAt'] as number)<0)corrupt(this.path);return structuredClone(v) as Record<string,AnomalyEntry>;}
+ protected empty(){return{};} protected decode(v:Obj){for(const x of Object.values(v))if(!obj(x)||!Number.isSafeInteger(x['value'])||(x['value'] as number)<0||!Number.isSafeInteger(x['expiresAt'])||(x['expiresAt'] as number)<0)corrupt(this.path);return structuredClone(v) as Record<string,AnomalyEntry>;}
  async increment(key:string,ttlMs=3600000){if(!key||!Number.isSafeInteger(ttlMs)||ttlMs<1)throw new Error('BPC_FILE_ANOMALY_INPUT_INVALID');return this.tx(d=>{const now=Date.now(),n=structuredClone(d);for(const[k,v]of Object.entries(n))if(v.expiresAt<=now)delete n[k];const value=(n[key]?.expiresAt>now?n[key].value:0)+1;n[key]={value,expiresAt:now+ttlMs};return{next:n,result:value};});}
  async get(key:string){return this.tx(d=>{const v=d[key];return{result:v&&v.expiresAt>Date.now()?v.value:0};});}
  async reset(key:string){this.tx(d=>{const n=structuredClone(d);delete n[key];return{next:n,result:undefined};});}
