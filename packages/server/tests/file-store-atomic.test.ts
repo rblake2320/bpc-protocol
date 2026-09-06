@@ -17,6 +17,17 @@ describe('atomic BPC file stores', () => {
     await expect(new FileNonceBackend(nonce).checkAndConsume('synthetic-seen-nonce',60000)).rejects.toThrow(/BPC_FILE_STORE_CORRUPT/);
     await expect(new FileAnomalyStore(anomaly).increment('attack')).rejects.toThrow(/BPC_FILE_STORE_CORRUPT/);
   });
+  it('rejects prototype keys and unsafe expiry candidates before publication', async () => {
+    const dir=mkdtempSync(join(tmpdir(),'bpc-file-')); const nonce=join(dir,'nonces.json'), anomaly=join(dir,'anomaly.json');
+    await expect(new FileNonceBackend(nonce).checkAndConsume('__proto__',60000)).rejects.toThrow(/BPC_FILE_NONCE_INPUT_INVALID/);
+    await expect(new FileAnomalyStore(anomaly).increment('__proto__')).rejects.toThrow(/BPC_FILE_ANOMALY_INPUT_INVALID/);
+    await expect(new FileNonceBackend(nonce).checkAndConsume('safe',Number.MAX_SAFE_INTEGER)).rejects.toThrow(/BPC_FILE_NONCE_INPUT_INVALID/);
+    expect(() => new FileNonceBackend(nonce)).not.toThrow();
+  });
+  it('rejects incomplete persisted pair authority', async () => {
+    const path=join(mkdtempSync(join(tmpdir(),'bpc-file-')),'pairs.json'); writeFileSync(path,'{"pairs":{"synthetic":null},"pending":{}}');
+    await expect(new FilePairStore(path).list()).rejects.toThrow(/BPC_FILE_STORE_CORRUPT/);
+  });
   it('serializes fresh nonce reads across independent store instances', async () => {
     const path=join(mkdtempSync(join(tmpdir(),'bpc-file-')),'nonces.json'); const a=new FileNonceBackend(path),b=new FileNonceBackend(path);
     const result=await Promise.all([a.checkAndConsume('same',60000),b.checkAndConsume('same',60000)]);
