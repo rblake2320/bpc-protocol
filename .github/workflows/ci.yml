@@ -96,6 +96,16 @@ jobs:
       - run: npm run build
       - run: npm run test:pack
       - run: npm run test:installed-file-store
+        env:
+          BPC_INSTALLED_EVIDENCE_DIR: ${{ runner.temp }}/bpc-installed-evidence
+      - name: Retain installed package evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bpc-installed-file-store-${{ github.run_id }}
+          path: ${{ runner.temp }}/bpc-installed-evidence
+          if-no-files-found: error
+          retention-days: 30
       - run: npm test
       - run: npm run test:adversarial
       - run: npm run test:interop

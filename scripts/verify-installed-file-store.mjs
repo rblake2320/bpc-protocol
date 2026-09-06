@@ -1,12 +1,17 @@
 // Exercise published tarballs in an isolated consumer, never workspace imports.
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
 const root = resolve(import.meta.dirname, '..');
-const evidence = mkdtempSync(join(tmpdir(), 'bpc-installed-file-store-'));
+const requestedEvidence = process.env.BPC_INSTALLED_EVIDENCE_DIR;
+const evidence = requestedEvidence ? resolve(requestedEvidence) : mkdtempSync(join(tmpdir(), 'bpc-installed-file-store-'));
+if (requestedEvidence) {
+  if (existsSync(evidence)) throw Error(`Evidence directory exists: ${evidence}`);
+  mkdirSync(evidence, { recursive: true });
+}
 const packages = join(evidence, 'packages');
 const consumer = join(evidence, 'consumer');
 mkdirSync(packages); mkdirSync(consumer);
@@ -22,6 +27,21 @@ function npm(args, cwd) {
   return run(process.execPath, [process.env.npm_execpath, ...args], cwd);
 }
 try {
+  const git = args => run('git', args, root).trim();
+  const sourceFiles = git(['ls-files', '--', 'packages/core/src', 'packages/server/src',
+    'packages/client-sdk/src', 'package.json', 'package-lock.json',
+    'packages/*/package.json', 'packages/*/tsconfig.json', 'tsconfig*.json',
+    'scripts/verify-installed-file-store.mjs']).split('\n').filter(Boolean);
+  const hash = file => createHash('sha256').update(readFileSync(file)).digest('hex');
+  receipt.provenance = { head: git(['rev-parse', 'HEAD']),
+    dirty: git(['status', '--porcelain']),
+    scriptSha256: hash(join(root, 'scripts/verify-installed-file-store.mjs')),
+    inputs: Object.fromEntries(sourceFiles.map(file => [file, hash(join(root, file))])) };
+  npm(['run', 'build'], root);
+  for (const [file, before] of Object.entries(receipt.provenance.inputs)) {
+    if (hash(join(root, file)) !== before) throw Error(`Build input changed: ${file}`);
+  }
+  receipt.provenance.inputsUnchangedAfterBuild = true;
   for (const name of ['core', 'server']) {
     const packed = JSON.parse(npm(['pack', `./packages/${name}`, '--ignore-scripts', '--json', '--pack-destination', packages], root));
     if (packed.length !== 1) throw Error(`Expected one ${name} tarball`);
