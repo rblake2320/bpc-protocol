@@ -21,7 +21,8 @@
     "test:pack": "npm run build && tsx package-boundary-suite.mts && npm pack --dry-run --workspaces",
     "test:core": "npm run test --workspace=packages/core",
     "test:server": "npm run test --workspace=packages/server",
-    "test:client": "npm run test --workspace=packages/client-sdk"
+    "test:client": "npm run test --workspace=packages/client-sdk",
+    "test:installed-file-store": "node scripts/verify-installed-file-store.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
