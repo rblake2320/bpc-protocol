@@ -41,6 +41,8 @@ import type { ServerNonceStore } from './nonce-store.js';
 import type { AnomalyEngine } from './anomaly.js';
 import type { RateLimiter } from './rate-limiter.js';
 import type { AuditLog } from './audit.js';
+import { canonicalAuthorizationJwk, type SuccessfulUsePolicy } from './store.js';
+import { AuthorizationQuarantineError, type ContinuityGate } from './redis-continuity.js';
 
 export interface BPCRequestData {
   pairId: string | null;
@@ -92,6 +94,14 @@ export interface BPCServerConfig {
    * Default: true (recommended for production).
    */
   enableTarpit?: boolean;
+  /**
+   * Issue #11/#13: continuity gate. When provided, authorization fails closed
+   * (deny 'authorization_quarantined') while Redis nonce-state continuity is
+   * uncertain — after state loss, ambiguous failover, or an unreachable marker
+   * store. Checked immediately before the nonce is consumed. Optional and
+   * non-breaking: verifiers without a continuity guard behave as before.
+   */
+  continuityGuard?: ContinuityGate;
 }
 
 const DEFAULT_SERVER_CONFIG: BPCServerConfig = {
@@ -128,10 +138,7 @@ interface AuthorizationContext {
  * policy inputs while the request is being verified.
  */
 function captureAuthorizationContext(pair: import('./types.js').StoredPair): AuthorizationContext {
-  const pubJwk = Object.freeze({
-    ...pair.pubJwk,
-    key_ops: pair.pubJwk.key_ops ? Object.freeze([...pair.pubJwk.key_ops]) : undefined,
-  }) as JsonWebKey;
+  const pubJwk = canonicalAuthorizationJwk(pair.pubJwk) as JsonWebKey;
 
   return Object.freeze({
     pairId: pair.id,
@@ -248,7 +255,7 @@ export async function verifyBPCRequest(
 
   const lockoutCount = config.lockoutCount ?? 10;
   if (auth.failedSigs >= lockoutCount) {
-    registry.recordActivity(req.pairId, false, sourceIp).catch(() => {});
+    if (!await registry.ensureLocked(req.pairId, lockoutCount)) return deny('pair_state_changed_retry');
     if (shadowEnabled) {
       await anomaly.enterShadowState(req.pairId, sourceIp, 'failedSigs_threshold');
       const delayMs = tarpitEnabled ? await anomaly.applyTarpit(sourceIp, 'shadow') : 0;
@@ -258,11 +265,11 @@ export async function verifyBPCRequest(
   }
 
   if (auth.expiresAt && Date.now() > auth.expiresAt) {
-    pair.status = 'expired';
-    registry.get(req.pairId).then(p => { if (p) { p.status = 'expired'; } }).catch(() => {});
+    if (!await registry.markExpired(req.pairId, Date.now())) return deny('pair_state_changed_retry');
     return deny('pair_expired');
   }
   if (auth.maxRequests && auth.maxRequests > 0 && auth.requests >= auth.maxRequests) {
+    if (!await registry.markUsageExpired(req.pairId)) return deny('pair_state_changed_retry');
     return deny('pair_usage_cap_exceeded');
   }
   if (auth.status !== 'active') return deny('pair_revoked');
@@ -378,12 +385,26 @@ export async function verifyBPCRequest(
     verifiedAt: now,
   });
 
+  // Issue #11/#13: refuse to consume a nonce while continuity is uncertain.
+  // If the marker store lost state / failed over, checkAndConsume could accept
+  // an already-used nonce; the guard fails closed here instead.
+  if (config.continuityGuard) {
+    try {
+      config.continuityGuard.assertAcceptable();
+    } catch {
+      return deny('authorization_quarantined');
+    }
+  }
+
   // Atomic first-acceptance gate. Concurrent valid replays can both complete
   // signature verification, but only one can consume the nonce.
   let replayDetected: boolean;
   try {
     replayDetected = await nonceStore.checkAndConsume(rawNonce);
-  } catch {
+  } catch (error) {
+    if (error instanceof AuthorizationQuarantineError) {
+      return deny('authorization_quarantined');
+    }
     return deny('replay_store_unavailable');
   }
   if (replayDetected) {
@@ -406,7 +427,21 @@ export async function verifyBPCRequest(
     return { ok: false, pairId: req.pairId, error: 'ghost_pair_denied', shadow: true, tarpitDelayMs: delayMs };
   }
 
-  await registry.recordActivity(req.pairId, true);
+  const expectedUsePolicy: SuccessfulUsePolicy = {
+    status: auth.status,
+    scope: auth.scope,
+    mode: auth.mode,
+    secretHash: auth.secretHash,
+    pubJwk: auth.pubJwk,
+    expiresAt: auth.expiresAt,
+    maxRequests: auth.maxRequests,
+    kind: auth.kind,
+    canaryClass: auth.canaryClass,
+  };
+  const useClaim = await registry.claimSuccessfulUseOutcome(req.pairId, Date.now(), expectedUsePolicy);
+  if (useClaim === 'time-expired') return deny('pair_expired');
+  if (useClaim === 'usage-exhausted') return deny('pair_usage_cap_exceeded');
+  if (useClaim !== 'claimed') return deny('pair_state_changed_retry');
   await config.auditLog?.write({
     action: 'verify_pass', pairId: req.pairId,
     method: req.method, path: req.path, ip: req.ip,

@@ -170,6 +170,16 @@ describe('ROT — rotation hardening', () => {
     expect(all.some(e => e.action === 'register' && e.pairId === res.newPairId)).toBe(true);
     expect((await audit.verifyChain()).valid).toBe(true);
   });
+
+  it('A6: rotation preserves ghost classification and request/expiry policy', async () => {
+    const store=new MemoryPairStore(),registry=new PairRegistry(store,10,10,true),oldKey=await generateKeypair();
+    const pairId=await registry.registerDirect({name:'ghost-capped',scope:'read',mode:'production',secretHash:await hashSecret('ghost-capped-secret'),pubJwk:oldKey.pubJwk,expiresAt:Date.now()+60_000,maxRequests:7,kind:'ghost',canaryClass:'registry_exfil'});
+    const replacement=await generateKeypair(),{payload,timestamp}=buildRotation(pairId,replacement.pubJwk),{signature,signedData}=await signRotation(oldKey.privateKey,payload);
+    const result=await handleRotation({oldPairId:pairId,newPubJwk:replacement.pubJwk,signature,signedData,timestamp},store);
+    expect(result.ok).toBe(true);
+    expect(await store.get(result.newPairId!)).toMatchObject({maxRequests:7,kind:'ghost',canaryClass:'registry_exfil'});
+    expect((await store.get(result.newPairId!))?.expiresAt).toBe((await store.get(pairId))?.expiresAt);
+  });
 });
 
 // ── AUD: hash-chained audit log ─────────────────────────────────────────────────

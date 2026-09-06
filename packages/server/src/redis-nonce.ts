@@ -22,6 +22,12 @@ export interface RedisBackedNonceOptions {
   safetyBufferMs?: number;
   /** Maximum time to wait for one Redis SET before failing closed. Default: 2s. */
   commandTimeoutMs?: number;
+  /**
+   * Required acknowledgement that this low-level helper has no continuity
+   * epoch/quarantine. Production Redis verifiers must use the async governed
+   * factory instead.
+   */
+  continuityMode: 'ungoverned-development';
 }
 
 export interface RedisBackedNonceStore {
@@ -106,15 +112,17 @@ export class RedisNonceStore implements NonceStoreBackend {
 }
 
 /**
- * Safe standalone composition for distributed TypeScript BPC verifiers.
- * The low-level classes remain exported for custom adapters, but this builder
- * binds the Redis TTL to the verifier acceptance window and isolates keys by
- * deployment namespace.
+ * Explicitly ungoverned low-level composition for tests and development.
+ * It binds TTL and namespace but cannot detect Redis state loss or failover.
+ * Production Redis verifiers must use createGovernedRedisBackedNonceStore().
  */
 export function createRedisBackedNonceStore(
   redis: RedisClient,
   options: RedisBackedNonceOptions,
 ): RedisBackedNonceStore {
+  if (options.continuityMode !== 'ungoverned-development') {
+    throw new RangeError('continuityMode must explicitly be ungoverned-development');
+  }
   if (!NAMESPACE_RE.test(options.namespace)) {
     throw new RangeError('namespace must be 1-64 ASCII letters, digits, dot, underscore, or hyphen');
   }

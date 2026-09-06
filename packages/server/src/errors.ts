@@ -22,6 +22,7 @@ export const BPC_ERRORS: Record<string, BPCError> = {
   invalid_signature:     { code: 'invalid_signature',     message: 'ECDSA signature verification failed',    httpStatus: 401 },
   replay_detected:       { code: 'replay_detected',       message: 'Nonce already seen — replay rejected',   httpStatus: 401 },
   replay_store_unavailable: { code: 'replay_store_unavailable', message: 'Replay protection unavailable',    httpStatus: 503 },
+  authorization_quarantined: { code: 'authorization_quarantined', message: 'Authorization continuity uncertain', httpStatus: 503 },
   timestamp_expired:     { code: 'timestamp_expired',     message: 'Request timestamp outside valid window', httpStatus: 401 },
   scope_violation:       { code: 'scope_violation',       message: 'Method not permitted for pair scope',    httpStatus: 403 },
   rate_limit_exceeded:   { code: 'rate_limit_exceeded',   message: 'Too many requests',                      httpStatus: 429 },

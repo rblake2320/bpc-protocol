@@ -30,7 +30,7 @@
  */
 
 import { importPublicKeyFromJwk, verifyPayload, generateId } from '@bpc/core';
-import type { PairStore } from './store.js';
+import { isAtomicPairStore, type PairStore } from './store.js';
 import type { StoredPair } from './types.js';
 import type { AuditLog } from './audit.js';
 
@@ -165,10 +165,8 @@ export async function handleRotation(
   // ROT-02: order-independent cryptographic-material comparison.
   if (!sameJwk(parsedNewPubJwk, req.newPubJwk)) return fail('payload_field_mismatch');
 
-  // 6. ROT-01: disable old pair FIRST (fail-closed), then create the new pair.
-  oldPair.status = 'rotated';
-  await store.set(oldPair);
-
+  // 6. Construct the replacement, then commit both authority changes atomically
+  // when the store exposes the production AtomicPairStore capability.
   const newPairId = generateId('pair');
   const newPair: StoredPair = {
     id:         newPairId,
@@ -183,9 +181,19 @@ export async function handleRotation(
     requests:   0,
     failedSigs: 0,
     expiresAt:  oldPair.expiresAt,
+    maxRequests: oldPair.maxRequests,
+    kind: oldPair.kind,
+    canaryClass: oldPair.canaryClass,
   };
   try {
-    await store.set(newPair);
+    if (isAtomicPairStore(store)) {
+      const rotated = await store.rotatePair(oldPair, newPair);
+      if (!rotated) return fail('rotation_conflict');
+    } else {
+      // Compatibility path for legacy single-writer stores.
+      await store.set({ ...oldPair, status: 'rotated' });
+      await store.set(newPair);
+    }
   } catch (err) {
     await auditLog?.write({
       action: 'rotate', severity: 'CRITICAL', pairId: req.oldPairId,

@@ -33,6 +33,7 @@
 
 import type { PairStore } from './store.js';
 import type { StoredPair, PairRegistration } from './types.js';
+import { BPC_PAIR_PG_SCHEMA } from './ha-outbox-pg.js';
 
 export interface PgPool {
   query(sql: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
@@ -135,36 +136,16 @@ export class PgPairStore implements PairStore {
   }
 }
 
+/** @deprecated Prefer the governed v3 provisioning path. This standalone DDL
+ * is deliberately fresh-only: CREATE IF NOT EXISTS would otherwise appear to
+ * upgrade a legacy table while silently retaining its weaker catalog. */
 export const PG_SCHEMA = `
-CREATE TABLE IF NOT EXISTS bpc_pairs (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  scope TEXT NOT NULL,
-  mode TEXT NOT NULL,
-  secret_hash TEXT NOT NULL,
-  pub_jwk JSONB NOT NULL,
-  status TEXT NOT NULL DEFAULT 'active',
-  created BIGINT NOT NULL,
-  last_active BIGINT,
-  requests INT NOT NULL DEFAULT 0,
-  failed_sigs INT NOT NULL DEFAULT 0,
-  cumulative_failures DOUBLE PRECISION,
-  first_failure_at BIGINT,
-  max_requests BIGINT,
-  kind TEXT NOT NULL DEFAULT 'legitimate',
-  canary_class TEXT,
-  expires_at BIGINT
-);
-
-ALTER TABLE bpc_pairs ADD COLUMN IF NOT EXISTS cumulative_failures DOUBLE PRECISION;
-ALTER TABLE bpc_pairs ADD COLUMN IF NOT EXISTS first_failure_at BIGINT;
-ALTER TABLE bpc_pairs ADD COLUMN IF NOT EXISTS max_requests BIGINT;
-ALTER TABLE bpc_pairs ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'legitimate';
-ALTER TABLE bpc_pairs ADD COLUMN IF NOT EXISTS canary_class TEXT;
-
-CREATE TABLE IF NOT EXISTS bpc_pending (
-  token TEXT PRIMARY KEY,
-  registration JSONB NOT NULL,
-  requested_at BIGINT NOT NULL
-);
-`;
+DO $bpc_fresh$
+BEGIN
+  IF to_regclass(current_schema() || '.bpc_pairs') IS NOT NULL
+     OR to_regclass(current_schema() || '.bpc_pending') IS NOT NULL THEN
+    RAISE EXCEPTION 'PG_SCHEMA is fresh-only; use the governed legacy migration path';
+  END IF;
+END
+$bpc_fresh$;
+${BPC_PAIR_PG_SCHEMA}`;

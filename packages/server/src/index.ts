@@ -6,7 +6,8 @@ export type {
   AnomalyCounters,
 } from './types.js';
 export type { BPCRequestData, BPCServerConfig } from './middleware.js';
-export type { PairStore, NonceStoreBackend, AnomalyStore } from './store.js';
+export type { PairStore, AtomicPairStore, PairAtomicMutation, SuccessfulUseClaim, SuccessfulUsePolicy, NonceStoreBackend, AnomalyStore } from './store.js';
+export { canonicalAuthorizationJwk, successfulUsePolicy, successfulUsePolicyMatches } from './store.js';
 export type { AuditLog, AuditEntry, AuditAction, AuditSeverity } from './audit.js';
 export type { RateLimiter, RateLimitResult } from './rate-limiter.js';
 export type { RotationRequest, RotationResult } from './rotation.js';
@@ -66,9 +67,228 @@ export {
   sealAgentCredentialCacheEntry,
 } from './agent-cache.js';
 export { PairRegistry } from './registry.js';
+export { isAtomicPairStore } from './store.js';
 export type { RedactedPair } from './registry.js';
 export { AnomalyEngine } from './anomaly.js';
 export { NonceStoreUnavailableError, ServerNonceStore } from './nonce-store.js';
+export {
+  AuthorizationQuarantineError,
+  DEFAULT_CONTINUITY_SAFETY_ALLOWANCE_MS,
+  DEFAULT_CONTINUITY_TIMEOUT_MS,
+  EvictionPolicyError,
+  RedisContinuityGuard,
+  assertNoEvictionPolicy,
+  startContinuityReconcileLoop,
+} from './redis-continuity.js';
+export type {
+  ContinuityGate,
+  ReconcileLoopHandle,
+  ReconcileLoopOptions,
+  RedisConfigClient,
+  RedisContinuityClient,
+  RedisContinuityOptions,
+} from './redis-continuity.js';
+export {
+  CANON_MAX_DEPTH,
+  CANON_MAX_NODES,
+  CANON_MAX_STRING_BYTES,
+  CANON_MAX_TOTAL_BYTES,
+  ContractValidationError,
+  FENCE_TOKEN_PATTERN,
+  HA_OUTBOX_CONTRACT_VERSION,
+  HA_OUTBOX_DIGEST_DOMAIN,
+  ID_PATTERN,
+  OutboxBackpressureError,
+  STREAM_HEAD_ALGS,
+  StaleFenceError,
+  assertHeaderConformant,
+  assertEpochTransitionConformant,
+  assertStreamHeadBinds,
+  canonicalOpDigest,
+  canonicalize,
+  epochTransitionDigest,
+  fenceTokenToDecimal,
+  idempotencyKeyOf,
+  streamHeadDigest,
+} from './ha-outbox-contract.js';
+export type {
+  ContractVersion,
+  DurableOutbox,
+  DurableTx,
+  EpochTransitionAuthorizer,
+  EpochTransitionRecord,
+  FenceToken,
+  HotpMutationSanitizer,
+  IdempotencyKey,
+  MutationSanitizer,
+  OutboxPublisher,
+  OutboxRecord,
+  OutboxRecordHeader,
+  PromotionFence,
+  PublisherBackpressure,
+  ReceiverCheckpoint,
+  ReceiverDecision,
+  SanitizedMutation,
+  SignedStreamHead,
+  StreamHeadAlg,
+  StreamHeadVerifier,
+  TskHotpMutation,
+  TskReceiverCheckpoint,
+} from './ha-outbox-contract.js';
+export {
+  CheckpointConflictError,
+  CheckpointInconsistentError,
+  CheckpointUnavailableError,
+  ContinuityValidationError,
+  MalformedCasError,
+  NotAuthorizedError,
+  RedisAheadError,
+  RollbackCheckpointGuard,
+  RollbackDetectedError,
+  SequenceExhaustedError,
+  WitnessMissingError,
+} from './rollback-checkpoint.js';
+export type {
+  CheckpointState,
+  MonotonicCheckpoint,
+  RedisSequenceView,
+  RollbackCheckpointOptions,
+  ProvisioningAuthorizer,
+  RollbackVerdict,
+} from './rollback-checkpoint.js';
+export {
+  HA_OUTBOX_PG_SCHEMA,
+  BPC_PAIR_PG_SCHEMA,
+  HA_OUTBOX_SCHEMA_MANIFEST,
+  HA_OUTBOX_SCHEMA_VERSION,
+  PgDurableOutbox,
+  PgDurablePublisher,
+  PgPromotionFence,
+  PgReceiverCheckpoint,
+  adoptCurrentSchemaVersion,
+  assertSchemaReady,
+  attestSchema,
+  provisionSchemaVersion,
+  prepareLegacyPairAuthorityV2ForMigration,
+  migrateLegacyPairAuthorityToV3,
+  schemaManifest,
+} from './ha-outbox-pg.js';
+export {
+  AmbiguousCommitError,
+  ConnectionDisposalError,
+  NodePostgresTransactor,
+  PostCommitReleaseError,
+} from './pg-transactor.js';
+export type {
+  NodePostgresClient,
+  NodePostgresPool,
+  NodePostgresResult,
+  NodePostgresTransactorOptions,
+} from './pg-transactor.js';
+export type {
+  AckReceipt,
+  AckReceiptVerifier,
+  DrainResult,
+  MutationApplier,
+  OutboxTransport,
+  PgBackend,
+  PgExecutor,
+  PgOutboxOptions,
+  PgPublisherOptions,
+  PgTransactor,
+  PgTx,
+  SchemaReadyToken,
+} from './ha-outbox-pg.js';
+export {
+  BPC_TRANSPORT_NONCE_SCHEMA,
+  AckVerificationUnavailableError,
+  HttpOutboxTransport,
+  OutboxTransportError,
+  PgReplayNonceStore,
+  createHttpOutboxReceiver,
+} from './http-outbox-transport.js';
+export {
+  BPC_HA_SCHEMA,
+  BPC_HA_SCHEMA_VERSION,
+  BPC_HA_SCHEMA_MANIFEST,
+  bpcHaSchemaManifest,
+  provisionBpcHaSchema,
+  assertBpcHaSchemaReady,
+  provisionBpcRuntimeMutationBoundary,
+  validateDbMutationPolicyContext,
+  BpcRedisQuorumFenceStore,
+  BpcCutoverController,
+  PgRedisFenceWitness,
+  BpcRedisFenceStore,
+  PgSourceLeaseFence,
+  createHaPairAuthority,
+  buildPairSnapshotBundle,
+  importPairSnapshotBundle,
+  buildPairSnapshotManifest,
+  installSourceLeaseGrant,
+  installActiveCutoverReceipt,
+  buildPromotionReadinessAttestation,
+  verifyPromotionReadinessAttestation,
+  promoteReceiverToSource,
+  signSourceLeaseGrant,
+  signRedisFenceRecord,
+  signNodeIdentityChallenge,
+  redisFenceRecordDigest,
+  pairSnapshotManifestDigest,
+  signCutoverReceipt,
+  verifyPairSnapshotManifest,
+  verifySourceLeaseGrant,
+  verifyCutoverReceipt,
+} from './bpc-ha-final.js';
+export type {
+  BareSourceLeaseGrant,
+  PairSnapshotManifest,
+  PairSnapshotBundle,
+  CutoverReceipt,
+  CutoverPhase,
+  PromotionReadinessAttestation,
+  PublicKeyResolver,
+  RedisFenceRecord,
+  SourceLeaseBinding,
+  SourceLeaseGrant,
+  BpcHaReadyToken,
+  NodeIdentityProver,
+  DbMutationTicketSigner,
+  DbMutationTicketRequest,
+  DbMutationPolicyContext,
+} from './bpc-ha-final.js';
+export type {
+  FetchLike,
+  FetchResponseLike,
+  HttpOutboxReceiverOptions,
+  HttpOutboxTransportOptions,
+  PgReplayNonceStoreOptions,
+} from './http-outbox-transport.js';
+export {
+  PgPairMutationApplier,
+  PgTransactionalPairStore,
+  Aes256GcmPairPayloadCodec,
+  bpcPairMutationSanitizer,
+} from './pg-durable-pair-store.js';
+export type {
+  BpcPairMutation,
+  CanonicalPairRegistration,
+  CanonicalPublicJwk,
+  CanonicalStoredPair,
+  PairPayloadCodec,
+  PairSealKeyring,
+  PgTransactionalPairStoreOptions,
+  SealedPairPayload,
+} from './pg-durable-pair-store.js';
+export {
+  RedisContinuityConfigurationError,
+  createGovernedRedisBackedNonceStore,
+} from './redis-governed.js';
+export type {
+  GovernedRedisBackedNonceOptions,
+  GovernedRedisBackedNonceStore,
+  RedisAtomicClient,
+} from './redis-governed.js';
 export { verifyBPCRequest } from './middleware.js';
 export { MemoryPairStore, MemoryNonceBackend, MemoryAnomalyStore } from './memory-store.js';
 export { ReplicatingPairStore } from './replicating-store.js';

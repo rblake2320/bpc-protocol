@@ -81,12 +81,79 @@ product or security claims. Git history contains the original wording.
 
 - **Parked:** claiming that the TypeScript Redis nonce backend alone preserves
   replay evidence through every restart, failover, eviction, or data-loss event.
-- **Reason:** atomic `SET NX PX` proves concurrent first-use ordering while the
-  keys exist. Redis persistence and replication can have deployment-specific
-  loss windows, and the package cannot detect arbitrary deletion.
-- **Current claim:** named Redis errors fail closed; deployments must use
-  `noeviction` and quarantine authorization for the full retention horizon
-  after any failover whose nonce durability is uncertain.
+- **Reason:** the governed Lua operation proves expected-epoch validation and
+  concurrent first-use ordering on the Redis instance that executes it. Redis
+  persistence and asynchronous replication can still have deployment-specific
+  loss windows. A restored internally consistent snapshot with the same epoch,
+  privileged selective nonce deletion, or policy drift between CONFIG checks
+  is not detected by that operation. One client's CONFIG response also does
+  not attest the configuration of every Redis Cluster member.
+- **Current claim:** the awaited TypeScript governed factory verifies live
+  `noeviction`, binds one namespace horizon, shares an epoch/quarantine across
+  verifiers, denies a missing marker or an epoch change relative to the running
+  process/trusted checkpoint, and atomically combines those checks with nonce
+  consumption. Uncertain state and Redis failures produce named fail-closed
+  results. A cold process without a trusted expected epoch can adopt any
+  existing epoch and cannot attest that snapshot's freshness.
 - **Restore only with:** a deployment-specific durable topology, measured loss
   bounds, restart/failover evidence, deletion detection or trusted checkpoints,
-  and adversarial recovery tests.
+  immutable/monitored policy, and adversarial recovery tests.
+
+## P-011: Ungoverned Redis helper as production composition
+
+- **Parked:** describing `createRedisBackedNonceStore()` or raw `SET NX PX` as
+  sufficient production replay continuity.
+- **Reason:** the helper has no shared epoch, no quarantine, and no atomic
+  continuity comparison. State loss can make an already-used nonce look fresh.
+- **Current claim:** it is an isolated test/development primitive and requires
+  `continuityMode: 'ungoverned-development'`. Production TypeScript consumers
+  use the awaited governed factory.
+- **Restore only with:** not applicable; use the governed composition rather
+  than weakening its boundary.
+
+## P-012: Live wall-clock TTL as an exact unit-test boundary
+
+- **Parked:** reading a countdown from the host clock and requiring it to remain
+  at least 1000ms after awaited work.
+- **Reason:** one millisecond of legitimate scheduling produced a false failure
+  without identifying a shorter configured quarantine.
+- **Current design:** freeze the fake model's clock and assert the exact 1000ms
+  horizon, with restoration protected even if asynchronous cleanup fails; live
+  Redis tests remain responsible for real countdown behavior.
+- **Restore only with:** a deterministic clock supplied by the test harness that
+  preserves the same exact semantic assertion.
+
+## P-013: Durable-outbox mechanism as high-availability proof
+
+- **Parked:** describing the PostgreSQL durable-outbox mechanism or its
+  single-node integration as production HA, lossless replication, or measured
+  failover capability.
+- **Reason:** one PostgreSQL service cannot establish behavior during two-node
+  database/Redis failover, split brain, or network partition.
+- **Current claim:** a production PostgreSQL transactor and single-node durable
+  outbox mechanism exist and are tested against real PostgreSQL.
+- **Restore only with:** issue #16's real two-node PostgreSQL and Redis drill,
+  adversarial stale-writer/split-brain cases, and recorded RPO/RTO evidence.
+
+## P-014: Pair-store mechanism as complete registry transactionality
+
+- **Parked:** claiming that the transactional PostgreSQL PairStore alone makes
+  every registry workflow atomic or race-free.
+- **Reason:** pair approval, rotation, lifecycle updates, and usage claims are
+  now atomic, but the IP failure tracker is still node-local and the two-node
+  PostgreSQL/Redis failover boundary is not proven.
+- **Current claim:** `AtomicPairStore` makes the named pair-authority transitions
+  atomic and couples PostgreSQL changes to compound durable-outbox mutations.
+- **Restore only with:** distributed anomaly aggregation plus issue #16's real
+  two-node drill, snapshot/tail resync, and measured RPO/RTO evidence.
+
+## P-015: Same-host authenticated transport as production HA
+
+- **Parked:** describing the authenticated loopback two-PostgreSQL drill as
+  independent-network HA, failover, or split-brain proof.
+- **Reason:** the transport and state stores are real, but the CI services share
+  one host and the slice does not promote a receiver or test an external fence.
+- **Current claim:** authenticated independent-state replication survives lost
+  ACK and receiver database reconnection and converges without duplicate apply.
+- **Restore only with:** issue #16's external-fence, partition, promotion,
+  snapshot-and-tail, restart, and measured RPO/RTO acceptance matrix.

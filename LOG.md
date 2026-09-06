@@ -1,5 +1,55 @@
 # Change Log
 
+## 2026-07-16
+
+- Enterprise Actions run `29476950456` exposed two evidence defects: the
+  heterogeneous-horizon unit test measured a live countdown and intermittently
+  saw 999ms instead of the just-established 1000ms horizon, and the root npm
+  workspace runner continued into later workspace output after that failure.
+  The test now freezes `Date.now()`, restores it in a cleanup-safe nested
+  `finally`, and asserts the exact 1000ms property. A tested sequential runner
+  forwards root arguments to every workspace and stops at the first nonzero
+  result. This improves test determinism, argument propagation, failure
+  locality, and log clarity; it does not change production continuity logic or
+  imply that npm's former workspace runner returned success on failure.
+- Corrected PR #14 after independent review found that its continuity check was
+  a non-atomic local preflight, bootstrap returned before a first reconcile,
+  CONFIG parsing accepted ambiguous shapes, and the interval loop could
+  overlap or outlive shutdown.
+- Added the awaited `createGovernedRedisBackedNonceStore()` production factory.
+  It requires exact live `maxmemory-policy noeviction`, bootstraps a shared
+  horizon configuration, epoch, and quarantine, places all governed keys in
+  one Redis Cluster hash slot, and checks the config/expected epoch/quarantine
+  in the same Lua EVAL that consumes the nonce. A heterogeneous verifier cannot
+  join the namespace or shorten its quarantine.
+- A fresh or missing continuity namespace now quarantines every verifier for
+  the full derived replay horizon plus allowance. Epoch change, malformed
+  shared state, timeout, disconnect, unknown response, and reconcile failure
+  deny without memory fallback. `authorization_quarantined` and
+  `replay_store_unavailable` are distinct named 503 results.
+- Replaced the overlapping interval with a serialized self-scheduling wrapper.
+  The cadence must be shorter than nonce retention; observer failures are
+  contained; asynchronous idempotent shutdown closes authorization first and
+  drains the active wrapper. An ioredis command that already timed out cannot be
+  cancelled by JavaScript and may settle later; this boundary is documented and
+  a regression proves a late nonce write cannot authorize the denied caller.
+- Kept `createRedisBackedNonceStore()` only as an explicitly acknowledged
+  `ungoverned-development` helper so existing test adapters remain available
+  without being mistaken for production continuity evidence.
+- Added stateful adversarial unit coverage and expanded the actual Redis runner.
+  Local evidence: 249/249 Node workspace tests, 81/81 Python tests, 22/22 live
+  governed Redis assertions, 28/28 live HTTP adversarial assertions, build,
+  cross-language interop, npm package dry-runs, and production dependency audit
+  all passed. PostgreSQL was not listening locally. GitHub Actions then passed
+  both Node gates (including the real PostgreSQL integration) and both Python
+  gates for implementation commit `2b3ebf5` in runs `29475725228` and
+  `29475727870`.
+- Preserved the bounded claim: one Redis EVAL closes the preflight/consume
+  interleaving on the executing instance. It does not prove same-epoch snapshot
+  freshness, uncheckpointed cold-restore identity, asynchronous replication
+  durability, prevention of privileged selective deletion, cancellable Redis
+  commands, or immutable runtime Redis policy.
+
 ## 2026-07-15
 
 - Corrected PR #8 beyond its two stale assertions: copied all authorization
@@ -117,3 +167,110 @@
   authorization. Review and an intentional release decision are still required.
 - Rollback: revert the resulting hardening commit; parked wording and rationale
   remain in `PARKED.md`, `WHY.md`, and Git history.
+
+## 2026-07-18: Production PostgreSQL transaction adapter for durable outbox
+
+- Added `NodePostgresTransactor`, enforcing `SERIALIZABLE`, verified `BEGIN`,
+  server-side statement timeout, verified `COMMIT`, and an internal deadline
+  across connection acquisition through commit.
+- Failed, aborted, timed-out, or poisoned connections are destroyed instead of
+  returned to the pool. Disposal failures have explicit observable outcomes.
+- A dispatched `COMMIT` with a lost or malformed response becomes
+  `AmbiguousCommitError` with `committed="unknown"`; callers reconcile by
+  idempotency key instead of blindly retrying.
+- Replaced the real-PostgreSQL harness's bespoke adapter with the production
+  class. Verification: 23 focused adapter tests, 286 server tests, TypeScript
+  build, package dry-run, and 23 real PostgreSQL 16 checks.
+- This is single-node mechanism evidence. Issue #16 remains open for the real
+  two-node PostgreSQL and Redis failover/split-brain drill with measured RPO/RTO.
+
+## 2026-07-18: Snapshot asynchronous outbox trust boundaries
+
+- Detached and deep-froze canonical I-JSON snapshots before every asynchronous
+  append, delivery, acknowledgement-verification, and receiver-apply boundary.
+- Rejected proxies, inherited/accessor/symbol fields, unexpected transport
+  fields, non-I-JSON values, and invalid transaction capabilities fail-closed.
+- Fixed a publisher double-read in which a changing database-row object could
+  validate one mutation and deliver another under the original digest.
+- Verification: 40 focused adversarial tests, 295 server tests, TypeScript
+  build, and 23 real PostgreSQL 16 checks. Independent review found no remaining
+  critical, high, or medium snapshot-boundary blocker.
+
+## 2026-07-18: Transactional encrypted pair authority
+
+- Added `PgTransactionalPairStore`, coupling pair and pending-registration
+  changes to ordered durable-outbox records in one `SERIALIZABLE` transaction.
+- Classified `secretHash` correctly as operational HMAC key material. Set
+  mutations use AES-256-GCM with a fresh nonce and AAD bound to the protocol,
+  stream, operation, authority identity, algorithm, and seal-key identifier;
+  clear key material is absent from durable replication records.
+- Expanded schema version 3 and its catalog manifest to govern the outbox and
+  pair-authority tables together. Removed the exported test readiness-token
+  bypass and added a package-boundary regression.
+- Added a forward-only, transactional v2-to-v3 migration that copies legacy
+  authority through the new constraints, attests the complete schema, and only
+  then advances the version marker. Invalid legacy data rolls back intact.
+- Added a governed standalone-v2 preparation step and a migration-only
+  transactor entry that acquires authority locks before establishing the
+  serializable snapshot. A deterministic real-PostgreSQL regression proves a
+  writer committing while migration waits is preserved or the migration fails.
+- Closed normalization aliases and side effects: required values come only from
+  own data descriptors, public-key/secret values use canonical 32-byte
+  base64url, and sealed payload encodings must round-trip canonically.
+- Closed the production transactor escape that allowed callback-issued
+  transaction/session control. Callback SQL is now single-statement and
+  lexed across comments and quoted literals before dispatch; a real PostgreSQL
+  regression proves early COMMIT/ROLLBACK/SAVEPOINT/multi-statement attempts
+  leave zero durable rows.
+- Verification: TypeScript build, 306 server tests, package-boundary and dry-run
+  tarball checks, and 34 integrated PostgreSQL 16 checks.
+- This is single-node mechanism evidence. Issue #16 remains open for the real
+  two-node PostgreSQL/Redis drill, resynchronization, and measured RPO/RTO.
+## 2026-07-18: Atomic pair registry mechanism
+
+- Added `AtomicPairStore` and production enforcement in `PairRegistry`.
+- Added transactional PostgreSQL approval, mutation, successful-use claim, and
+  rotation operations with compound receiver mutations.
+- Removed fire-and-forget expiry/lock persistence and enforced `maxRequests`
+  with an atomic claim before authorization succeeds.
+- Added concurrent memory-store tests and real PostgreSQL approval, capacity,
+  CAS, usage-cap, and compound receiver evidence.
+- Bound the final successful-use claim to the complete authorization policy
+  snapshot and retained durable expiry/cap reasons for concurrent losers.
+- Added middleware regressions for concurrent scope mutation and the final
+  usage-cap race; neither denial increments the pair's successful-use count.
+- Canonicalized public-key identity identically in middleware, memory, and
+  PostgreSQL claims; absent and explicit-undefined optional JWK metadata no
+  longer creates a false policy mismatch.
+- Validation: 318 server tests, 37 integrated PostgreSQL 16 checks, workspace
+  build/tests, package-boundary suite, and dry-pack all pass.
+- Issue #16 remains open; this is single-node transactional mechanism evidence,
+  not a two-node HA claim.
+
+## 2026-07-18: Authenticated two-state replication hop
+
+- Added the production HTTP implementation of `OutboxTransport` and a bounded
+  receiver handler. Request authentication binds the exact method/path and raw
+  body digest before a durable nonce is consumed and semantic parsing begins.
+- Bound each response to the fresh request attempt in addition to the existing
+  signed receiver decision. Lost replies remain ambiguous and retriable; they
+  never fabricate an acknowledgement.
+- Locked the durable nonce table before its per-request catalog attestation and
+  held the lock through nonce insertion, closing the concurrent-DDL gap.
+- Made a terminally quarantined row the durable ordered-stream barrier, so a
+  fresh publisher cannot skip it and deliver later operations.
+- Replaced the two-PostgreSQL drill's in-process adapter with the authenticated
+  socket path and recorded zero post-convergence loss plus convergence time.
+- This is bounded mechanism evidence; issue #16 remains open.
+
+## 2026-07-18: Frozen HA acceptance
+
+- Added a signed three-member Redis monotonic epoch quorum, external control
+  witness/cutover chain, and guard-signed source lease
+  history enforced inside the authoritative PostgreSQL transaction.
+- Added source-signed snapshot manifests, tail convergence, signed promotion
+  receipts, and a promoted-source epoch initialization.
+- Added an actual child publisher SIGKILL/restart and a live Redis TCP partition
+  while the old source retains PostgreSQL access.
+- The acceptance command records backlog, zero recoverable data-loss RPO, and
+  measured crash recovery, resynchronization, and promotion RTO.

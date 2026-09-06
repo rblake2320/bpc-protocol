@@ -2,7 +2,51 @@
 
 All notable changes to BPC Protocol are documented in this file.
 
-## [Unreleased] -- 2026-07-15
+## [Unreleased] -- 2026-07-16
+
+- Added the frozen #16 HA acceptance composition: signed three-member Redis epoch
+  fencing, guard-signed expiring source leases enforced at PostgreSQL
+  pre-commit, signed snapshot/tail promotion, and actual publisher process
+  death/restart across A/B authorities plus an external control PostgreSQL.
+- Added measured per-fault backlog, data-loss RPO, resynchronization time, and
+  RTO evidence. A partitioned old source is rejected inside its authoritative
+  database transaction while the promoted source originates the next epoch.
+
+- Added an authenticated, replay-resistant HTTP durable-outbox transport with
+  exact-path authorization, bounded raw-body verification, durable receiver
+  nonces, request-attempt-bound response MACs, and decision-bound receipts.
+- Replaced the two-PostgreSQL drill's in-process adapter with a real loopback
+  HTTP hop. The drill records receiver lag and convergence time and proves zero
+  missing acknowledged rows after ACK loss and receiver-database reconnection.
+- Locked the replay table before per-request catalog attestation and held that
+  lock through nonce insertion; exact index definitions are attested rather
+  than inferred from their count.
+- Made a terminal quarantine the durable ordered-stream barrier so a restarted
+  publisher cannot skip the failed row and dispatch later sequence numbers.
+- Kept issue #16 open: same-host loopback does not prove external promotion
+  fencing, split-brain denial, snapshot-and-tail resynchronization, or
+  independent network/failure-domain availability.
+
+- Made the heterogeneous-horizon regression use a controlled clock and retain
+  an exact 1000ms quarantine assertion; host scheduling can no longer turn the
+  assertion into a false 999ms failure. Clock restoration is protected even if
+  asynchronous store cleanup fails. The root test command now forwards caller
+  arguments to every workspace and stops on the first failing workspace; named
+  runner regressions bind both behaviors.
+- Added an awaited governed Redis replay factory that verifies exact live
+  `noeviction`, binds a shared namespace horizon, bootstraps shared continuity
+  quarantine, and atomically checks the config and expected epoch while
+  consuming each nonce in one same-slot Lua EVAL.
+- Fresh, missing, changed, malformed, timed-out, or unavailable continuity
+  state now produces named fail-closed denials across independent verifiers.
+  Reconciliation wrappers are serialized, shorter than nonce retention,
+  observer-safe, and drained by asynchronous idempotent shutdown. Timed-out
+  underlying ioredis commands are not cancellable; late settlement remains
+  fail closed and is covered by a named regression.
+- The legacy Redis nonce builder now requires the explicit
+  `ungoverned-development` marker. Active documentation and live integration
+  use only the governed production composition and preserve rollback,
+  replication, administrative-deletion, and policy-drift boundaries.
 
 - Successful TypeScript verification now returns an immutable authorization
   snapshot copied from the same point-in-time registry read used by the
