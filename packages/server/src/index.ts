@@ -343,6 +343,10 @@ export {
   verifyFallbackAuthorization,
 } from './principal-session.js';
 
+// Single-host persistence. These stores reject corruption and lock conflicts;
+// they are not distributed authorities and never steal stale locks.
+export { FilePairStore, FileNonceBackend, FileAnomalyStore } from './file-store.js';
+
 // Factory function — creates a fully-wired BPC server with in-memory backends
 import { PairRegistry } from './registry.js';
 import { AnomalyEngine } from './anomaly.js';
