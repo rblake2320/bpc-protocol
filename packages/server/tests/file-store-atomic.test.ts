@@ -2,6 +2,8 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { FileAnomalyStore, FileNonceBackend, FilePairStore } from '../src/file-store.js';
 
@@ -35,7 +37,7 @@ describe('atomic BPC file stores', () => {
   });
   it('serializes a nonce race across two child processes', async () => {
     const path=join(mkdtempSync(join(tmpdir(),'bpc-file-')),'nonces.json'); const child=join(import.meta.dirname,'file-store-atomic-child.mts');
-    const run=()=>new Promise<{replay?:boolean,error?:string}>((resolve,reject)=>{const command=`call C:/Users/techai/bpc-master-pin/node_modules/.bin/tsx.cmd ${child} ${path} cross-process`;const p=spawn(process.env.ComSpec!,['/d','/s','/c',command],{cwd:process.cwd(),stdio:['ignore','pipe','pipe']});let out='',err='';p.stdout.on('data',x=>out+=x);p.stderr.on('data',x=>err+=x);p.on('error',reject);p.on('close',code=>code===0?resolve(JSON.parse(out)):reject(new Error(err)));});
+    const run=()=>new Promise<{replay?:boolean,error?:string}>((resolve,reject)=>{const loader=createRequire(import.meta.url).resolve('tsx');const p=spawn(process.execPath,['--import',pathToFileURL(loader).href,child,path,'cross-process'],{cwd:process.cwd(),stdio:['ignore','pipe','pipe']});let out='',err='';p.stdout.on('data',x=>out+=x);p.stderr.on('data',x=>err+=x);p.on('error',reject);p.on('close',code=>code===0?resolve(JSON.parse(out)):reject(new Error(err)));});
     const results=await Promise.all([run(),run()]); expect(results.some(x=>x.replay===false)).toBe(true); expect(results.some(x=>x.replay===true||x.error==='BPC_FILE_STORE_LOCK_UNAVAILABLE')).toBe(true);
     expect((await run()).replay).toBe(true);
   });
@@ -44,3 +46,5 @@ describe('atomic BPC file stores', () => {
     await a.increment('attack'); await b.increment('attack'); expect(await new FileAnomalyStore(path).get('attack')).toBe(2);
   });
 });
+
+
