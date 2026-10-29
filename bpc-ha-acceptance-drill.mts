@@ -37,6 +37,12 @@ const URL_CONTROL = process.env['BPC_TEST_POSTGRES_CONTROL_URL'];
 const REDIS_URLS = process.env['BPC_TEST_REDIS_URLS']?.split(',').filter(Boolean) ?? [];
 if (!URL_A || !URL_B || !URL_CONTROL || REDIS_URLS.length !== 3) throw new Error('A/B/control PostgreSQL URLs and exactly three BPC_TEST_REDIS_URLS are required');
 if (URL_A === URL_B) throw new Error('A and B PostgreSQL URLs must differ');
+// This lease must cover the real database-role/posture adversarial matrix that
+// precedes the intentional expiry cutover. Six seconds made acceptance depend
+// on hosted-runner speed and correctly fail closed before the first governed
+// mutation on a slower runner. Keep the expiry test real, but give the bounded
+// setup and mutation matrix a production-like execution window.
+const SOURCE_LEASE_WINDOW_MS = 60_000;
 const { Pool } = pg;
 const poolA = new Pool({ connectionString: URL_A, max: 8 }); poolA.on('error', () => {});
 const poolB = new Pool({ connectionString: URL_B, max: 8 }); poolB.on('error', () => {});
@@ -143,7 +149,7 @@ async function main(): Promise<void> {
   const quorumFaultAt=Date.now();redisMembers[2]!.disconnect();assert.equal((await fenceStore.current()).epoch,1);
   redisMembers[1]!.disconnect();await assert.rejects(fenceStore.current(),/no authoritative majority/);
   await redisMembers[1]!.connect();await redisMembers[2]!.connect();assert.equal((await fenceStore.current()).epoch,1);const quorumRecoveryMs=Date.now()-quorumFaultAt;
-  const aLeaseExpiry=Date.now()+6_000;
+  const aLeaseExpiry=Date.now()+SOURCE_LEASE_WINDOW_MS;
   const grant1=signSourceLeaseGrant('guard-v1',guardPrivate,{streamId:SID,epoch:1,status:'active',holderNodeId:'node-a',leaseId:'lease-a',commandId:'grant-a1',expiresAtMs:aLeaseExpiry,maxTransactionDurationMs:dbA.maxTransactionDurationMs,grantSeq:1,prevDigest:null});
   await dbA.transaction((exec)=>installSourceLeaseGrant(exec,sourceResolver,grant1));await dbControl.transaction((exec)=>installSourceLeaseGrant(exec,sourceResolver,grant1));
   const binding1={streamId:SID,epoch:1,holderNodeId:'node-a',authoritySystemId:idA,nodeCredentialKeyId:'node-a-hsm',leaseId:'lease-a',grantDigest:grant1.grantDigest,redisClaimDigest:redisFenceRecordDigest(redisA),maxClockSkewMs:25,maxTransactionDurationMs:dbA.maxTransactionDurationMs};
